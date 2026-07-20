@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.1.1';
+const STSC_VERSION = '0.1.2';
 
 const POSITION_MAP = Object.freeze({
     prompt: 0,
@@ -33,6 +33,9 @@ const DEFAULT_SETTINGS = Object.freeze({
     pendingInstructionIds: [],
     ui: {
         editingPresetId: '',
+        editingGeneralPresetId: '',
+        editingCharacterPresetId: '',
+        presetSection: 'general',
         activeTab: 'status',
     },
 });
@@ -44,6 +47,7 @@ let lastTestResult = '';
 let internalQuietActive = false;
 let runtimePromptKeys = new Set();
 let initialized = false;
+let bulkDraft = null;
 
 function ctx() {
     return globalThis.SillyTavern?.getContext?.();
@@ -90,7 +94,7 @@ function normalizeSettings() {
     if (!settings.characterBindings || typeof settings.characterBindings !== 'object') settings.characterBindings = {};
 
     if (settings.presets.length === 0) {
-        const general = createPreset('通用自检预设');
+        const general = createPreset('默认（初始默认）', 'general');
         general.questions.push(
             createQuestion('当前角色与{{user}}处于什么关系阶段？本轮应当如何表现？', 'open', 'standard', true),
             createQuestion('本轮是否出现了缺少剧情或设定依据的好感、亲密或占有欲？', 'boolean', 'brief', true),
@@ -98,18 +102,54 @@ function normalizeSettings() {
         );
         settings.presets.push(general);
         settings.generalPresetId = general.id;
-        settings.ui.editingPresetId = general.id;
     }
 
-    if (!settings.generalPresetId || !settings.presets.some(x => x.id === settings.generalPresetId)) {
-        settings.generalPresetId = settings.presets[0]?.id || '';
+    const legacyGeneralId = settings.generalPresetId || settings.presets[0]?.id || '';
+    const legacyCharacterPresetIds = new Set(Object.values(settings.characterBindings));
+    for (const preset of settings.presets) {
+        if (!preset.kind) {
+            preset.kind = preset.id !== legacyGeneralId && legacyCharacterPresetIds.has(preset.id) ? 'character' : 'general';
+        }
+        normalizePreset(preset);
     }
 
-    if (!settings.ui.editingPresetId || !settings.presets.some(x => x.id === settings.ui.editingPresetId)) {
-        settings.ui.editingPresetId = settings.generalPresetId || settings.presets[0]?.id || '';
+    let generalPresets = settings.presets.filter(x => x.kind === 'general');
+    if (!generalPresets.length) {
+        const general = createPreset('默认（初始默认）', 'general');
+        settings.presets.unshift(general);
+        generalPresets = [general];
     }
 
-    for (const preset of settings.presets) normalizePreset(preset);
+    if (!settings.generalPresetId || !generalPresets.some(x => x.id === settings.generalPresetId)) {
+        settings.generalPresetId = generalPresets[0].id;
+    }
+
+    // 兼容旧版本的“角色 -> 预设”绑定表，并迁移到角色预设本身。
+    for (const [characterKey, presetId] of Object.entries(settings.characterBindings)) {
+        const preset = settings.presets.find(x => x.id === presetId);
+        if (!preset || preset.kind === 'general' || preset.boundCharacterKey) continue;
+        preset.kind = 'character';
+        preset.boundCharacterKey = characterKey;
+        preset.boundCharacterName = findCharacterEntity(characterKey)?.name || preset.boundCharacterName || '原绑定角色';
+    }
+    settings.characterBindings = {};
+
+    const initialGeneral = settings.presets.find(x => x.id === settings.generalPresetId && x.kind === 'general');
+    if (initialGeneral?.name === '通用自检预设') initialGeneral.name = '默认（初始默认）';
+
+    settings.ui.presetSection = settings.ui.presetSection === 'character' ? 'character' : 'general';
+    const oldEditing = settings.presets.find(x => x.id === settings.ui.editingPresetId);
+    if (!settings.ui.editingGeneralPresetId && oldEditing?.kind === 'general') settings.ui.editingGeneralPresetId = oldEditing.id;
+    if (!settings.ui.editingCharacterPresetId && oldEditing?.kind === 'character') settings.ui.editingCharacterPresetId = oldEditing.id;
+
+    if (!generalPresets.some(x => x.id === settings.ui.editingGeneralPresetId)) {
+        settings.ui.editingGeneralPresetId = settings.generalPresetId;
+    }
+    const characterPresets = settings.presets.filter(x => x.kind === 'character');
+    if (!characterPresets.some(x => x.id === settings.ui.editingCharacterPresetId)) {
+        settings.ui.editingCharacterPresetId = characterPresets[0]?.id || '';
+    }
+
     for (const reference of settings.references) normalizeReference(reference);
     for (const instruction of settings.temporaryInstructions) normalizeTemporaryInstruction(instruction);
 
@@ -126,20 +166,30 @@ function mergeDefaults(target, defaults) {
     }
 }
 
-function createPreset(name = '新自检预设') {
+function createPreset(name = '新自检预设', kind = 'general') {
     return {
         id: uid('preset'),
         name,
+        kind: kind === 'character' ? 'character' : 'general',
         enabled: true,
         questions: [],
+        boundCharacterKey: '',
+        boundCharacterName: '',
     };
 }
 
 function normalizePreset(preset) {
     preset.id ||= uid('preset');
     preset.name ||= '未命名预设';
+    preset.kind = preset.kind === 'character' ? 'character' : 'general';
     if (preset.enabled === undefined) preset.enabled = true;
     if (!Array.isArray(preset.questions)) preset.questions = [];
+    preset.boundCharacterKey ||= '';
+    preset.boundCharacterName ||= '';
+    if (preset.kind === 'general') {
+        preset.boundCharacterKey = '';
+        preset.boundCharacterName = '';
+    }
     for (const question of preset.questions) normalizeQuestion(question);
 }
 
@@ -213,6 +263,35 @@ function saveSettings() {
     ctx()?.saveSettingsDebounced?.();
 }
 
+function characterEntityFrom(character, index = '') {
+    if (!character) return { key: '', name: '', index: -1 };
+    const stableKey = character.avatar || character.data?.avatar || character.data?.name || character.name || String(index);
+    return {
+        key: `character:${stableKey}`,
+        name: character.name || character.data?.name || '未命名角色',
+        index: Number(index),
+    };
+}
+
+function getAllCharacterEntities() {
+    const characters = ctx()?.characters;
+    if (!Array.isArray(characters)) return [];
+    return characters.map((character, index) => characterEntityFrom(character, index)).filter(x => x.key);
+}
+
+function findCharacterEntity(key) {
+    if (!key) return null;
+    return getAllCharacterEntities().find(x => x.key === key) || null;
+}
+
+function getCurrentCharacterEntity() {
+    const context = ctx();
+    if (!context || context.groupId) return { key: '', name: '未找到角色', index: -1 };
+    const character = context.characters?.[Number(context.characterId)];
+    if (!character) return { key: '', name: '未找到角色', index: -1 };
+    return characterEntityFrom(character, Number(context.characterId));
+}
+
 function getCurrentEntity() {
     const context = ctx();
     if (!context) return { key: '', name: '未选择角色' };
@@ -222,14 +301,8 @@ function getCurrentEntity() {
         return { key: `group:${context.groupId}`, name: group?.name || '当前群聊' };
     }
 
-    const character = context.characters?.[Number(context.characterId)];
-    if (!character) return { key: '', name: '未选择角色' };
-
-    const stableKey = character.avatar || character.data?.name || character.name || String(context.characterId);
-    return {
-        key: `character:${stableKey}`,
-        name: character.name || character.data?.name || '当前角色',
-    };
+    const character = getCurrentCharacterEntity();
+    return character.key ? character : { key: '', name: '未选择角色' };
 }
 
 function getCurrentChatId() {
@@ -243,9 +316,18 @@ function getPresetById(id) {
 
 function getBoundPreset() {
     const settings = normalizeSettings();
-    const entity = getCurrentEntity();
-    const presetId = entity.key ? settings.characterBindings[entity.key] : '';
-    return presetId ? settings.presets.find(x => x.id === presetId) || null : null;
+    const character = getCurrentCharacterEntity();
+    if (!character.key) return null;
+    return settings.presets.find(x => x.kind === 'character' && x.boundCharacterKey === character.key) || null;
+}
+
+function getPresetBindingState(preset) {
+    if (!preset || preset.kind !== 'character' || !preset.boundCharacterKey) {
+        return { status: 'unbound', name: '未绑定' };
+    }
+    const character = findCharacterEntity(preset.boundCharacterKey);
+    if (character) return { status: 'ok', name: character.name };
+    return { status: 'missing', name: preset.boundCharacterName || '未知角色' };
 }
 
 function referenceApplies(reference) {
@@ -894,95 +976,135 @@ function renderStatusTab() {
     `);
 }
 
-function presetOptions(selectedId) {
-    return normalizeSettings().presets.map(preset => `<option value="${escapeHtml(preset.id)}" ${preset.id === selectedId ? 'selected' : ''}>${escapeHtml(preset.name)}</option>`).join('');
+function presetOptions(kind, selectedId) {
+    return normalizeSettings().presets
+        .filter(preset => preset.kind === kind)
+        .map(preset => `<option value="${escapeHtml(preset.id)}" ${preset.id === selectedId ? 'selected' : ''}>${escapeHtml(preset.name)}</option>`)
+        .join('');
+}
+
+function getEditingPreset(kind = null) {
+    const settings = normalizeSettings();
+    const actualKind = kind || settings.ui.presetSection || 'general';
+    const id = actualKind === 'character' ? settings.ui.editingCharacterPresetId : settings.ui.editingGeneralPresetId;
+    return settings.presets.find(x => x.id === id && x.kind === actualKind) || null;
+}
+
+function renderQuestionCards(preset) {
+    if (!preset?.questions.length) return '<div class="stsc-empty">这个预设还没有问题。</div>';
+    return preset.questions.map((question, index) => `
+        <div class="stsc-question-card" data-question-id="${escapeHtml(question.id)}">
+            <div class="stsc-card-header">
+                <div class="stsc-card-title">问题 ${index + 1}</div>
+                <div class="stsc-card-actions">
+                    <button class="menu_button stsc-small-button" type="button" data-action="move-question-up" ${index === 0 ? 'disabled' : ''}>上移</button>
+                    <button class="menu_button stsc-small-button" type="button" data-action="move-question-down" ${index === preset.questions.length - 1 ? 'disabled' : ''}>下移</button>
+                    <button class="menu_button stsc-small-button stsc-danger-button" type="button" data-action="delete-question">删除</button>
+                </div>
+            </div>
+            <div class="stsc-field">
+                <label>问题内容</label>
+                <textarea class="text_pole stsc-textarea" data-question-field="text">${escapeHtml(question.text)}</textarea>
+            </div>
+            <div class="stsc-grid-3" style="margin-top:9px">
+                <div class="stsc-field">
+                    <label>问题类型</label>
+                    <select class="text_pole" data-question-field="type">
+                        <option value="open" ${question.type === 'open' ? 'selected' : ''}>开放问答题</option>
+                        <option value="boolean" ${question.type === 'boolean' ? 'selected' : ''}>判断题（是/否）</option>
+                    </select>
+                </div>
+                <div class="stsc-field">
+                    <label>回答程度</label>
+                    <select class="text_pole" data-question-field="length">
+                        <option value="brief" ${question.length === 'brief' ? 'selected' : ''}>简短</option>
+                        <option value="standard" ${question.length === 'standard' ? 'selected' : ''}>标准</option>
+                        <option value="detailed" ${question.length === 'detailed' ? 'selected' : ''}>详细</option>
+                    </select>
+                </div>
+                <div class="stsc-field">
+                    <label>选项</label>
+                    <label class="checkbox_label"><input type="checkbox" data-question-field="requireEvidence" ${question.requireEvidence ? 'checked' : ''}> 要求剧情/设定依据</label>
+                    <label class="checkbox_label"><input type="checkbox" data-question-field="enabled" ${question.enabled ? 'checked' : ''}> 启用本题</label>
+                </div>
+            </div>
+        </div>`).join('');
 }
 
 function renderPresetsTab() {
     const settings = normalizeSettings();
-    const preset = getPresetById(settings.ui.editingPresetId) || settings.presets[0];
-    const entity = getCurrentEntity();
-    const bound = getBoundPreset();
+    const kind = settings.ui.presetSection === 'character' ? 'character' : 'general';
+    const presets = settings.presets.filter(x => x.kind === kind);
+    let preset = getEditingPreset(kind);
+    if (!preset && presets.length) {
+        preset = presets[0];
+        if (kind === 'character') settings.ui.editingCharacterPresetId = preset.id;
+        else settings.ui.editingGeneralPresetId = preset.id;
+    }
 
-    const questionsHtml = preset?.questions.length
-        ? preset.questions.map((question, index) => `
-            <div class="stsc-question-card" data-question-id="${escapeHtml(question.id)}">
-                <div class="stsc-card-header">
-                    <div class="stsc-card-title">问题 ${index + 1}</div>
-                    <div class="stsc-card-actions">
-                        <button class="menu_button stsc-small-button" data-action="move-question-up" ${index === 0 ? 'disabled' : ''}>上移</button>
-                        <button class="menu_button stsc-small-button" data-action="move-question-down" ${index === preset.questions.length - 1 ? 'disabled' : ''}>下移</button>
-                        <button class="menu_button stsc-small-button stsc-danger-button" data-action="delete-question">删除</button>
-                    </div>
-                </div>
-                <div class="stsc-field">
-                    <label>问题内容</label>
-                    <textarea class="text_pole stsc-textarea" data-question-field="text">${escapeHtml(question.text)}</textarea>
-                </div>
-                <div class="stsc-grid-3" style="margin-top:9px">
-                    <div class="stsc-field">
-                        <label>问题类型</label>
-                        <select class="text_pole" data-question-field="type">
-                            <option value="open" ${question.type === 'open' ? 'selected' : ''}>开放问答题</option>
-                            <option value="boolean" ${question.type === 'boolean' ? 'selected' : ''}>判断题（是/否）</option>
-                        </select>
-                    </div>
-                    <div class="stsc-field">
-                        <label>回答程度</label>
-                        <select class="text_pole" data-question-field="length">
-                            <option value="brief" ${question.length === 'brief' ? 'selected' : ''}>简短</option>
-                            <option value="standard" ${question.length === 'standard' ? 'selected' : ''}>标准</option>
-                            <option value="detailed" ${question.length === 'detailed' ? 'selected' : ''}>详细</option>
-                        </select>
-                    </div>
-                    <div class="stsc-field">
-                        <label>选项</label>
-                        <label class="checkbox_label"><input type="checkbox" data-question-field="requireEvidence" ${question.requireEvidence ? 'checked' : ''}> 要求剧情/设定依据</label>
-                        <label class="checkbox_label"><input type="checkbox" data-question-field="enabled" ${question.enabled ? 'checked' : ''}> 启用本题</label>
-                    </div>
-                </div>
-            </div>`).join('')
-        : '<div class="stsc-empty">这个预设还没有问题。</div>';
+    const currentCharacter = getCurrentCharacterEntity();
+    const binding = getPresetBindingState(preset);
+    const activeGeneral = getPresetById(settings.generalPresetId);
+    const pageTitle = kind === 'general' ? '通用预设' : '角色预设';
+    const selectId = kind === 'general' ? 'stsc_general_preset_select' : 'stsc_character_preset_select';
+    const questionsHtml = renderQuestionCards(preset);
+
+    let presetDetails = '<div class="stsc-empty">还没有预设。请点击“新建预设”。</div>';
+    if (preset) {
+        const generalBox = kind === 'general' ? `
+            <div class="stsc-binding-box">
+                当前正在生效的通用预设：<b>${escapeHtml(activeGeneral?.name || '无')}</b>
+            </div>
+            <div class="stsc-toolbar">
+                <button class="menu_button" type="button" data-action="set-general-preset" ${settings.generalPresetId === preset.id ? 'disabled' : ''}>${settings.generalPresetId === preset.id ? '当前通用预设' : '设为当前通用预设'}</button>
+                <button class="menu_button" type="button" data-action="test-preset">测试当前实际生效问题（调用一次API）</button>
+            </div>` : `
+            <div class="stsc-binding-box ${binding.status === 'missing' ? 'stsc-binding-missing' : ''}">
+                当前绑定角色卡：<b>${binding.status === 'unbound' ? '未绑定' : escapeHtml(binding.name)}</b>
+                ${binding.status === 'missing' ? '<div class="stsc-status-error">⚠ 角色卡丢失：原角色卡可能已被删除或更换。</div>' : ''}
+                <div class="stsc-muted" style="margin-top:5px">当前聊天页面：${currentCharacter.key ? escapeHtml(currentCharacter.name) : '未找到角色卡'}</div>
+            </div>
+            <div class="stsc-toolbar">
+                <button class="menu_button" type="button" data-action="bind-current-character">绑定到当前角色</button>
+                <button class="menu_button" type="button" data-action="unbind-preset" ${binding.status === 'unbound' ? 'disabled' : ''}>解除绑定</button>
+                <button class="menu_button" type="button" data-action="test-preset">测试当前实际生效问题（调用一次API）</button>
+            </div>`;
+
+        presetDetails = `
+            <div class="stsc-grid-2" style="margin-top:10px">
+                <div class="stsc-field"><label>预设名称</label><input id="stsc_preset_name" class="text_pole" type="text" value="${escapeHtml(preset.name)}"></div>
+                <div class="stsc-field"><label>预设状态</label><label class="checkbox_label"><input id="stsc_preset_enabled" type="checkbox" ${preset.enabled ? 'checked' : ''}> 启用该预设</label></div>
+            </div>
+            ${generalBox}`;
+    }
 
     $('#stsc_tab_presets').html(`
-        <div class="stsc-section">
-            <div class="stsc-section-title">预设管理</div>
-            <div class="stsc-toolbar">
-                <select id="stsc_preset_select" class="text_pole">${presetOptions(preset?.id)}</select>
-                <button class="menu_button" data-action="new-preset">新建</button>
-                <button class="menu_button" data-action="copy-preset">复制</button>
-                <button class="menu_button stsc-danger-button" data-action="delete-preset">删除</button>
-            </div>
-            ${preset ? `
-                <div class="stsc-grid-2" style="margin-top:10px">
-                    <div class="stsc-field"><label>预设名称</label><input id="stsc_preset_name" class="text_pole" type="text" value="${escapeHtml(preset.name)}"></div>
-                    <div class="stsc-field"><label>预设状态</label><label class="checkbox_label"><input id="stsc_preset_enabled" type="checkbox" ${preset.enabled ? 'checked' : ''}> 启用该预设</label></div>
-                </div>
-                <div class="stsc-binding-box">
-                    当前角色：<b>${escapeHtml(entity.name)}</b><br>
-                    当前绑定：<b>${escapeHtml(bound?.name || '未绑定角色专属预设')}</b>
-                </div>
-                <div class="stsc-toolbar">
-                    <button class="menu_button" data-action="set-general-preset">设为通用预设</button>
-                    <button class="menu_button" data-action="bind-current-character">绑定到当前角色</button>
-                    <button class="menu_button" data-action="unbind-current-character">解除当前角色绑定</button>
-                    <button class="menu_button" data-action="test-preset">测试当前生效问题（调用一次API）</button>
-                </div>
-            ` : ''}
+        <div class="stsc-preset-subtabs" role="tablist" aria-label="预设类型">
+            <button type="button" class="stsc-preset-subtab ${kind === 'general' ? 'active' : ''}" data-preset-section="general">通用预设</button>
+            <button type="button" class="stsc-preset-subtab ${kind === 'character' ? 'active' : ''}" data-preset-section="character">角色预设</button>
         </div>
 
+        <div class="stsc-section">
+            <div class="stsc-section-title">${pageTitle}</div>
+            <div class="stsc-muted">${kind === 'general' ? '通用预设可在所有角色中持续生效；可以创建多套，但同一时间只选择一套作为当前通用预设。' : '角色预设创建后默认不绑定。打开角色卡聊天页面后，再手动绑定到当前角色。'}</div>
+            <div class="stsc-toolbar" style="margin-top:10px">
+                ${presets.length ? `<select id="${selectId}" class="text_pole">${presetOptions(kind, preset?.id)}</select>` : ''}
+                <button class="menu_button" type="button" data-action="open-create-preset" data-kind="${kind}">＋ 新建预设</button>
+                <button class="menu_button" type="button" data-action="copy-preset" ${preset ? '' : 'disabled'}>复制</button>
+                <button class="menu_button stsc-danger-button" type="button" data-action="delete-preset" ${preset ? '' : 'disabled'}>删除</button>
+            </div>
+            ${presetDetails}
+        </div>
+
+        ${preset ? `
         <div class="stsc-section">
             <div class="stsc-section-title">问题列表</div>
-            <div class="stsc-toolbar"><button class="menu_button" data-action="add-question">＋ 添加问题</button></div>
+            <div class="stsc-toolbar">
+                <button class="menu_button" type="button" data-action="add-question">＋ 添加问题</button>
+                <button class="menu_button" type="button" data-action="open-batch-import">批量导入问题</button>
+            </div>
             <div id="stsc_question_list">${questionsHtml}</div>
-        </div>
-
-        <div class="stsc-section">
-            <div class="stsc-section-title">批量导入问题</div>
-            <div class="stsc-muted">可直接粘贴编号、换行、项目符号或连续问句，插件会拆成独立问题卡片，不调用API。</div>
-            <textarea id="stsc_batch_questions" class="text_pole stsc-textarea" placeholder="1. 当前角色和用户是什么关系？\n2. 本轮应该如何表现？"></textarea>
-            <div class="stsc-toolbar" style="margin-top:8px"><button class="menu_button" data-action="batch-import">自动拆分并加入当前预设</button></div>
-        </div>
+        </div>` : ''}
 
         ${lastTestResult ? `
         <div class="stsc-section">
@@ -1138,8 +1260,23 @@ function openManager(tab = null) {
 }
 
 function closeManager() {
+    closeDialog();
     $('#stsc_manager_overlay').addClass('stsc-hidden').attr('aria-hidden', 'true');
     $('body').removeClass('stsc-modal-open');
+}
+
+function openDialog(title, bodyHtml, footerHtml = '') {
+    $('#stsc_dialog_title').text(title || '操作');
+    $('#stsc_dialog_body').html(bodyHtml || '');
+    $('#stsc_dialog_footer').html(footerHtml || '');
+    $('#stsc_dialog_overlay').removeClass('stsc-hidden').attr('aria-hidden', 'false');
+    $('body').addClass('stsc-modal-open');
+}
+
+function closeDialog() {
+    bulkDraft = null;
+    $('#stsc_dialog_overlay').addClass('stsc-hidden').attr('aria-hidden', 'true');
+    $('#stsc_dialog_title, #stsc_dialog_body, #stsc_dialog_footer').empty();
 }
 
 function switchTab(tab) {
@@ -1152,27 +1289,100 @@ function switchTab(tab) {
     $(`#stsc_tab_${tab}`).addClass('active');
 }
 
+function normalizePresetName(name) {
+    return String(name || '').trim().replace(/\s+/g, ' ').toLocaleLowerCase();
+}
+
+function presetNameExists(name, excludeId = '') {
+    const normalized = normalizePresetName(name);
+    return Boolean(normalized && normalizeSettings().presets.some(x => x.id !== excludeId && normalizePresetName(x.name) === normalized));
+}
+
+function makeUniquePresetName(baseName) {
+    const base = String(baseName || '新自检预设').trim() || '新自检预设';
+    if (!presetNameExists(base)) return base;
+    let index = 2;
+    while (presetNameExists(`${base} ${index}`)) index += 1;
+    return `${base} ${index}`;
+}
+
+function openCreatePresetDialog(kind) {
+    const label = kind === 'character' ? '角色预设' : '通用预设';
+    openDialog(
+        `新建${label}`,
+        `<div class="stsc-field">
+            <label>预设名称</label>
+            <input id="stsc_new_preset_name" class="text_pole" type="text" maxlength="80" placeholder="请输入不重复的预设名称">
+            <div id="stsc_new_preset_error" class="stsc-dialog-error"></div>
+        </div>
+        <div class="stsc-muted" style="margin-top:9px">${kind === 'character' ? '创建后默认不绑定角色，需要在角色卡聊天页面中手动绑定。' : '创建后不会自动替换当前通用预设，确认内容后可以手动设为当前通用。'}</div>`,
+        `<button class="menu_button" type="button" data-dialog-action="cancel">取消</button>
+         <button class="menu_button" type="button" data-dialog-action="create-preset" data-kind="${kind}">确认创建</button>`
+    );
+    setTimeout(() => $('#stsc_new_preset_name').trigger('focus'), 0);
+}
+
+function looksLikeQuestion(text) {
+    const value = String(text || '').trim();
+    if (!value) return false;
+    if (/[？?]\s*$/.test(value)) return true;
+    return /^(是否|有无|能否|可否|当前|本轮|此时|角色|两人|他们|应该|应当|如何|为何|为什么|什么|哪|哪些|怎样|怎么|请(?:说明|判断|分析|确认|回答|概括|检查)|根据.+(?:如何|是否|应该))/u.test(value);
+}
+
 function splitBulkQuestions(raw) {
-    let text = String(raw || '').replaceAll('\r', '\n').trim();
+    let text = String(raw || '').replace(/\r\n?/g, '\n').trim();
     if (!text) return [];
 
-    text = text.replace(/\s+(?=(?:\d+|[一二三四五六七八九十]+)[\.、：:]\s*)/g, '\n');
-    let lines = text.split(/\n+/).map(x => x.trim()).filter(Boolean);
-
-    if (lines.length === 1) {
-        lines = lines[0].split(/(?<=[？?])\s*/).map(x => x.trim()).filter(Boolean);
-    }
-
+    text = text.replace(/\s+(?=(?:\d+|[一二三四五六七八九十百]+)[\.、：:)）-]\s*)/g, '\n');
+    const sourceLines = text.split(/\n+/).map(x => x.trim()).filter(Boolean);
     const output = [];
-    for (const line of lines) {
-        const cleaned = line
-            .replace(/^\s*(?:[-*•·]+|(?:\d+|[一二三四五六七八九十]+)[\.、：:)）-])\s*/, '')
-            .trim();
+
+    for (const original of sourceLines) {
+        const marked = /^\s*(?:[-*•·]+|(?:\d+|[一二三四五六七八九十百]+)[\.、：:)）-])\s*/u.test(original);
+        const cleaned = original.replace(/^\s*(?:[-*•·]+|(?:\d+|[一二三四五六七八九十百]+)[\.、：:)）-])\s*/u, '').trim();
         if (!cleaned) continue;
-        const chunks = cleaned.split(/(?<=[？?])(?=\s*[^？?])/).map(x => x.trim()).filter(Boolean);
-        output.push(...chunks);
+        const chunks = cleaned.split(/(?<=[？?])\s*(?=\S)/u).map(x => x.trim()).filter(Boolean);
+        for (const chunk of chunks) {
+            if (looksLikeQuestion(chunk)) output.push(chunk);
+        }
     }
-    return output;
+
+    if (!output.length && looksLikeQuestion(text)) output.push(text);
+    return [...new Set(output)];
+}
+
+function renderBulkImportDialog() {
+    if (!bulkDraft) return;
+    const itemsHtml = bulkDraft.items.length ? bulkDraft.items.map((item, index) => `
+        <div class="stsc-bulk-item" data-bulk-index="${index}">
+            <div class="stsc-card-header">
+                <div class="stsc-card-title">识别结果 ${index + 1}</div>
+                <button class="menu_button stsc-small-button stsc-danger-button" type="button" data-dialog-action="delete-bulk-item">删除</button>
+            </div>
+            <textarea class="text_pole stsc-textarea" data-bulk-field="text">${escapeHtml(item)}</textarea>
+        </div>`).join('') : '<div class="stsc-empty">还没有识别结果。粘贴内容后点击“开始识别”。</div>';
+
+    openDialog(
+        '批量导入问题',
+        `<div class="stsc-field">
+            <label>粘贴原始内容</label>
+            <textarea id="stsc_bulk_raw" class="text_pole stsc-bulk-raw" placeholder="把整段问题粘贴到这里。识别后不会立即导入，可以先修改和删除。">${escapeHtml(bulkDraft.raw)}</textarea>
+        </div>
+        <div class="stsc-toolbar" style="margin-top:9px">
+            <button class="menu_button" type="button" data-dialog-action="recognize-bulk">开始识别 / 重新识别</button>
+            <button class="menu_button" type="button" data-dialog-action="add-bulk-item">＋ 手动补一条</button>
+        </div>
+        <div class="stsc-muted" style="margin-top:9px">识别结果只是临时草稿。请先检查、修改或删除，点击“确认导入”后才会正式加入当前预设。</div>
+        <div class="stsc-bulk-preview">${itemsHtml}</div>`,
+        `<button class="menu_button" type="button" data-dialog-action="cancel">取消</button>
+         <button class="menu_button" type="button" data-dialog-action="confirm-bulk" ${bulkDraft.items.length ? '' : 'disabled'}>确认导入（${bulkDraft.items.length}）</button>`
+    );
+}
+
+function openBulkImportDialog(preset) {
+    if (!preset) return;
+    bulkDraft = { presetId: preset.id, raw: '', items: [] };
+    renderBulkImportDialog();
 }
 
 async function testCurrentPreset() {
@@ -1225,58 +1435,57 @@ ${questionText}
     }
 }
 
-function getEditingPreset() {
-    const settings = normalizeSettings();
-    return settings.presets.find(x => x.id === settings.ui.editingPresetId) || null;
-}
-
 function bindUiEvents() {
-    $('#stsc_enabled').on('change', function () {
-        normalizeSettings().enabled = this.checked;
-        saveSettings();
-        renderAll();
-    });
-
-    $('#stsc_mode_quick').on('change', function () {
-        normalizeSettings().mode = this.value;
-        saveSettings();
-        renderAll();
-    });
-
-    $('#stsc_open_manager').on('click', () => openManager('status'));
-    $('#stsc_open_latest').on('click', () => openManager('status'));
     $('#stsc_close_manager').on('click', closeManager);
-    $('#stsc_manager_overlay').on('click', function (event) {
-        if (event.target === this) closeManager();
-    });
-    $(document).on('keydown.stsc', function (event) {
-        if (event.key === 'Escape' && !$('#stsc_manager_overlay').hasClass('stsc-hidden')) closeManager();
-    });
-    $('#stsc_manager_overlay').on('click', function (event) {
-        if (event.target === this) closeManager();
-    });
+    $('#stsc_dialog_close').on('click', closeDialog);
 
+    // 不再点击黑色背景关闭，避免用户拖选/复制文字时误退出插件。
     $(document).on('keydown.stsc', function (event) {
-        if (event.key === 'Escape' && !$('#stsc_manager_overlay').hasClass('stsc-hidden')) closeManager();
+        if (event.key !== 'Escape') return;
+        if (!$('#stsc_dialog_overlay').hasClass('stsc-hidden')) closeDialog();
+        else if (!$('#stsc_manager_overlay').hasClass('stsc-hidden')) closeManager();
     });
 
     $('#stsc_manager_overlay').on('click', '.stsc-tab', function () {
         switchTab($(this).data('tab'));
     });
 
-    $('#stsc_manager_overlay').on('change', '#stsc_preset_select', function () {
-        normalizeSettings().ui.editingPresetId = this.value;
+    $('#stsc_manager_overlay').on('click', '[data-preset-section]', function () {
+        const settings = normalizeSettings();
+        settings.ui.presetSection = $(this).data('preset-section') === 'character' ? 'character' : 'general';
         saveSettings();
         renderPresetsTab();
     });
 
-    $('#stsc_manager_overlay').on('input', '#stsc_preset_name', function () {
+    $('#stsc_manager_overlay').on('change', '#stsc_general_preset_select', function () {
+        normalizeSettings().ui.editingGeneralPresetId = this.value;
+        saveSettings();
+        renderPresetsTab();
+    });
+
+    $('#stsc_manager_overlay').on('change', '#stsc_character_preset_select', function () {
+        normalizeSettings().ui.editingCharacterPresetId = this.value;
+        saveSettings();
+        renderPresetsTab();
+    });
+
+    $('#stsc_manager_overlay').on('change', '#stsc_preset_name', function () {
         const preset = getEditingPreset();
         if (!preset) return;
-        preset.name = this.value;
+        const nextName = String(this.value || '').trim();
+        if (!nextName) {
+            toastr.warning('预设名称不能为空。', '写作前置自检');
+            renderPresetsTab();
+            return;
+        }
+        if (presetNameExists(nextName, preset.id)) {
+            toastr.warning('已经存在同名预设，请换一个名称。', '写作前置自检');
+            renderPresetsTab();
+            return;
+        }
+        preset.name = nextName;
         saveSettings();
-        renderCompact();
-        renderManagerSubtitle();
+        renderAll();
     });
 
     $('#stsc_manager_overlay').on('change', '#stsc_preset_enabled', function () {
@@ -1369,63 +1578,67 @@ function bindUiEvents() {
         const settings = normalizeSettings();
         const preset = getEditingPreset();
 
-        if (action === 'new-preset') {
-            const newPreset = createPreset();
-            settings.presets.push(newPreset);
-            settings.ui.editingPresetId = newPreset.id;
+        if (action === 'open-create-preset') {
+            openCreatePresetDialog($(this).data('kind'));
+            return;
         } else if (action === 'copy-preset' && preset) {
             const copied = clone(preset);
             copied.id = uid('preset');
-            copied.name = `${preset.name} 副本`;
+            copied.name = makeUniquePresetName(`${preset.name} 副本`);
             copied.questions = copied.questions.map(q => ({ ...q, id: uid('q') }));
+            copied.boundCharacterKey = '';
+            copied.boundCharacterName = '';
             settings.presets.push(copied);
-            settings.ui.editingPresetId = copied.id;
+            if (copied.kind === 'character') settings.ui.editingCharacterPresetId = copied.id;
+            else settings.ui.editingGeneralPresetId = copied.id;
         } else if (action === 'delete-preset' && preset) {
-            if (settings.presets.length <= 1) {
-                toastr.warning('至少要保留一个预设。', '写作前置自检');
+            if (preset.kind === 'general' && settings.presets.filter(x => x.kind === 'general').length <= 1) {
+                toastr.warning('至少要保留一个通用预设。', '写作前置自检');
                 return;
             }
             settings.presets = settings.presets.filter(x => x.id !== preset.id);
-            for (const [key, value] of Object.entries(settings.characterBindings)) {
-                if (value === preset.id) delete settings.characterBindings[key];
+            if (preset.kind === 'general') {
+                const remaining = settings.presets.filter(x => x.kind === 'general');
+                if (settings.generalPresetId === preset.id) settings.generalPresetId = remaining[0]?.id || '';
+                settings.ui.editingGeneralPresetId = remaining[0]?.id || '';
+            } else {
+                settings.ui.editingCharacterPresetId = settings.presets.find(x => x.kind === 'character')?.id || '';
             }
-            if (settings.generalPresetId === preset.id) settings.generalPresetId = settings.presets[0].id;
-            settings.ui.editingPresetId = settings.presets[0].id;
-        } else if (action === 'set-general-preset' && preset) {
+        } else if (action === 'set-general-preset' && preset?.kind === 'general') {
             settings.generalPresetId = preset.id;
             settings.generalEnabled = true;
-            toastr.success(`已将“${preset.name}”设为通用预设。`, '写作前置自检');
-        } else if (action === 'bind-current-character' && preset) {
-            const entity = getCurrentEntity();
-            if (!entity.key) {
-                toastr.warning('请先打开一个角色卡。', '写作前置自检');
+            toastr.success(`已将“${preset.name}”设为当前通用预设。`, '写作前置自检');
+        } else if (action === 'bind-current-character' && preset?.kind === 'character') {
+            const character = getCurrentCharacterEntity();
+            if (!character.key) {
+                toastr.warning('当前页面未找到角色卡，请先进入一个角色卡聊天页面。', '写作前置自检');
                 return;
             }
-            settings.characterBindings[entity.key] = preset.id;
+            for (const other of settings.presets.filter(x => x.kind === 'character' && x.id !== preset.id && x.boundCharacterKey === character.key)) {
+                other.boundCharacterKey = '';
+                other.boundCharacterName = '';
+            }
+            preset.boundCharacterKey = character.key;
+            preset.boundCharacterName = character.name;
             settings.characterEnabled = true;
-            toastr.success(`已将“${preset.name}”绑定到 ${entity.name}。`, '写作前置自检');
-        } else if (action === 'unbind-current-character') {
-            const entity = getCurrentEntity();
-            if (entity.key) delete settings.characterBindings[entity.key];
+            toastr.success(`已将“${preset.name}”绑定到 ${character.name}。`, '写作前置自检');
+        } else if (action === 'unbind-preset' && preset?.kind === 'character') {
+            preset.boundCharacterKey = '';
+            preset.boundCharacterName = '';
         } else if (action === 'test-preset') {
             await testCurrentPreset();
             return;
         } else if (action === 'add-question' && preset) {
             preset.questions.push(createQuestion());
+        } else if (action === 'open-batch-import' && preset) {
+            openBulkImportDialog(preset);
+            return;
         } else if (['delete-question', 'move-question-up', 'move-question-down'].includes(action) && preset) {
             const id = $(this).closest('[data-question-id]').data('question-id');
             const index = preset.questions.findIndex(x => x.id === id);
             if (index >= 0 && action === 'delete-question') preset.questions.splice(index, 1);
             if (index > 0 && action === 'move-question-up') [preset.questions[index - 1], preset.questions[index]] = [preset.questions[index], preset.questions[index - 1]];
             if (index >= 0 && index < preset.questions.length - 1 && action === 'move-question-down') [preset.questions[index + 1], preset.questions[index]] = [preset.questions[index], preset.questions[index + 1]];
-        } else if (action === 'batch-import' && preset) {
-            const imported = splitBulkQuestions($('#stsc_batch_questions').val());
-            if (!imported.length) {
-                toastr.warning('没有识别到可导入的问题。', '写作前置自检');
-                return;
-            }
-            preset.questions.push(...imported.map(text => createQuestion(text)));
-            toastr.success(`已拆分并加入 ${imported.length} 个问题。`, '写作前置自检');
         } else if (action === 'add-reference') {
             settings.references.push(createReference());
         } else if (action === 'delete-reference') {
@@ -1434,13 +1647,13 @@ function bindUiEvents() {
         } else if (action === 'bind-reference-character') {
             const id = $(this).closest('[data-reference-id]').data('reference-id');
             const reference = settings.references.find(x => x.id === id);
-            const entity = getCurrentEntity();
-            if (!reference || !entity.key) {
-                toastr.warning('请先打开一个角色卡。', '写作前置自检');
+            const character = getCurrentCharacterEntity();
+            if (!reference || !character.key) {
+                toastr.warning('当前页面未找到角色卡，请先进入一个角色卡聊天页面。', '写作前置自检');
                 return;
             }
             reference.scope = 'character';
-            reference.characterKey = entity.key;
+            reference.characterKey = character.key;
         } else if (action === 'add-temp') {
             settings.temporaryInstructions.push(createTemporaryInstruction());
         } else if (action === 'delete-temp') {
@@ -1455,6 +1668,92 @@ function bindUiEvents() {
 
         saveSettings();
         renderAll();
+    });
+
+    $('#stsc_dialog_overlay').on('input', '#stsc_bulk_raw', function () {
+        if (bulkDraft) bulkDraft.raw = this.value;
+    });
+
+    $('#stsc_dialog_overlay').on('input', '[data-bulk-field="text"]', function () {
+        if (!bulkDraft) return;
+        const index = Number($(this).closest('[data-bulk-index]').data('bulk-index'));
+        if (Number.isInteger(index) && bulkDraft.items[index] !== undefined) bulkDraft.items[index] = this.value;
+    });
+
+    $('#stsc_dialog_overlay').on('keydown', '#stsc_new_preset_name', function (event) {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            $('#stsc_dialog_overlay [data-dialog-action="create-preset"]').trigger('click');
+        }
+    });
+
+    $('#stsc_dialog_overlay').on('click', '[data-dialog-action]', function () {
+        const action = $(this).data('dialog-action');
+        const settings = normalizeSettings();
+
+        if (action === 'cancel') {
+            closeDialog();
+            return;
+        }
+        if (action === 'create-preset') {
+            const kind = $(this).data('kind') === 'character' ? 'character' : 'general';
+            const name = String($('#stsc_new_preset_name').val() || '').trim();
+            if (!name) {
+                $('#stsc_new_preset_error').text('请输入预设名称。');
+                return;
+            }
+            if (presetNameExists(name)) {
+                $('#stsc_new_preset_error').text('已经存在同名预设，请换一个名称。');
+                return;
+            }
+            const preset = createPreset(name, kind);
+            settings.presets.push(preset);
+            settings.ui.presetSection = kind;
+            if (kind === 'character') settings.ui.editingCharacterPresetId = preset.id;
+            else settings.ui.editingGeneralPresetId = preset.id;
+            saveSettings();
+            closeDialog();
+            renderAll();
+            return;
+        }
+        if (action === 'recognize-bulk') {
+            if (!bulkDraft) return;
+            bulkDraft.raw = String($('#stsc_bulk_raw').val() || '');
+            bulkDraft.items = splitBulkQuestions(bulkDraft.raw);
+            if (!bulkDraft.items.length) toastr.warning('没有识别到明显的问题，请调整原文或手动补充。', '写作前置自检');
+            renderBulkImportDialog();
+            return;
+        }
+        if (action === 'add-bulk-item') {
+            if (!bulkDraft) return;
+            bulkDraft.raw = String($('#stsc_bulk_raw').val() || bulkDraft.raw || '');
+            bulkDraft.items.push('');
+            renderBulkImportDialog();
+            setTimeout(() => $('#stsc_dialog_body [data-bulk-field="text"]').last().trigger('focus'), 0);
+            return;
+        }
+        if (action === 'delete-bulk-item') {
+            if (!bulkDraft) return;
+            const index = Number($(this).closest('[data-bulk-index]').data('bulk-index'));
+            if (Number.isInteger(index)) bulkDraft.items.splice(index, 1);
+            renderBulkImportDialog();
+            return;
+        }
+        if (action === 'confirm-bulk') {
+            if (!bulkDraft) return;
+            const preset = settings.presets.find(x => x.id === bulkDraft.presetId);
+            const items = bulkDraft.items.map(x => String(x || '').trim()).filter(Boolean);
+            if (!preset || !items.length) {
+                toastr.warning('没有可以导入的问题。', '写作前置自检');
+                return;
+            }
+            preset.questions.push(...items.map(text => createQuestion(text)));
+            saveSettings();
+            const count = items.length;
+            closeDialog();
+            renderAll();
+            toastr.success(`已确认导入 ${count} 个问题。`, '写作前置自检');
+        }
     });
 }
 
@@ -1478,7 +1777,7 @@ async function initialize() {
     normalizeSettings();
     const html = await context.renderExtensionTemplateAsync(STSC_FOLDER, 'settings');
     // 管理器直接挂到 body，避免被“扩展”侧栏的宽度、overflow 或 transform 裁切。
-    $('#stsc_manager_overlay').remove();
+    $('#stsc_manager_overlay, #stsc_dialog_overlay').remove();
     $('body').append(html);
     initialized = true;
     bindUiEvents();
