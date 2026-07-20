@@ -1102,3 +1102,210 @@ body.stsc-modal-open {
     padding: 10px;
   }
 }
+
+/* v0.1.5：小屏排版、自由悬浮与流式自检隐藏 */
+
+/* AI 输出的专用标签即使被 ST 当成 HTML 渲染，也不会把自检展示在正文里。 */
+#chat .mes_text stsc_self_check,
+#chat .mes_text self_check {
+  display: none !important;
+}
+
+#chat .mes_text stsc_response,
+#chat .mes_text response {
+  display: contents !important;
+}
+
+/* 弹窗按钮始终横向排字，避免被 ST 的全局按钮样式压成竖排文字。 */
+.stsc-dialog-footer .menu_button,
+.stsc-dialog-footer button,
+.stsc-header-actions .menu_button,
+.stsc-card-actions .menu_button {
+  writing-mode: horizontal-tb !important;
+  text-orientation: mixed !important;
+  white-space: nowrap !important;
+  word-break: keep-all !important;
+  overflow-wrap: normal !important;
+  line-height: 1.25 !important;
+  min-height: 38px;
+  padding: 8px 13px !important;
+}
+
+.stsc-dialog-footer {
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: thin;
+}
+
+.stsc-floating-root {
+  width: 50px;
+  height: 50px;
+  pointer-events: none;
+}
+
+.stsc-floating-button,
+.stsc-floating-panel {
+  pointer-events: auto;
+}
+
+.stsc-floating-button {
+  width: 50px;
+  height: 50px;
+}
+
+.stsc-floating-icon {
+  padding: 9px;
+}
+
+.stsc-floating-icon svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  stroke-width: 1.65;
+}
+
+/* 自由拖动后，桌面端根据按钮所在象限向屏幕内侧展开。 */
+.stsc-floating-root[data-horizontal="right"] .stsc-floating-panel {
+  right: 0;
+  left: auto;
+}
+
+.stsc-floating-root[data-horizontal="left"] .stsc-floating-panel {
+  left: 0;
+  right: auto;
+}
+
+.stsc-floating-panel {
+  z-index: 2147482600;
+  display: flex;
+  flex-direction: column;
+}
+
+.stsc-floating-content {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+@media (max-width: 720px) {
+  .stsc-manager-header {
+    gap: 8px;
+  }
+
+  .stsc-header-actions {
+    flex-wrap: nowrap;
+  }
+
+  .stsc-save-button {
+    min-width: 78px !important;
+    white-space: nowrap !important;
+  }
+
+  /* 手机/小平板的操作弹窗使用完整可视区域，底部按钮改为整行，文字不再竖排。 */
+  .stsc-dialog-header {
+    padding: max(11px, env(safe-area-inset-top)) 12px 10px;
+  }
+
+  .stsc-dialog-body {
+    padding: 11px 10px;
+  }
+
+  .stsc-dialog-footer {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 7px;
+    overflow: visible;
+    padding: 10px max(10px, env(safe-area-inset-right)) max(10px, env(safe-area-inset-bottom)) max(10px, env(safe-area-inset-left));
+  }
+
+  .stsc-dialog-footer > *,
+  .stsc-dialog-footer .menu_button,
+  .stsc-dialog-footer button {
+    flex: 0 0 auto !important;
+    width: 100% !important;
+    min-width: 0 !important;
+    max-width: none !important;
+  }
+
+  /* 悬浮按钮可在整个安全区域自由移动；展开内容使用独立全屏浮层。 */
+  .stsc-floating-root {
+    width: 50px;
+    height: 50px;
+  }
+
+  .stsc-floating-panel,
+  .stsc-floating-root[data-horizontal="left"] .stsc-floating-panel,
+  .stsc-floating-root[data-horizontal="right"] .stsc-floating-panel,
+  .stsc-floating-root[data-vertical="top"] .stsc-floating-panel,
+  .stsc-floating-root[data-vertical="bottom"] .stsc-floating-panel {
+    position: fixed !important;
+    left: max(8px, env(safe-area-inset-left)) !important;
+    right: max(8px, env(safe-area-inset-right)) !important;
+    top: max(var(--stsc-safe-top, 54px), calc(env(safe-area-inset-top) + 48px)) !important;
+    bottom: max(var(--stsc-safe-bottom, 82px), calc(env(safe-area-inset-bottom) + 72px)) !important;
+    width: auto !important;
+    height: auto !important;
+    max-width: none !important;
+    max-height: none !important;
+    border-radius: 16px;
+    overflow: hidden;
+    transform: none !important;
+  }
+
+  .stsc-floating-header {
+    flex: 0 0 auto;
+    padding: 11px 12px;
+  }
+
+  .stsc-floating-content {
+    max-height: none !important;
+    padding: 10px;
+  }
+
+  .stsc-floating-footer {
+    flex: 0 0 auto;
+    padding: 10px 12px max(10px, env(safe-area-inset-bottom));
+  }
+
+  .stsc-floating-footer .menu_button {
+    width: 100% !important;
+    white-space: nowrap !important;
+  }
+}
+
+@media (max-width: 430px) {
+  .stsc-manager-header {
+    padding-inline: 9px;
+  }
+
+  .stsc-manager-heading {
+    max-width: calc(100% - 126px);
+  }
+
+  .stsc-manager-subtitle {
+    display: none;
+  }
+
+  .stsc-save-button {
+    min-width: 68px !important;
+    padding-inline: 8px !important;
+    font-size: 0.86rem;
+  }
+
+  .stsc-icon-button {
+    flex-basis: 38px !important;
+    width: 38px !important;
+    min-width: 38px !important;
+  }
+
+  .stsc-floating-panel,
+  .stsc-floating-root[data-horizontal="left"] .stsc-floating-panel,
+  .stsc-floating-root[data-horizontal="right"] .stsc-floating-panel {
+    left: max(6px, env(safe-area-inset-left)) !important;
+    right: max(6px, env(safe-area-inset-right)) !important;
+    top: max(var(--stsc-safe-top, 50px), calc(env(safe-area-inset-top) + 44px)) !important;
+    bottom: max(var(--stsc-safe-bottom, 76px), calc(env(safe-area-inset-bottom) + 66px)) !important;
+    border-radius: 14px;
+  }
+}
