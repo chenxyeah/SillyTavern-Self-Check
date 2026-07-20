@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.1.0';
+const STSC_VERSION = '0.1.1';
 
 const POSITION_MAP = Object.freeze({
     prompt: 0,
@@ -1132,12 +1132,14 @@ function openManager(tab = null) {
     const settings = normalizeSettings();
     if (tab) settings.ui.activeTab = tab;
     $('#stsc_manager_overlay').removeClass('stsc-hidden').attr('aria-hidden', 'false');
+    $('body').addClass('stsc-modal-open');
     switchTab(settings.ui.activeTab || 'status');
     renderAll();
 }
 
 function closeManager() {
     $('#stsc_manager_overlay').addClass('stsc-hidden').attr('aria-hidden', 'true');
+    $('body').removeClass('stsc-modal-open');
 }
 
 function switchTab(tab) {
@@ -1244,6 +1246,12 @@ function bindUiEvents() {
     $('#stsc_open_manager').on('click', () => openManager('status'));
     $('#stsc_open_latest').on('click', () => openManager('status'));
     $('#stsc_close_manager').on('click', closeManager);
+    $('#stsc_manager_overlay').on('click', function (event) {
+        if (event.target === this) closeManager();
+    });
+    $(document).on('keydown.stsc', function (event) {
+        if (event.key === 'Escape' && !$('#stsc_manager_overlay').hasClass('stsc-hidden')) closeManager();
+    });
     $('#stsc_manager_overlay').on('click', function (event) {
         if (event.target === this) closeManager();
     });
@@ -1469,8 +1477,9 @@ async function initialize() {
 
     normalizeSettings();
     const html = await context.renderExtensionTemplateAsync(STSC_FOLDER, 'settings');
-    const $settingsTarget = $('#extensions_settings2').length ? $('#extensions_settings2') : $('#extensions_settings');
-    $settingsTarget.append(html);
+    // 管理器直接挂到 body，避免被“扩展”侧栏的宽度、overflow 或 transform 裁切。
+    $('#stsc_manager_overlay').remove();
+    $('body').append(html);
     initialized = true;
     bindUiEvents();
     addExtensionsMenuButton();
