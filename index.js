@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.1.3';
+const STSC_VERSION = '0.1.4';
 
 const POSITION_MAP = Object.freeze({
     prompt: 0,
@@ -34,6 +34,10 @@ const DEFAULT_SETTINGS = Object.freeze({
     appearance: {
         theme: 'default',
         floatingEnabled: false,
+        floatingPosition: {
+            side: 'right',
+            topRatio: 0.72,
+        },
     },
     ui: {
         editingPresetId: '',
@@ -56,6 +60,8 @@ let editDraft = null;
 let editDirty = false;
 let pendingUnsavedAction = null;
 let streamDomObserver = null;
+let floatingDragState = null;
+let suppressFloatingClickUntil = 0;
 
 function ctx() {
     return globalThis.SillyTavern?.getContext?.();
@@ -103,6 +109,11 @@ function normalizeSettings() {
     if (!settings.appearance || typeof settings.appearance !== 'object') settings.appearance = clone(DEFAULT_SETTINGS.appearance);
     settings.appearance.theme = ['default', 'rose', 'blue', 'mint', 'violet', 'gold'].includes(settings.appearance.theme) ? settings.appearance.theme : 'default';
     settings.appearance.floatingEnabled = Boolean(settings.appearance.floatingEnabled);
+    if (!settings.appearance.floatingPosition || typeof settings.appearance.floatingPosition !== 'object') {
+        settings.appearance.floatingPosition = clone(DEFAULT_SETTINGS.appearance.floatingPosition);
+    }
+    settings.appearance.floatingPosition.side = settings.appearance.floatingPosition.side === 'left' ? 'left' : 'right';
+    settings.appearance.floatingPosition.topRatio = clampNumber(settings.appearance.floatingPosition.topRatio, 0, 1, 0.72);
 
     if (settings.presets.length === 0) {
         const general = createPreset('默认（初始默认）', 'general');
@@ -345,6 +356,106 @@ function requestUnsavedDecision(action) {
 function applyTheme(settings = getUiSettings()) {
     const theme = settings?.appearance?.theme || 'default';
     $('#stsc_manager_overlay, #stsc_dialog_overlay, #stsc_floating_root').attr('data-stsc-theme', theme);
+}
+
+function floatingViewportMetrics() {
+    const button = document.getElementById('stsc_floating_button');
+    const size = Math.max(44, button?.getBoundingClientRect?.().width || 48);
+    const margin = window.matchMedia?.('(max-width: 700px)')?.matches ? 10 : 14;
+    const viewportHeight = window.visualViewport?.height || window.innerHeight || document.documentElement.clientHeight || 800;
+    const viewportWidth = window.visualViewport?.width || window.innerWidth || document.documentElement.clientWidth || 1200;
+    const minTop = margin;
+    const maxTop = Math.max(minTop, viewportHeight - size - margin);
+    return { size, margin, viewportHeight, viewportWidth, minTop, maxTop };
+}
+
+function applyFloatingPosition(settings = getUiSettings()) {
+    const root = document.getElementById('stsc_floating_root');
+    if (!root) return;
+    const position = settings?.appearance?.floatingPosition || DEFAULT_SETTINGS.appearance.floatingPosition;
+    const { margin, minTop, maxTop, viewportHeight } = floatingViewportMetrics();
+    const ratio = clampNumber(position.topRatio, 0, 1, 0.72);
+    const top = minTop + (maxTop - minTop) * ratio;
+    const side = position.side === 'left' ? 'left' : 'right';
+
+    root.style.top = `${Math.round(top)}px`;
+    root.style.bottom = 'auto';
+    root.style.left = side === 'left' ? `${margin}px` : 'auto';
+    root.style.right = side === 'right' ? `${margin}px` : 'auto';
+    root.dataset.side = side;
+    root.dataset.vertical = top > viewportHeight / 2 ? 'bottom' : 'top';
+}
+
+function persistFloatingPosition(side, top) {
+    const actual = normalizeSettings();
+    if (!actual) return;
+    const { minTop, maxTop } = floatingViewportMetrics();
+    const safeTop = clampNumber(top, minTop, maxTop, minTop);
+    const denominator = Math.max(1, maxTop - minTop);
+    const next = {
+        side: side === 'left' ? 'left' : 'right',
+        topRatio: clampNumber((safeTop - minTop) / denominator, 0, 1, 0.72),
+    };
+    actual.appearance.floatingPosition = next;
+    if (editDraft?.appearance) editDraft.appearance.floatingPosition = clone(next);
+    saveSettings();
+    applyFloatingPosition(editDraft || actual);
+}
+
+function beginFloatingDrag(event) {
+    if (event.button !== undefined && event.button !== 0) return;
+    const root = document.getElementById('stsc_floating_root');
+    const button = document.getElementById('stsc_floating_button');
+    if (!root || !button) return;
+    const rect = root.getBoundingClientRect();
+    floatingDragState = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        startLeft: rect.left,
+        startTop: rect.top,
+        moved: false,
+    };
+    button.setPointerCapture?.(event.pointerId);
+    root.classList.add('stsc-floating-dragging');
+    document.getElementById('stsc_floating_panel')?.classList.add('stsc-hidden');
+}
+
+function moveFloatingDrag(event) {
+    const state = floatingDragState;
+    const root = document.getElementById('stsc_floating_root');
+    if (!state || !root || (state.pointerId !== undefined && event.pointerId !== state.pointerId)) return;
+    const { size, margin, viewportWidth, minTop, maxTop } = floatingViewportMetrics();
+    const dx = event.clientX - state.startX;
+    const dy = event.clientY - state.startY;
+    if (!state.moved && Math.hypot(dx, dy) > 5) state.moved = true;
+    if (!state.moved) return;
+
+    const left = clampNumber(state.startLeft + dx, margin, Math.max(margin, viewportWidth - size - margin), margin);
+    const top = clampNumber(state.startTop + dy, minTop, maxTop, minTop);
+    root.style.left = `${Math.round(left)}px`;
+    root.style.right = 'auto';
+    root.style.top = `${Math.round(top)}px`;
+    root.style.bottom = 'auto';
+    event.preventDefault();
+}
+
+function endFloatingDrag(event) {
+    const state = floatingDragState;
+    const root = document.getElementById('stsc_floating_root');
+    const button = document.getElementById('stsc_floating_button');
+    if (!state || !root || (state.pointerId !== undefined && event.pointerId !== state.pointerId)) return;
+    floatingDragState = null;
+    button?.releasePointerCapture?.(event.pointerId);
+    root.classList.remove('stsc-floating-dragging');
+    if (!state.moved) return;
+
+    const rect = root.getBoundingClientRect();
+    const { viewportWidth } = floatingViewportMetrics();
+    const side = rect.left + rect.width / 2 < viewportWidth / 2 ? 'left' : 'right';
+    persistFloatingPosition(side, rect.top);
+    suppressFloatingClickUntil = Date.now() + 350;
+    event.preventDefault();
 }
 
 function characterEntityFrom(character, index = '') {
@@ -1396,15 +1507,15 @@ function renderSettingsTab() {
             <div class="stsc-grid-2">
                 <div class="stsc-field"><label>插件配色</label><select id="stsc_theme" class="text_pole">
                     <option value="default" ${settings.appearance.theme === 'default' ? 'selected' : ''}>默认：跟随 SillyTavern 美化</option>
-                    <option value="rose" ${settings.appearance.theme === 'rose' ? 'selected' : ''}>柔粉</option>
-                    <option value="blue" ${settings.appearance.theme === 'blue' ? 'selected' : ''}>雾蓝</option>
-                    <option value="mint" ${settings.appearance.theme === 'mint' ? 'selected' : ''}>薄荷</option>
-                    <option value="violet" ${settings.appearance.theme === 'violet' ? 'selected' : ''}>紫罗兰</option>
-                    <option value="gold" ${settings.appearance.theme === 'gold' ? 'selected' : ''}>暖金</option>
+                    <option value="rose" ${settings.appearance.theme === 'rose' ? 'selected' : ''}>樱雾粉</option>
+                    <option value="blue" ${settings.appearance.theme === 'blue' ? 'selected' : ''}>月光蓝</option>
+                    <option value="mint" ${settings.appearance.theme === 'mint' ? 'selected' : ''}>青瓷绿</option>
+                    <option value="violet" ${settings.appearance.theme === 'violet' ? 'selected' : ''}>暮藤紫</option>
+                    <option value="gold" ${settings.appearance.theme === 'gold' ? 'selected' : ''}>奶杏金</option>
                 </select></div>
                 <div class="stsc-field"><label>悬浮窗</label>
                     <label class="checkbox_label"><input id="stsc_floating_enabled" type="checkbox" ${settings.appearance.floatingEnabled ? 'checked' : ''}> 开启悬浮按钮，快速查看最新一轮问答</label>
-                    <div class="stsc-muted">悬浮窗只展示插件保存的自检，不会把问答重新写入聊天正文。</div>
+                    <div class="stsc-muted">悬浮按钮支持鼠标或手指拖动，松开后会自动贴靠左侧或右侧，并记住位置。悬浮窗只展示插件保存的自检。</div>
                 </div>
             </div>
         </div>
@@ -1422,6 +1533,7 @@ function renderFloating() {
     const $root = $('#stsc_floating_root');
     if (!$root.length) return;
     applyTheme(settings);
+    applyFloatingPosition(settings);
 
     const enabled = Boolean(settings.appearance?.floatingEnabled);
     $root.toggleClass('stsc-hidden', !enabled).attr('aria-hidden', enabled ? 'false' : 'true');
@@ -1681,7 +1793,14 @@ ${questionText}
 function bindUiEvents() {
     $('#stsc_close_manager').on('click', closeManager);
     $('#stsc_save_changes').on('click', () => commitEditDraft());
-    $('#stsc_floating_button').on('click', function () { $('#stsc_floating_panel').toggleClass('stsc-hidden'); renderFloating(); });
+    $('#stsc_floating_button').on('click', function () {
+        if (Date.now() < suppressFloatingClickUntil) return;
+        $('#stsc_floating_panel').toggleClass('stsc-hidden');
+        renderFloating();
+    });
+    $('#stsc_floating_button').on('pointerdown', beginFloatingDrag);
+    $(document).on('pointermove.stscFloating', moveFloatingDrag);
+    $(document).on('pointerup.stscFloating pointercancel.stscFloating', endFloatingDrag);
     $('#stsc_floating_close').on('click', () => $('#stsc_floating_panel').addClass('stsc-hidden'));
     $('#stsc_floating_open_manager').on('click', () => { $('#stsc_floating_panel').addClass('stsc-hidden'); openManager('status'); });
     $('#stsc_dialog_close').on('click', closeDialog);
@@ -2046,6 +2165,11 @@ function bindUiEvents() {
             toastr.success(`已确认导入 ${count} 个问题。`, '写作前置自检');
         }
     });
+
+    $(window).on('resize.stscFloating orientationchange.stscFloating', function () {
+        applyFloatingPosition(editDraft || normalizeSettings());
+    });
+    window.visualViewport?.addEventListener?.('resize', () => applyFloatingPosition(editDraft || normalizeSettings()));
 
     window.addEventListener('beforeunload', function (event) {
         if (!editDirty) return;

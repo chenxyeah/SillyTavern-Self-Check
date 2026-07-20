@@ -7,6 +7,12 @@
   --stsc-danger: #e05454;
   --stsc-warning: #d79a35;
   --stsc-success: #48a86a;
+  --stsc-text: var(--SmartThemeBodyColor, #eee);
+  --stsc-muted-text: color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 72%, transparent);
+  --stsc-input: color-mix(in srgb, var(--SmartThemeBlurTintColor, #222) 88%, #000 12%);
+  --stsc-button: color-mix(in srgb, var(--SmartThemeBodyColor, #eee) 8%, transparent);
+  --stsc-deep: color-mix(in srgb, #000 24%, transparent);
+  --stsc-overlay: rgba(0, 0, 0, 0.64);
 }
 
 body.stsc-modal-open {
@@ -31,7 +37,7 @@ body.stsc-modal-open {
   height: 100dvh !important;
   margin: 0 !important;
   padding: 16px !important;
-  background: rgba(0, 0, 0, 0.68);
+  background: var(--stsc-overlay);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -50,7 +56,7 @@ body.stsc-modal-open {
   border: 1px solid var(--stsc-border);
   border-radius: 14px;
   background: var(--stsc-panel);
-  color: var(--SmartThemeBodyColor, #eee);
+  color: var(--stsc-text);
   box-shadow: 0 18px 70px rgba(0, 0, 0, 0.58);
   display: flex;
   flex-direction: column;
@@ -566,7 +572,7 @@ body.stsc-modal-open {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: rgba(0, 0, 0, 0.74);
+  background: var(--stsc-overlay);
   overflow: hidden;
 }
 
@@ -580,7 +586,7 @@ body.stsc-modal-open {
   border: 1px solid var(--stsc-border);
   border-radius: 14px;
   background: var(--stsc-panel);
-  color: var(--SmartThemeBodyColor, #eee);
+  color: var(--stsc-text);
   box-shadow: 0 20px 80px rgba(0, 0, 0, 0.65);
   overflow: hidden;
   backdrop-filter: blur(18px);
@@ -702,7 +708,7 @@ body.stsc-modal-open {
   }
 }
 
-/* v0.1.3：显式保存、配色与悬浮自检 */
+/* v0.1.4：更清爽的配色与可拖动悬浮窗 */
 .stsc-header-actions {
   flex: 0 0 auto;
   display: flex;
@@ -714,13 +720,12 @@ body.stsc-modal-open {
 
 .stsc-save-state {
   font-size: 0.82rem;
-  opacity: 0.72;
+  color: var(--stsc-muted-text);
   white-space: nowrap;
 }
 
 .stsc-save-state.stsc-unsaved {
   color: var(--stsc-warning);
-  opacity: 1;
   font-weight: 700;
 }
 
@@ -731,7 +736,7 @@ body.stsc-modal-open {
 .stsc-save-button.stsc-save-dirty,
 .stsc-primary-button {
   border-color: var(--stsc-accent) !important;
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--stsc-accent) 45%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--stsc-accent) 42%, transparent);
 }
 
 .stsc-unsaved-message {
@@ -739,71 +744,189 @@ body.stsc-modal-open {
   padding: 8px 2px;
 }
 
-/* 默认跟随 SillyTavern 主题；其他配色只影响本插件。 */
+.stsc-manager,
+.stsc-dialog,
+.stsc-floating-root {
+  color: var(--stsc-text);
+}
+
+.stsc-manager-subtitle,
+.stsc-muted,
+.stsc-field > label,
+.stsc-label {
+  color: var(--stsc-muted-text);
+  opacity: 1;
+}
+
+.stsc-test-result,
+.stsc-code-note {
+  background: var(--stsc-deep);
+}
+
+/*
+ * 自定义配色统一采用“中性深色玻璃底 + 轻柔点缀色”。
+ * 不再整页铺满粉、紫或棕色，避免发闷和文字对比不足。
+ */
 #stsc_manager_overlay[data-stsc-theme="rose"],
 #stsc_dialog_overlay[data-stsc-theme="rose"],
 #stsc_floating_root[data-stsc-theme="rose"] {
-  --stsc-accent: #e89aaa;
-  --stsc-panel: rgba(49, 31, 39, 0.97);
-  --stsc-card: rgba(88, 52, 67, 0.58);
-  --stsc-soft: rgba(232, 154, 170, 0.09);
+  --stsc-accent: #f0a8bd;
+  --stsc-panel: rgba(29, 28, 33, 0.965);
+  --stsc-card: rgba(255, 255, 255, 0.058);
+  --stsc-soft: rgba(240, 168, 189, 0.075);
+  --stsc-border: rgba(255, 231, 239, 0.145);
+  --stsc-text: #f8f4f6;
+  --stsc-muted-text: #bdb5ba;
+  --stsc-input: rgba(14, 14, 18, 0.76);
+  --stsc-button: rgba(255, 255, 255, 0.07);
+  --stsc-deep: rgba(8, 8, 11, 0.42);
+  --stsc-overlay: rgba(8, 8, 12, 0.61);
 }
 
 #stsc_manager_overlay[data-stsc-theme="blue"],
 #stsc_dialog_overlay[data-stsc-theme="blue"],
 #stsc_floating_root[data-stsc-theme="blue"] {
-  --stsc-accent: #76aee8;
-  --stsc-panel: rgba(27, 39, 55, 0.97);
-  --stsc-card: rgba(51, 78, 108, 0.58);
-  --stsc-soft: rgba(118, 174, 232, 0.09);
+  --stsc-accent: #9bc4f4;
+  --stsc-panel: rgba(27, 31, 38, 0.965);
+  --stsc-card: rgba(255, 255, 255, 0.058);
+  --stsc-soft: rgba(155, 196, 244, 0.075);
+  --stsc-border: rgba(221, 237, 255, 0.145);
+  --stsc-text: #f3f7fb;
+  --stsc-muted-text: #b2bbc6;
+  --stsc-input: rgba(12, 15, 20, 0.76);
+  --stsc-button: rgba(255, 255, 255, 0.07);
+  --stsc-deep: rgba(7, 10, 14, 0.42);
+  --stsc-overlay: rgba(7, 9, 13, 0.61);
 }
 
 #stsc_manager_overlay[data-stsc-theme="mint"],
 #stsc_dialog_overlay[data-stsc-theme="mint"],
 #stsc_floating_root[data-stsc-theme="mint"] {
-  --stsc-accent: #72c7ad;
-  --stsc-panel: rgba(27, 48, 43, 0.97);
-  --stsc-card: rgba(48, 91, 79, 0.56);
-  --stsc-soft: rgba(114, 199, 173, 0.09);
+  --stsc-accent: #8ed4c1;
+  --stsc-panel: rgba(27, 33, 32, 0.965);
+  --stsc-card: rgba(255, 255, 255, 0.057);
+  --stsc-soft: rgba(142, 212, 193, 0.073);
+  --stsc-border: rgba(224, 255, 246, 0.14);
+  --stsc-text: #f2f8f6;
+  --stsc-muted-text: #b1bfbb;
+  --stsc-input: rgba(12, 17, 16, 0.76);
+  --stsc-button: rgba(255, 255, 255, 0.07);
+  --stsc-deep: rgba(7, 12, 11, 0.42);
+  --stsc-overlay: rgba(7, 10, 10, 0.61);
 }
 
 #stsc_manager_overlay[data-stsc-theme="violet"],
 #stsc_dialog_overlay[data-stsc-theme="violet"],
 #stsc_floating_root[data-stsc-theme="violet"] {
-  --stsc-accent: #aa8be4;
-  --stsc-panel: rgba(39, 31, 55, 0.97);
-  --stsc-card: rgba(73, 54, 105, 0.58);
-  --stsc-soft: rgba(170, 139, 228, 0.09);
+  --stsc-accent: #c1a9ef;
+  --stsc-panel: rgba(31, 29, 37, 0.965);
+  --stsc-card: rgba(255, 255, 255, 0.058);
+  --stsc-soft: rgba(193, 169, 239, 0.075);
+  --stsc-border: rgba(240, 231, 255, 0.145);
+  --stsc-text: #f7f4fb;
+  --stsc-muted-text: #bbb5c3;
+  --stsc-input: rgba(15, 13, 20, 0.76);
+  --stsc-button: rgba(255, 255, 255, 0.07);
+  --stsc-deep: rgba(9, 7, 13, 0.42);
+  --stsc-overlay: rgba(8, 7, 12, 0.61);
 }
 
 #stsc_manager_overlay[data-stsc-theme="gold"],
 #stsc_dialog_overlay[data-stsc-theme="gold"],
 #stsc_floating_root[data-stsc-theme="gold"] {
-  --stsc-accent: #d9b56f;
-  --stsc-panel: rgba(51, 43, 28, 0.97);
-  --stsc-card: rgba(94, 75, 41, 0.58);
-  --stsc-soft: rgba(217, 181, 111, 0.09);
+  --stsc-accent: #e4c58d;
+  --stsc-panel: rgba(33, 31, 27, 0.965);
+  --stsc-card: rgba(255, 255, 255, 0.057);
+  --stsc-soft: rgba(228, 197, 141, 0.073);
+  --stsc-border: rgba(255, 242, 216, 0.145);
+  --stsc-text: #faf7f1;
+  --stsc-muted-text: #c1baae;
+  --stsc-input: rgba(17, 15, 12, 0.76);
+  --stsc-button: rgba(255, 255, 255, 0.07);
+  --stsc-deep: rgba(11, 9, 6, 0.42);
+  --stsc-overlay: rgba(10, 9, 7, 0.61);
+}
+
+/* 自定义配色下覆盖 ST 对输入框和按钮的全局着色，避免出现亮粉色长条。 */
+#stsc_manager_overlay:not([data-stsc-theme="default"]) :is(.text_pole, input[type="text"], input[type="number"], textarea, select),
+#stsc_dialog_overlay:not([data-stsc-theme="default"]) :is(.text_pole, input[type="text"], input[type="number"], textarea, select) {
+  color: var(--stsc-text) !important;
+  background: var(--stsc-input) !important;
+  border: 1px solid var(--stsc-border) !important;
+  box-shadow: none !important;
+}
+
+#stsc_manager_overlay:not([data-stsc-theme="default"]) :is(.text_pole, input[type="text"], input[type="number"], textarea, select):focus,
+#stsc_dialog_overlay:not([data-stsc-theme="default"]) :is(.text_pole, input[type="text"], input[type="number"], textarea, select):focus {
+  border-color: color-mix(in srgb, var(--stsc-accent) 72%, transparent) !important;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--stsc-accent) 14%, transparent) !important;
+}
+
+#stsc_manager_overlay:not([data-stsc-theme="default"]) option,
+#stsc_dialog_overlay:not([data-stsc-theme="default"]) option {
+  color: var(--stsc-text);
+  background: #1c1c21;
+}
+
+#stsc_manager_overlay:not([data-stsc-theme="default"]) .menu_button,
+#stsc_dialog_overlay:not([data-stsc-theme="default"]) .menu_button,
+#stsc_floating_root:not([data-stsc-theme="default"]) .menu_button {
+  color: var(--stsc-text) !important;
+  background: var(--stsc-button) !important;
+  border-color: var(--stsc-border) !important;
+  box-shadow: none;
+}
+
+#stsc_manager_overlay:not([data-stsc-theme="default"]) .menu_button:hover,
+#stsc_dialog_overlay:not([data-stsc-theme="default"]) .menu_button:hover,
+#stsc_floating_root:not([data-stsc-theme="default"]) .menu_button:hover {
+  background: color-mix(in srgb, var(--stsc-accent) 14%, var(--stsc-button)) !important;
+  border-color: color-mix(in srgb, var(--stsc-accent) 52%, var(--stsc-border)) !important;
+}
+
+#stsc_manager_overlay input[type="checkbox"],
+#stsc_dialog_overlay input[type="checkbox"] {
+  accent-color: var(--stsc-accent);
 }
 
 .stsc-floating-root {
   position: fixed;
-  right: max(14px, env(safe-area-inset-right));
-  bottom: max(88px, calc(env(safe-area-inset-bottom) + 76px));
   z-index: 2147482500;
-  color: var(--SmartThemeBodyColor, #eee);
+  width: 48px;
+  height: 48px;
+  color: var(--stsc-text);
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
 }
 
 .stsc-floating-button {
   position: relative;
   width: 48px;
   height: 48px;
-  border: 1px solid color-mix(in srgb, var(--stsc-accent) 60%, transparent);
+  padding: 0 !important;
+  border: 1px solid color-mix(in srgb, var(--stsc-accent) 55%, var(--stsc-border));
   border-radius: 50%;
   background: var(--stsc-panel);
   color: inherit;
-  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.42);
-  cursor: pointer;
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  cursor: grab;
+  touch-action: none;
   backdrop-filter: blur(16px);
+  transition: transform 150ms ease, border-color 150ms ease, box-shadow 150ms ease;
+}
+
+.stsc-floating-button:hover {
+  transform: translateY(-1px);
+  border-color: var(--stsc-accent);
+  box-shadow: 0 13px 38px rgba(0, 0, 0, 0.46), 0 0 0 3px color-mix(in srgb, var(--stsc-accent) 10%, transparent);
+}
+
+.stsc-floating-dragging .stsc-floating-button {
+  cursor: grabbing;
+  transform: scale(1.055);
+  border-color: var(--stsc-accent);
+  box-shadow: 0 15px 42px rgba(0, 0, 0, 0.5), 0 0 0 4px color-mix(in srgb, var(--stsc-accent) 13%, transparent);
 }
 
 .stsc-floating-icon {
@@ -814,6 +937,7 @@ body.stsc-modal-open {
   font-size: 21px;
   font-weight: 800;
   color: var(--stsc-accent);
+  pointer-events: none;
 }
 
 .stsc-floating-badge {
@@ -829,20 +953,40 @@ body.stsc-modal-open {
   font-size: 12px;
   line-height: 19px;
   font-weight: 800;
+  pointer-events: none;
 }
 
 .stsc-floating-panel {
   position: absolute;
-  right: 0;
-  bottom: 58px;
-  width: min(390px, calc(100vw - 24px));
-  max-height: min(560px, 62dvh);
+  width: min(400px, calc(100vw - 28px));
+  max-height: min(580px, 66dvh);
   border: 1px solid var(--stsc-border);
-  border-radius: 13px;
+  border-radius: 14px;
   background: var(--stsc-panel);
-  box-shadow: 0 16px 55px rgba(0, 0, 0, 0.52);
+  color: var(--stsc-text);
+  box-shadow: 0 18px 58px rgba(0, 0, 0, 0.5);
   overflow: hidden;
   backdrop-filter: blur(18px);
+}
+
+.stsc-floating-root[data-side="right"] .stsc-floating-panel {
+  right: 0;
+  left: auto;
+}
+
+.stsc-floating-root[data-side="left"] .stsc-floating-panel {
+  left: 0;
+  right: auto;
+}
+
+.stsc-floating-root[data-vertical="bottom"] .stsc-floating-panel {
+  bottom: 58px;
+  top: auto;
+}
+
+.stsc-floating-root[data-vertical="top"] .stsc-floating-panel {
+  top: 58px;
+  bottom: auto;
 }
 
 .stsc-floating-header,
@@ -866,10 +1010,11 @@ body.stsc-modal-open {
 }
 
 .stsc-floating-content {
-  max-height: min(430px, 48dvh);
+  max-height: min(440px, 51dvh);
   padding: 10px;
   overflow: auto;
   overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
 }
 
 .stsc-floating-content .stsc-answer-card {
@@ -881,7 +1026,7 @@ body.stsc-modal-open {
   display: flex;
   align-items: center;
   gap: 8px;
-  opacity: 0.78;
+  color: var(--stsc-muted-text);
   font-size: 0.92em;
   padding: 6px 0;
 }
@@ -890,7 +1035,7 @@ body.stsc-modal-open {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--SmartThemeQuoteColor, #8c76c8);
+  background: var(--stsc-accent);
   animation: stsc-pulse 1.1s ease-in-out infinite;
 }
 
@@ -918,16 +1063,42 @@ body.stsc-modal-open {
   }
 
   .stsc-floating-root {
-    right: 10px;
-    bottom: max(76px, calc(env(safe-area-inset-bottom) + 68px));
+    width: 48px;
+    height: 48px;
   }
 
-  .stsc-floating-panel {
+  .stsc-floating-panel,
+  .stsc-floating-root[data-side="left"] .stsc-floating-panel,
+  .stsc-floating-root[data-side="right"] .stsc-floating-panel,
+  .stsc-floating-root[data-vertical="top"] .stsc-floating-panel,
+  .stsc-floating-root[data-vertical="bottom"] .stsc-floating-panel {
     position: fixed;
-    right: 10px;
-    left: 10px;
-    bottom: max(132px, calc(env(safe-area-inset-bottom) + 124px));
+    left: max(10px, env(safe-area-inset-left));
+    right: max(10px, env(safe-area-inset-right));
+    top: auto;
+    bottom: max(76px, calc(env(safe-area-inset-bottom) + 66px));
     width: auto;
-    max-height: 58dvh;
+    max-height: min(68dvh, 620px);
+    border-radius: 16px;
+  }
+
+  .stsc-floating-content {
+    max-height: min(51dvh, 470px);
+  }
+}
+
+@media (max-width: 420px) {
+  .stsc-floating-panel,
+  .stsc-floating-root[data-side="left"] .stsc-floating-panel,
+  .stsc-floating-root[data-side="right"] .stsc-floating-panel {
+    left: max(7px, env(safe-area-inset-left));
+    right: max(7px, env(safe-area-inset-right));
+    bottom: max(70px, calc(env(safe-area-inset-bottom) + 62px));
+    border-radius: 14px;
+  }
+
+  .stsc-floating-header,
+  .stsc-floating-footer {
+    padding: 10px;
   }
 }
