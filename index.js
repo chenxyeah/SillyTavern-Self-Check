@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.1.6';
+const STSC_VERSION = '0.1.7';
 const STSC_CHECK_TAG = 'stsc_self_check';
 const STSC_RESPONSE_TAG = 'stsc_response';
 const STSC_CHECK_OPEN_RE = /<stsc_self_check\b[^>]*>/i;
@@ -366,7 +366,7 @@ function requestUnsavedDecision(action) {
 
 function applyTheme(settings = getUiSettings()) {
     const theme = settings?.appearance?.theme || 'default';
-    $('#stsc_manager_overlay, #stsc_dialog_overlay, #stsc_floating_root').attr('data-stsc-theme', theme);
+    $('#stsc_manager_overlay, #stsc_dialog_overlay, #stsc_floating_root, #stsc_floating_panel').attr('data-stsc-theme', theme);
 }
 
 function visibleRect(selector) {
@@ -450,6 +450,100 @@ function persistFloatingPosition(left, top) {
     applyFloatingPosition(editDraft || actual);
 }
 
+function floatingVisualViewport() {
+    const visual = window.visualViewport;
+    const left = Number.isFinite(visual?.offsetLeft) ? visual.offsetLeft : 0;
+    const top = Number.isFinite(visual?.offsetTop) ? visual.offsetTop : 0;
+    const width = Math.max(240, visual?.width || window.innerWidth || document.documentElement.clientWidth || 390);
+    const height = Math.max(260, visual?.height || window.innerHeight || document.documentElement.clientHeight || 700);
+    return { left, top, width, height, right: left + width, bottom: top + height };
+}
+
+function floatingPanelBoundaries(viewport) {
+    const compact = window.matchMedia?.('(max-width: 720px)')?.matches || (window.matchMedia?.('(pointer: coarse)')?.matches && viewport.width < 900);
+    const margin = compact ? 8 : 14;
+    let topBoundary = viewport.top + margin;
+    let bottomBoundary = viewport.bottom - margin;
+
+    const topSelectors = ['#top-bar', '#top-settings-holder', '.top-bar', '#sheld'];
+    for (const selector of topSelectors) {
+        const rect = visibleRect(selector);
+        if (!rect) continue;
+        const height = Math.max(0, Math.min(rect.bottom, viewport.bottom) - Math.max(rect.top, viewport.top));
+        const startsAtTop = rect.top <= viewport.top + 36;
+        const plausibleBar = height >= 24 && height <= Math.min(140, viewport.height * 0.26);
+        if (startsAtTop && plausibleBar) topBoundary = Math.max(topBoundary, Math.min(rect.bottom + margin, viewport.top + 140));
+    }
+
+    const bottomSelectors = ['#send_form', '#form_sheld', '#send_textarea', '.send_form'];
+    for (const selector of bottomSelectors) {
+        const rect = visibleRect(selector);
+        if (!rect) continue;
+        const intersectsBottom = rect.bottom >= viewport.bottom - 48 && rect.top < viewport.bottom;
+        const plausibleInput = rect.height >= 34 && rect.height <= Math.min(260, viewport.height * 0.38);
+        if (intersectsBottom && plausibleInput) bottomBoundary = Math.min(bottomBoundary, rect.top - margin);
+    }
+
+    // 某些移动浏览器会让顶部/底部检测值互相挤压。空间不足时直接回退到视觉视口，绝不让面板塌成一条线。
+    const minimumPanelHeight = Math.min(300, Math.max(220, viewport.height - margin * 2));
+    if (bottomBoundary - topBoundary < minimumPanelHeight) {
+        topBoundary = viewport.top + margin;
+        bottomBoundary = viewport.bottom - margin;
+    }
+
+    return { compact, margin, topBoundary, bottomBoundary };
+}
+
+function setImportantStyle(element, property, value) {
+    element?.style?.setProperty?.(property, value, 'important');
+}
+
+function layoutFloatingPanel() {
+    const panel = document.getElementById('stsc_floating_panel');
+    if (!panel || panel.classList.contains('stsc-hidden')) return;
+
+    const viewport = floatingVisualViewport();
+    const { compact, margin, topBoundary, bottomBoundary } = floatingPanelBoundaries(viewport);
+    setImportantStyle(panel, 'position', 'fixed');
+    setImportantStyle(panel, 'right', 'auto');
+    setImportantStyle(panel, 'bottom', 'auto');
+    setImportantStyle(panel, 'transform', 'none');
+    setImportantStyle(panel, 'box-sizing', 'border-box');
+    setImportantStyle(panel, 'display', 'flex');
+
+    if (compact) {
+        const width = Math.max(240, viewport.width - margin * 2);
+        const height = Math.max(220, bottomBoundary - topBoundary);
+        setImportantStyle(panel, 'left', `${Math.round(viewport.left + margin)}px`);
+        setImportantStyle(panel, 'top', `${Math.round(topBoundary)}px`);
+        setImportantStyle(panel, 'width', `${Math.round(width)}px`);
+        setImportantStyle(panel, 'height', `${Math.round(Math.min(height, viewport.height - margin * 2))}px`);
+        setImportantStyle(panel, 'max-width', 'none');
+        setImportantStyle(panel, 'max-height', 'none');
+        panel.dataset.layout = 'mobile';
+        return;
+    }
+
+    const button = document.getElementById('stsc_floating_button');
+    const buttonRect = button?.getBoundingClientRect?.() || { left: viewport.right - 64, right: viewport.right - 14, top: viewport.top + 90, bottom: viewport.top + 140 };
+    const width = Math.min(420, viewport.width - margin * 2);
+    const height = Math.min(640, Math.max(300, viewport.height * 0.72), viewport.height - margin * 2);
+    const openLeft = buttonRect.left + buttonRect.width / 2 < viewport.left + viewport.width / 2;
+    const openDown = buttonRect.top + buttonRect.height / 2 < viewport.top + viewport.height / 2;
+    const desiredLeft = openLeft ? buttonRect.left : buttonRect.right - width;
+    const desiredTop = openDown ? buttonRect.bottom + 10 : buttonRect.top - height - 10;
+    const left = clampNumber(desiredLeft, viewport.left + margin, viewport.right - width - margin, viewport.left + margin);
+    const top = clampNumber(desiredTop, viewport.top + margin, viewport.bottom - height - margin, viewport.top + margin);
+
+    setImportantStyle(panel, 'left', `${Math.round(left)}px`);
+    setImportantStyle(panel, 'top', `${Math.round(top)}px`);
+    setImportantStyle(panel, 'width', `${Math.round(width)}px`);
+    setImportantStyle(panel, 'height', `${Math.round(height)}px`);
+    setImportantStyle(panel, 'max-width', 'none');
+    setImportantStyle(panel, 'max-height', 'none');
+    panel.dataset.layout = 'desktop';
+}
+
 function toggleFloatingPanel(forceOpen = null) {
     const $panel = $('#stsc_floating_panel');
     if (!$panel.length) return;
@@ -457,7 +551,11 @@ function toggleFloatingPanel(forceOpen = null) {
     $panel.toggleClass('stsc-hidden', !shouldOpen).attr('aria-hidden', shouldOpen ? 'false' : 'true');
     if (shouldOpen) {
         renderFloating();
-        requestAnimationFrame(() => $('#stsc_floating_panel').trigger('focus'));
+        requestAnimationFrame(() => {
+            layoutFloatingPanel();
+            $('#stsc_floating_panel').trigger('focus');
+        });
+        setTimeout(layoutFloatingPanel, 80);
     }
 }
 
@@ -1689,7 +1787,7 @@ function renderFloating() {
     const enabled = Boolean(settings.appearance?.floatingEnabled);
     $root.toggleClass('stsc-hidden', !enabled).attr('aria-hidden', enabled ? 'false' : 'true');
     if (!enabled) {
-        $('#stsc_floating_panel').addClass('stsc-hidden');
+        $('#stsc_floating_panel').addClass('stsc-hidden').attr('aria-hidden', 'true');
         return;
     }
 
@@ -1715,6 +1813,7 @@ function renderFloating() {
             </div>`).join('')
         : `<div class="stsc-test-result">${escapeHtml(latest.rawCheck || '没有可显示的自检内容。')}</div>`;
     $('#stsc_floating_content').html(`${issues}${answers}`);
+    if (!$('#stsc_floating_panel').hasClass('stsc-hidden')) requestAnimationFrame(layoutFloatingPanel);
 }
 
 function renderAll() {
@@ -2317,10 +2416,13 @@ function bindUiEvents() {
         }
     });
 
-    $(window).on('resize.stscFloating orientationchange.stscFloating', function () {
+    const refreshFloatingLayout = () => {
         applyFloatingPosition(editDraft || normalizeSettings());
-    });
-    window.visualViewport?.addEventListener?.('resize', () => applyFloatingPosition(editDraft || normalizeSettings()));
+        layoutFloatingPanel();
+    };
+    $(window).on('resize.stscFloating orientationchange.stscFloating', refreshFloatingLayout);
+    window.visualViewport?.addEventListener?.('resize', refreshFloatingLayout);
+    window.visualViewport?.addEventListener?.('scroll', refreshFloatingLayout);
 
     window.addEventListener('beforeunload', function (event) {
         if (!editDirty) return;
@@ -2349,7 +2451,7 @@ async function initialize() {
     normalizeSettings();
     const html = await context.renderExtensionTemplateAsync(STSC_FOLDER, 'settings');
     // 管理器直接挂到 body，避免被“扩展”侧栏的宽度、overflow 或 transform 裁切。
-    $('#stsc_manager_overlay, #stsc_dialog_overlay, #stsc_floating_root').remove();
+    $('#stsc_manager_overlay, #stsc_dialog_overlay, #stsc_floating_root, #stsc_floating_panel').remove();
     $('body').append(html);
     initialized = true;
     bindUiEvents();

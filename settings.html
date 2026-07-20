@@ -46,17 +46,19 @@
     <span class="stsc-floating-icon" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48"><circle cx="24" cy="24" r="21.5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" d="M38.972 28.012a15.5 15.5 0 0 1-16.995 11.356A15.5 15.5 0 0 1 8.5 24.001A15.5 15.5 0 0 1 21.977 8.634A15.5 15.5 0 0 1 38.972 19.99"/><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" d="M16.5 23.5c0-3.866 3.358-7 7.5-7s7.5 3.134 7.5 7c0 4.519-5.858 8-10 8c.481-.834.5-1.714.5-1.714c-3.198-.687-5.5-3.049-5.5-6.286"/></svg></span>
     <span id="stsc_floating_badge" class="stsc-floating-badge stsc-hidden">!</span>
   </button>
-  <div id="stsc_floating_panel" class="stsc-floating-panel stsc-hidden" role="dialog" aria-label="最新一轮自检">
-    <div class="stsc-floating-header">
-      <div>
-        <div class="stsc-floating-title">最新一轮自检</div>
-        <div id="stsc_floating_subtitle" class="stsc-muted"></div>
-      </div>
-      <button id="stsc_floating_close" class="menu_button stsc-icon-button" type="button" aria-label="关闭悬浮窗">✕</button>
+</div>
+
+<!-- 问答面板独立挂在 body 下，不再放在 50px 的可拖动按钮容器中，避免移动端被父容器压缩成细线。 -->
+<div id="stsc_floating_panel" class="stsc-floating-panel stsc-hidden" role="dialog" aria-label="最新一轮自检" tabindex="-1" aria-hidden="true">
+  <div class="stsc-floating-header">
+    <div>
+      <div class="stsc-floating-title">最新一轮自检</div>
+      <div id="stsc_floating_subtitle" class="stsc-muted"></div>
     </div>
-    <div id="stsc_floating_content" class="stsc-floating-content"></div>
-    <div class="stsc-floating-footer">
-      <button id="stsc_floating_open_manager" class="menu_button" type="button">打开完整管理器</button>
-    </div>
+    <button id="stsc_floating_close" class="menu_button stsc-icon-button" type="button" aria-label="关闭悬浮窗">✕</button>
+  </div>
+  <div id="stsc_floating_content" class="stsc-floating-content"></div>
+  <div class="stsc-floating-footer">
+    <button id="stsc_floating_open_manager" class="menu_button" type="button">打开完整管理器</button>
   </div>
 </div>

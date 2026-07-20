@@ -769,7 +769,8 @@ body.stsc-modal-open {
  */
 #stsc_manager_overlay[data-stsc-theme="rose"],
 #stsc_dialog_overlay[data-stsc-theme="rose"],
-#stsc_floating_root[data-stsc-theme="rose"] {
+#stsc_floating_root[data-stsc-theme="rose"],
+#stsc_floating_panel[data-stsc-theme="rose"] {
   --stsc-accent: #f0a8bd;
   --stsc-panel: rgba(29, 28, 33, 0.965);
   --stsc-card: rgba(255, 255, 255, 0.058);
@@ -785,7 +786,8 @@ body.stsc-modal-open {
 
 #stsc_manager_overlay[data-stsc-theme="blue"],
 #stsc_dialog_overlay[data-stsc-theme="blue"],
-#stsc_floating_root[data-stsc-theme="blue"] {
+#stsc_floating_root[data-stsc-theme="blue"],
+#stsc_floating_panel[data-stsc-theme="blue"] {
   --stsc-accent: #9bc4f4;
   --stsc-panel: rgba(27, 31, 38, 0.965);
   --stsc-card: rgba(255, 255, 255, 0.058);
@@ -801,7 +803,8 @@ body.stsc-modal-open {
 
 #stsc_manager_overlay[data-stsc-theme="mint"],
 #stsc_dialog_overlay[data-stsc-theme="mint"],
-#stsc_floating_root[data-stsc-theme="mint"] {
+#stsc_floating_root[data-stsc-theme="mint"],
+#stsc_floating_panel[data-stsc-theme="mint"] {
   --stsc-accent: #8ed4c1;
   --stsc-panel: rgba(27, 33, 32, 0.965);
   --stsc-card: rgba(255, 255, 255, 0.057);
@@ -817,7 +820,8 @@ body.stsc-modal-open {
 
 #stsc_manager_overlay[data-stsc-theme="violet"],
 #stsc_dialog_overlay[data-stsc-theme="violet"],
-#stsc_floating_root[data-stsc-theme="violet"] {
+#stsc_floating_root[data-stsc-theme="violet"],
+#stsc_floating_panel[data-stsc-theme="violet"] {
   --stsc-accent: #c1a9ef;
   --stsc-panel: rgba(31, 29, 37, 0.965);
   --stsc-card: rgba(255, 255, 255, 0.058);
@@ -833,7 +837,8 @@ body.stsc-modal-open {
 
 #stsc_manager_overlay[data-stsc-theme="gold"],
 #stsc_dialog_overlay[data-stsc-theme="gold"],
-#stsc_floating_root[data-stsc-theme="gold"] {
+#stsc_floating_root[data-stsc-theme="gold"],
+#stsc_floating_panel[data-stsc-theme="gold"] {
   --stsc-accent: #e4c58d;
   --stsc-panel: rgba(33, 31, 27, 0.965);
   --stsc-card: rgba(255, 255, 255, 0.057);
@@ -1394,5 +1399,79 @@ body.stsc-modal-open {
     flex-basis: 38px !important;
     width: 38px !important;
     min-width: 38px !important;
+  }
+}
+
+
+/* v0.1.7：移动端悬浮问答面板彻底脱离按钮容器，并由 JS 按 visualViewport 设置明确像素尺寸。 */
+#stsc_floating_panel {
+  position: fixed !important;
+  z-index: 2147483600 !important;
+  display: flex;
+  flex-direction: column;
+  min-width: 0 !important;
+  min-height: 220px !important;
+  box-sizing: border-box !important;
+  pointer-events: auto !important;
+  overscroll-behavior: contain;
+}
+
+#stsc_floating_panel.stsc-hidden {
+  display: none !important;
+}
+
+#stsc_floating_panel .stsc-floating-header,
+#stsc_floating_panel .stsc-floating-footer {
+  flex: 0 0 auto;
+}
+
+#stsc_floating_panel .stsc-floating-content {
+  flex: 1 1 auto;
+  min-height: 0 !important;
+  max-height: none !important;
+  overflow-y: auto !important;
+  overflow-x: hidden !important;
+  touch-action: pan-y;
+  -webkit-overflow-scrolling: touch;
+}
+
+#stsc_floating_panel .stsc-floating-footer,
+#stsc_floating_panel #stsc_floating_open_manager {
+  writing-mode: horizontal-tb !important;
+  text-orientation: mixed !important;
+}
+
+#stsc_floating_panel #stsc_floating_open_manager {
+  display: flex !important;
+  flex-direction: row !important;
+  width: 100% !important;
+  min-width: 0 !important;
+  white-space: nowrap !important;
+}
+
+#stsc_floating_panel:not([data-stsc-theme="default"]) .menu_button {
+  color: var(--stsc-text) !important;
+  background: var(--stsc-button) !important;
+  border-color: var(--stsc-border) !important;
+  box-shadow: none !important;
+}
+
+@media (max-width: 720px) {
+  #stsc_floating_panel {
+    border-radius: 15px !important;
+    max-width: none !important;
+    max-height: none !important;
+  }
+
+  #stsc_floating_panel .stsc-floating-header {
+    padding: 10px 11px !important;
+  }
+
+  #stsc_floating_panel .stsc-floating-content {
+    padding: 9px !important;
+  }
+
+  #stsc_floating_panel .stsc-floating-footer {
+    padding: 9px 10px !important;
   }
 }
