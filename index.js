@@ -1,13 +1,13 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.1.5';
+const STSC_VERSION = '0.1.6';
 const STSC_CHECK_TAG = 'stsc_self_check';
 const STSC_RESPONSE_TAG = 'stsc_response';
-const STSC_CHECK_OPEN_RE = /<(?:stsc_self_check|self_check)\b[^>]*>/i;
-const STSC_CHECK_CLOSE_RE = /<\/(?:stsc_self_check|self_check)>/i;
-const STSC_RESPONSE_OPEN_RE = /<(?:stsc_response|response)\b[^>]*>/i;
-const STSC_RESPONSE_CLOSE_RE = /<\/(?:stsc_response|response)>/i;
+const STSC_CHECK_OPEN_RE = /<stsc_self_check\b[^>]*>/i;
+const STSC_CHECK_CLOSE_RE = /<\/stsc_self_check>/i;
+const STSC_RESPONSE_OPEN_RE = /<stsc_response\b[^>]*>/i;
+const STSC_RESPONSE_CLOSE_RE = /<\/stsc_response>/i;
 
 const POSITION_MAP = Object.freeze({
     prompt: 0,
@@ -67,6 +67,7 @@ let editDirty = false;
 let pendingUnsavedAction = null;
 let streamDomObserver = null;
 let floatingDragState = null;
+let suppressFloatingClickUntil = 0;
 
 function ctx() {
     return globalThis.SillyTavern?.getContext?.();
@@ -514,13 +515,9 @@ function endFloatingDrag(event) {
     if (state.moved) {
         const rect = root.getBoundingClientRect();
         persistFloatingPosition(rect.left, rect.top);
+        suppressFloatingClickUntil = Date.now() + 450;
         event.preventDefault();
-        return;
     }
-
-    // 移动端不依赖 click 事件，轻触 pointerup 直接展开。
-    toggleFloatingPanel();
-    event.preventDefault();
 }
 
 function characterEntityFrom(character, index = '') {
@@ -938,48 +935,74 @@ function liveResponseText(raw) {
     return body;
 }
 
+function getMessageIdFromElement(element) {
+    if (!element) return -1;
+    const raw = element.getAttribute('mesid') ?? element.dataset?.mesid ?? element.getAttribute('data-mesid');
+    return /^\d+$/.test(String(raw ?? '')) ? Number(raw) : -1;
+}
+
 function findStreamingMessageElement() {
+    if (!pendingRun) return $();
     const context = ctx();
-    const candidateId = Math.max(0, (context?.chat?.length || 1) - 1);
-    const selectors = [
-        `.mes[mesid="${candidateId}"]`,
-        `.mes[data-mesid="${candidateId}"]`,
-        '#chat .mes.last_mes',
-        '#chat .mes:last',
-    ];
-    for (const selector of selectors) {
-        const $message = $(selector).last();
-        if ($message.length && !$message.hasClass('is_user')) return $message;
+    const elements = Array.from(document.querySelectorAll('#chat .mes')).reverse();
+    const minId = Number.isInteger(pendingRun.targetMessageFloor) ? pendingRun.targetMessageFloor : 0;
+
+    for (const element of elements) {
+        const id = getMessageIdFromElement(element);
+        if (id < minId) continue;
+        const message = context?.chat?.[id];
+        // 只允许遮罩 AI 消息，绝不根据 CSS 类猜测用户消息。
+        if (!message || message.is_user || message.is_system) continue;
+        const text = element.querySelector('.mes_text');
+        if (!text) continue;
+        return $(element);
     }
     return $();
 }
 
+function hasStartedPluginSelfCheck(raw = '') {
+    return /<stsc_self_check\b/i.test(String(raw));
+}
+
+function clearStreamMask(target = null) {
+    const $targets = target ? $(target) : $('#chat .mes.stsc-stream-masked');
+    $targets.each(function () {
+        const $message = $(this);
+        $message.removeClass('stsc-stream-masked');
+        $message.find('.stsc-stream-cover').remove();
+    });
+}
+
 function maskStreamingSelfCheck() {
     if (!pendingRun || pendingRun.mode !== 'single') return;
+    if (!hasStartedPluginSelfCheck(pendingRun.streamBuffer || '')) return;
     const $message = findStreamingMessageElement();
     if (!$message.length) return;
-    const $text = $message.find('.mes_text').first();
-    if (!$text.length) return;
 
-    const visibleBody = liveResponseText(pendingRun.streamBuffer || '');
-    $message.addClass('stsc-live-filtered');
-    const desiredHtml = visibleBody === null
-        ? '<div class="stsc-live-wait"><span class="stsc-live-dot"></span>正在完成写作前置自检，自检内容仅保存在插件中……</div>'
-        : (escapeHtml(visibleBody).replaceAll('\n', '<br>') || '<div class="stsc-live-wait"><span class="stsc-live-dot"></span>自检已完成，正在开始正文……</div>');
-    if ($text.attr('data-stsc-live-html') === desiredHtml) return;
-    $text.attr('data-stsc-live-html', desiredHtml).html(desiredHtml);
+    // 不改写 .mes_text，不触碰 Markdown、思维链、状态栏或任何其他插件标签。
+    // 这里只给当前 AI 消息盖一层临时遮罩，生成完成后再从原始消息中剥离自检。
+    if (!$message.hasClass('stsc-stream-masked')) {
+        $message.addClass('stsc-stream-masked');
+    }
+    if (!$message.find('.stsc-stream-cover').length) {
+        const cover = document.createElement('div');
+        cover.className = 'stsc-stream-cover';
+        cover.innerHTML = '<span class="stsc-live-dot"></span><span>正在完成写作前置自检，自检内容仅保存在插件中……</span>';
+        const block = $message.find('.mes_block').first()[0] || $message[0];
+        block.appendChild(cover);
+    }
 }
 
 function ensureStreamDomObserver() {
     if (streamDomObserver || !document.querySelector('#chat')) return;
     streamDomObserver = new MutationObserver(() => {
         if (!pendingRun || pendingRun.mode !== 'single') return;
+        if (!hasStartedPluginSelfCheck(pendingRun.streamBuffer || '')) return;
         requestAnimationFrame(maskStreamingSelfCheck);
     });
     streamDomObserver.observe(document.querySelector('#chat'), {
         childList: true,
         subtree: true,
-        characterData: true,
     });
 }
 
@@ -988,8 +1011,9 @@ function handleStreamTokenReceived(data) {
     const text = streamTextFromEvent(data);
     if (!text) return;
     pendingRun.streamBuffer = mergeStreamText(pendingRun.streamBuffer, text);
-    requestAnimationFrame(maskStreamingSelfCheck);
-    setTimeout(maskStreamingSelfCheck, 0);
+    if (hasStartedPluginSelfCheck(pendingRun.streamBuffer)) {
+        requestAnimationFrame(maskStreamingSelfCheck);
+    }
 }
 
 function resolveMessageId(data) {
@@ -1013,21 +1037,14 @@ function updateMessageText(message, body) {
 function refreshMessageDom(messageId, message) {
     const context = ctx();
     const id = Number(messageId);
-    const render = () => {
-        try {
-            context?.updateMessageBlock?.(id, message);
-            const $message = $(`#chat .mes[mesid="${id}"], #chat .mes[data-mesid="${id}"]`).first();
-            $message.removeClass('stsc-live-filtered');
-            $message.find('.mes_text').removeAttr('data-stsc-live-html');
-        } catch (error) {
-            console.warn('[STSC] 立即刷新已剥离自检的正文失败：', error);
-        }
-    };
-    render();
-    // 流式结束时 ST 可能仍会进行一次最终渲染，短暂延迟后再覆盖一次。
-    requestAnimationFrame(render);
-    setTimeout(render, 40);
-    setTimeout(render, 160);
+    try {
+        context?.updateMessageBlock?.(id, message);
+    } catch (error) {
+        console.warn('[STSC] 刷新已剥离自检的正文失败：', error);
+    } finally {
+        const $message = $(`#chat .mes[mesid="${id}"], #chat .mes[data-mesid="${id}"]`).first();
+        clearStreamMask($message);
+    }
 }
 
 function makeLatestResult({ parsed, questions, mode, messageId, strictRaw = '', strictStatus = '' }) {
@@ -1159,20 +1176,33 @@ function addMessageBadge(messageId) {
 
 function handleCharacterMessageRendered(data) {
     const messageId = resolveMessageId(data);
-    const message = ctx()?.chat?.[messageId];
     const latest = getLatestResult();
-    if (message && Number(latest?.messageId) === Number(messageId)) {
-        refreshMessageDom(messageId, message);
+    // 只有完成自检剥离后才移除遮罩，避免最终渲染事件早于解析时短暂泄露自检。
+    if (!pendingRun || Number(latest?.messageId) === Number(messageId)) {
+        const $message = $(`#chat .mes[mesid="${messageId}"], #chat .mes[data-mesid="${messageId}"]`).first();
+        clearStreamMask($message);
     }
     addMessageBadge(messageId);
 }
 
 function onGenerationEnded() {
     clearRuntimePrompts();
+    // 正常情况下 MESSAGE_RECEIVED 会负责剥离和清理；这里仅在流程已经结束时兜底。
+    setTimeout(() => {
+        if (!pendingRun) clearStreamMask();
+    }, 300);
+    // 极端情况下没有收到最终消息事件，避免遮罩永久残留。
+    setTimeout(() => {
+        if (pendingRun && Date.now() - pendingRun.startedAt > 4500) {
+            clearStreamMask();
+            pendingRun = null;
+        }
+    }, 5000);
 }
 
 function onGenerationStopped() {
     clearRuntimePrompts();
+    clearStreamMask();
     pendingRun = null;
     strictBusy = false;
 }
@@ -1200,6 +1230,13 @@ globalThis.sillyTavernSelfCheckInterceptor = async function (_chat, _contextSize
         return;
     }
 
+    const lastMessageId = Math.max(0, (context.chat?.length || 1) - 1);
+    const lastMessage = context.chat?.[lastMessageId];
+    // 普通发送时，AI消息会出现在当前用户消息之后；重生成/续写时则复用最后一条AI消息。
+    const targetMessageFloor = lastMessage && !lastMessage.is_user && !lastMessage.is_system
+        ? lastMessageId
+        : (context.chat?.length || 0);
+
     pendingRun = {
         mode: settings.mode,
         questions: clone(questions),
@@ -1208,6 +1245,7 @@ globalThis.sillyTavernSelfCheckInterceptor = async function (_chat, _contextSize
         strictCheck: '',
         strictParsed: null,
         streamBuffer: '',
+        targetMessageFloor,
     };
     ensureStreamDomObserver();
     requestAnimationFrame(maskStreamingSelfCheck);
@@ -1906,9 +1944,10 @@ ${questionText}
 function bindUiEvents() {
     $('#stsc_close_manager').on('click', closeManager);
     $('#stsc_save_changes').on('click', () => commitEditDraft());
-    // 点击由 pointerup 统一处理，避免移动端 pointer/click 重复触发导致“点了又关”。
     $('#stsc_floating_button').on('click', function (event) {
         event.preventDefault();
+        if (Date.now() < suppressFloatingClickUntil) return;
+        toggleFloatingPanel();
     });
     $('#stsc_floating_button').on('pointerdown', beginFloatingDrag);
     $(document).on('pointermove.stscFloating', moveFloatingDrag);
