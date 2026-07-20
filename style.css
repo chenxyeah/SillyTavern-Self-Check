@@ -1119,11 +1119,20 @@ body.stsc-modal-open {
   display: contents !important;
 }
 
-/* 流式阶段不重写消息 HTML，只暂时遮住当前 AI 消息，避免泄露自检和破坏 Markdown/代码渲染。 */
-#chat .mes.stsc-stream-masked .mes_text,
-#chat .mes.stsc-stream-masked .mes_reasoning,
-#chat .mes.stsc-stream-masked .mes_reasoning_details,
-#chat .mes.stsc-stream-masked .reasoning {
+/*
+ * 流式阶段只隐藏本插件自己的自检区段：
+ * - 尚未出现 <stsc_response> 时显示简短占位；
+ * - 一旦正文标签开始，立即镜像正文，让用户继续边生成边阅读；
+ * - 原始流式 DOM 暂时隐藏，最终由 SillyTavern 用剥离后的正文正常重绘。
+ */
+#chat .mes.stsc-stream-selfcheck .mes_text,
+#chat .mes.stsc-stream-selfcheck .mes_reasoning,
+#chat .mes.stsc-stream-selfcheck .mes_reasoning_details,
+#chat .mes.stsc-stream-selfcheck .reasoning,
+#chat .mes.stsc-stream-live .mes_text,
+#chat .mes.stsc-stream-live .mes_reasoning,
+#chat .mes.stsc-stream-live .mes_reasoning_details,
+#chat .mes.stsc-stream-live .reasoning {
   display: none !important;
 }
 
@@ -1138,6 +1147,19 @@ body.stsc-modal-open {
   opacity: 0.78;
   line-height: 1.55;
   font-size: 0.92em;
+}
+
+.stsc-stream-live-response {
+  width: 100%;
+  min-width: 0;
+  padding: 0;
+  color: var(--SmartThemeBodyColor, inherit);
+  font: inherit;
+  line-height: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 /* 所有插件按钮强制横向排字，抵消部分美化主题的窄按钮/竖排规则。 */
@@ -1475,3 +1497,56 @@ body.stsc-modal-open {
     padding: 9px 10px !important;
   }
 }
+
+/* v0.1.8：问答格式、依据展示与移动端关闭按钮 */
+.stsc-qa-label {
+  font-weight: 800;
+  color: var(--stsc-accent);
+}
+
+.stsc-evidence-text {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed color-mix(in srgb, var(--stsc-border) 78%, transparent);
+  line-height: 1.65;
+  white-space: pre-wrap;
+}
+
+.stsc-answer-source {
+  margin-top: 8px;
+  color: var(--stsc-muted-text);
+  font-size: 0.78rem;
+  line-height: 1.45;
+  opacity: 0.9;
+}
+
+#stsc_floating_close {
+  position: relative;
+  z-index: 4;
+  flex: 0 0 40px !important;
+  width: 40px !important;
+  min-width: 40px !important;
+  height: 40px !important;
+  min-height: 40px !important;
+  padding: 0 !important;
+  display: inline-grid !important;
+  place-items: center !important;
+  pointer-events: auto !important;
+  touch-action: manipulation !important;
+  -webkit-tap-highlight-color: transparent;
+}
+
+@media (max-width: 720px) {
+  #stsc_floating_close {
+    flex-basis: 42px !important;
+    width: 42px !important;
+    min-width: 42px !important;
+    height: 42px !important;
+    min-height: 42px !important;
+  }
+
+  .stsc-stream-live-response {
+    overflow-wrap: break-word;
+  }
+}
+

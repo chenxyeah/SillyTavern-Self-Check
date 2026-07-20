@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.1.7';
+const STSC_VERSION = '0.1.8';
 const STSC_CHECK_TAG = 'stsc_self_check';
 const STSC_RESPONSE_TAG = 'stsc_response';
 const STSC_CHECK_OPEN_RE = /<stsc_self_check\b[^>]*>/i;
@@ -545,18 +545,26 @@ function layoutFloatingPanel() {
 }
 
 function toggleFloatingPanel(forceOpen = null) {
-    const $panel = $('#stsc_floating_panel');
-    if (!$panel.length) return;
+    const panel = document.getElementById('stsc_floating_panel');
+    if (!panel) return;
+    const $panel = $(panel);
     const shouldOpen = forceOpen === null ? $panel.hasClass('stsc-hidden') : Boolean(forceOpen);
-    $panel.toggleClass('stsc-hidden', !shouldOpen).attr('aria-hidden', shouldOpen ? 'false' : 'true');
-    if (shouldOpen) {
-        renderFloating();
-        requestAnimationFrame(() => {
-            layoutFloatingPanel();
-            $('#stsc_floating_panel').trigger('focus');
-        });
-        setTimeout(layoutFloatingPanel, 80);
+
+    if (!shouldOpen) {
+        // layoutFloatingPanel 会写入 inline display:flex!important。关闭时必须先移除，
+        // 否则移动端的 .stsc-hidden 无法覆盖内联 important，表现为关闭按钮失效。
+        panel.style.removeProperty('display');
+        $panel.addClass('stsc-hidden').attr('aria-hidden', 'true');
+        return;
     }
+
+    $panel.removeClass('stsc-hidden').attr('aria-hidden', 'false');
+    renderFloating();
+    requestAnimationFrame(() => {
+        layoutFloatingPanel();
+        panel.focus?.({ preventScroll: true });
+    });
+    setTimeout(layoutFloatingPanel, 80);
 }
 
 function beginFloatingDrag(event) {
@@ -707,7 +715,7 @@ function makeReferenceQuestion(reference) {
         length: 'standard',
         requireEvidence: true,
         enabled: true,
-        source: `资料库：${reference.name}`,
+        source: `参考资料-${reference.name}`,
     };
 }
 
@@ -718,13 +726,13 @@ function getActiveQuestions(settings = normalizeSettings()) {
 
     if (settings.generalEnabled && general?.enabled) {
         for (const question of general.questions.filter(x => x.enabled && x.text.trim())) {
-            result.push({ ...clone(question), source: `通用：${general.name}` });
+            result.push({ ...clone(question), source: `通用自检预设-${general.name}` });
         }
     }
 
     if (settings.characterEnabled && character?.enabled && character.id !== general?.id) {
         for (const question of character.questions.filter(x => x.enabled && x.text.trim())) {
-            result.push({ ...clone(question), source: `角色：${character.name}` });
+            result.push({ ...clone(question), source: `角色自检预设-${character.name}` });
         }
     }
 
@@ -768,17 +776,20 @@ function lengthInstruction(length) {
 function buildQuestionXml(questions) {
     return questions.map((question, index) => {
         const typeRule = question.type === 'boolean'
-            ? '判断题：回答必须先明确写“是”或“否”，再补充说明。'
-            : '开放问答题：必须给出具体结论，不得只写“已注意”“会遵守”。';
+            ? '判断题：<answer>必须以“是”或“否”开头，再补充具体说明。'
+            : '开放问答题：<answer>必须给出具体结论，不得只写“已注意”“会遵守”。';
         const evidenceRule = question.requireEvidence
-            ? '必须给出可核对的剧情依据、角色设定依据或世界观依据。'
-            : '无需强制引用依据，但回答必须明确。';
+            ? '必须另外输出非空的<evidence>，写明可核对的剧情依据、角色设定依据或世界观依据；不得把依据只混写在<answer>里。'
+            : '无需强制输出<evidence>；回答必须明确。';
+        const requiredFields = question.requireEvidence ? 'answer,evidence' : 'answer';
         return [
-            `<question id="${escapeXml(question.id)}" index="${index + 1}">`,
+            `<question id="${escapeXml(question.id)}" index="${index + 1}" evidence_required="${question.requireEvidence ? 'true' : 'false'}">`,
             `<text>${escapeXml(question.text)}</text>`,
+            `<source>${escapeXml(question.source || '')}</source>`,
             `<type>${typeRule}</type>`,
             `<length>${lengthInstruction(question.length)}</length>`,
-            `<evidence>${evidenceRule}</evidence>`,
+            `<evidence_rule>${evidenceRule}</evidence_rule>`,
+            `<required_fields>${requiredFields}</required_fields>`,
             `</question>`,
         ].join('\n');
     }).join('\n');
@@ -795,10 +806,13 @@ function buildSinglePrompt(questions) {
 3. 不展示失败草稿、反复推理过程或隐藏思维，只展示最终可供用户核对的简洁答案。
 4. 不得漏题、合并题目或改变题目编号。
 5. 自检完成前绝对不得开始正文。
+6. 对标记 evidence_required="true" 的问题，必须在同一个<item>中同时输出非空的<answer>与<evidence>；缺少<evidence>即视为格式错误。
+7. <answer>只写最终结论与本轮演绎方案；<evidence>单独写支撑该结论的具体剧情、角色设定或世界观依据。
 
 你必须严格输出以下结构：
 <stsc_self_check>
-每题使用：<item id="题目ID"><answer>最终回答</answer></item>
+无需依据：<item id="题目ID"><answer>最终回答</answer></item>
+需要依据：<item id="题目ID"><answer>最终回答</answer><evidence>具体依据</evidence></item>
 </stsc_self_check>
 <stsc_response>
 正文、状态栏以及用户要求的全部正常输出格式
@@ -817,8 +831,11 @@ function buildStrictCheckPrompt(questions) {
 
 严格输出：
 <stsc_self_check>
-每题使用：<item id="题目ID"><answer>最终回答</answer></item>
+无需依据：<item id="题目ID"><answer>最终回答</answer></item>
+需要依据：<item id="题目ID"><answer>最终回答</answer><evidence>具体剧情、角色设定或世界观依据</evidence></item>
 </stsc_self_check>
+
+凡问题标记 evidence_required="true"，<evidence>不得省略、不得为空，也不得只把依据混写在<answer>中。
 
 本轮问题：
 ${buildQuestionXml(questions)}
@@ -919,8 +936,10 @@ function parseItems(checkInner) {
         const id = match[1].trim();
         const itemBody = match[2];
         const answerMatch = itemBody.match(/<answer[^>]*>([\s\S]*?)<\/answer>/i);
-        const answer = (answerMatch?.[1] ?? itemBody).trim();
-        items.push({ id, answer });
+        const evidenceMatch = itemBody.match(/<evidence[^>]*>([\s\S]*?)<\/evidence>/i);
+        const answer = (answerMatch?.[1] ?? '').trim();
+        const evidence = (evidenceMatch?.[1] ?? '').trim();
+        items.push({ id, answer, evidence });
     }
     return items;
 }
@@ -986,17 +1005,29 @@ function parseModelOutput(text, expectedQuestions = []) {
     result.items = parseItems(inner);
     result.body = unwrapResponse(after);
 
-    const itemMap = new Map(result.items.map(item => [item.id, item.answer]));
-    result.answers = expectedQuestions.map(question => ({
-        id: question.id,
-        question: question.text,
-        source: question.source || '',
-        answer: itemMap.get(question.id) || '',
-    }));
+    const itemMap = new Map(result.items.map(item => [item.id, item]));
+    result.answers = expectedQuestions.map(question => {
+        const item = itemMap.get(question.id) || {};
+        return {
+            id: question.id,
+            question: question.text,
+            source: question.source || '',
+            type: question.type || 'open',
+            requireEvidence: Boolean(question.requireEvidence),
+            answer: item.answer || '',
+            evidence: item.evidence || '',
+        };
+    });
 
     for (const answer of result.answers) {
         if (!answer.answer.trim()) {
             result.formatIssues.push(`缺少问题“${answer.question}”的回答。`);
+        }
+        if (answer.type === 'boolean' && answer.answer.trim() && !/^(是|否)(?:[，。；：:、\s]|$)/.test(answer.answer.trim())) {
+            result.formatIssues.push(`判断题“${answer.question}”的回答没有以“是”或“否”开头。`);
+        }
+        if (answer.requireEvidence && !answer.evidence.trim()) {
+            result.formatIssues.push(`问题“${answer.question}”已勾选需要依据，但AI没有输出独立的<evidence>依据。`);
         }
     }
 
@@ -1063,32 +1094,55 @@ function hasStartedPluginSelfCheck(raw = '') {
 }
 
 function clearStreamMask(target = null) {
-    const $targets = target ? $(target) : $('#chat .mes.stsc-stream-masked');
+    const $targets = target ? $(target) : $('#chat .mes.stsc-stream-selfcheck, #chat .mes.stsc-stream-live');
     $targets.each(function () {
         const $message = $(this);
-        $message.removeClass('stsc-stream-masked');
-        $message.find('.stsc-stream-cover').remove();
+        $message.removeClass('stsc-stream-selfcheck stsc-stream-live');
+        $message.find('.stsc-stream-cover, .stsc-stream-live-response').remove();
     });
 }
 
-function maskStreamingSelfCheck() {
-    if (!pendingRun || pendingRun.mode !== 'single') return;
-    if (!hasStartedPluginSelfCheck(pendingRun.streamBuffer || '')) return;
-    const $message = findStreamingMessageElement();
-    if (!$message.length) return;
-
-    // 不改写 .mes_text，不触碰 Markdown、思维链、状态栏或任何其他插件标签。
-    // 这里只给当前 AI 消息盖一层临时遮罩，生成完成后再从原始消息中剥离自检。
-    if (!$message.hasClass('stsc-stream-masked')) {
-        $message.addClass('stsc-stream-masked');
-    }
+function ensureStreamCover($message) {
+    $message.addClass('stsc-stream-selfcheck').removeClass('stsc-stream-live');
+    $message.find('.stsc-stream-live-response').remove();
     if (!$message.find('.stsc-stream-cover').length) {
         const cover = document.createElement('div');
         cover.className = 'stsc-stream-cover';
         cover.innerHTML = '<span class="stsc-live-dot"></span><span>正在完成写作前置自检，自检内容仅保存在插件中……</span>';
-        const block = $message.find('.mes_block').first()[0] || $message[0];
-        block.appendChild(cover);
+        const text = $message.find('.mes_text').first();
+        if (text.length) text.after(cover);
+        else ($message.find('.mes_block').first()[0] || $message[0]).appendChild(cover);
     }
+}
+
+function ensureLiveResponse($message, body) {
+    $message.removeClass('stsc-stream-selfcheck').addClass('stsc-stream-live');
+    $message.find('.stsc-stream-cover').remove();
+    let live = $message.find('.stsc-stream-live-response').first();
+    if (!live.length) {
+        live = $('<div class="stsc-stream-live-response" aria-live="polite"></div>');
+        const text = $message.find('.mes_text').first();
+        if (text.length) text.after(live);
+        else $message.find('.mes_block').first().append(live);
+    }
+    // 流式阶段只镜像本插件 <stsc_response> 内的正文。使用 textContent，避免临时渲染破坏
+    // Markdown、代码块、状态栏或其他插件标签；生成完成后由 SillyTavern 正常重绘。
+    live[0].textContent = String(body || '');
+}
+
+function updateStreamingSelfCheckDisplay() {
+    if (!pendingRun || pendingRun.mode !== 'single') return;
+    const raw = pendingRun.streamBuffer || '';
+    if (!hasStartedPluginSelfCheck(raw)) return;
+    const $message = findStreamingMessageElement();
+    if (!$message.length) return;
+
+    const responseBody = liveResponseText(raw);
+    if (responseBody === null) {
+        ensureStreamCover($message);
+        return;
+    }
+    ensureLiveResponse($message, responseBody);
 }
 
 function ensureStreamDomObserver() {
@@ -1096,7 +1150,7 @@ function ensureStreamDomObserver() {
     streamDomObserver = new MutationObserver(() => {
         if (!pendingRun || pendingRun.mode !== 'single') return;
         if (!hasStartedPluginSelfCheck(pendingRun.streamBuffer || '')) return;
-        requestAnimationFrame(maskStreamingSelfCheck);
+        requestAnimationFrame(updateStreamingSelfCheckDisplay);
     });
     streamDomObserver.observe(document.querySelector('#chat'), {
         childList: true,
@@ -1110,7 +1164,7 @@ function handleStreamTokenReceived(data) {
     if (!text) return;
     pendingRun.streamBuffer = mergeStreamText(pendingRun.streamBuffer, text);
     if (hasStartedPluginSelfCheck(pendingRun.streamBuffer)) {
-        requestAnimationFrame(maskStreamingSelfCheck);
+        requestAnimationFrame(updateStreamingSelfCheckDisplay);
     }
 }
 
@@ -1346,7 +1400,7 @@ globalThis.sillyTavernSelfCheckInterceptor = async function (_chat, _contextSize
         targetMessageFloor,
     };
     ensureStreamDomObserver();
-    requestAnimationFrame(maskStreamingSelfCheck);
+    requestAnimationFrame(updateStreamingSelfCheckDisplay);
 
     if (settings.mode === 'strict') {
         if (strictBusy) return;
@@ -1438,6 +1492,24 @@ function renderManagerSubtitle() {
     $('#stsc_manager_subtitle').text(`${summary.entity.name}｜${summary.presetText}｜${summary.questions.length}题`);
 }
 
+function renderAnswerCard(answer, index) {
+    const number = index + 1;
+    const evidence = answer.evidence || '';
+    const evidenceHtml = (answer.requireEvidence || evidence)
+        ? `<div class="stsc-evidence-text"><span class="stsc-qa-label">A${number}依据：</span>${escapeHtml(evidence || '（未识别到依据）')}</div>`
+        : '';
+    const sourceHtml = answer.source
+        ? `<div class="stsc-answer-source">问题来源：${escapeHtml(answer.source)}</div>`
+        : '';
+    return `
+        <div class="stsc-answer-card">
+            <div class="stsc-question-text"><span class="stsc-qa-label">Q${number}：</span>${escapeHtml(answer.question || '')}</div>
+            <div class="stsc-answer-text"><span class="stsc-qa-label">A${number}：</span>${escapeHtml(answer.answer || '（未识别到回答）')}</div>
+            ${evidenceHtml}
+            ${sourceHtml}
+        </div>`;
+}
+
 function renderStatusTab() {
     const settings = getUiSettings();
     const summary = activeSummary(settings);
@@ -1449,12 +1521,7 @@ function renderStatusTab() {
     let latestHtml = '<div class="stsc-empty">还没有自检记录。</div>';
     if (latest) {
         const answers = (latest.answers || []).length
-            ? latest.answers.map((answer, i) => `
-                <div class="stsc-answer-card">
-                    <div class="stsc-question-text">${i + 1}. ${escapeHtml(answer.question)}</div>
-                    ${answer.source ? `<div class="stsc-muted">${escapeHtml(answer.source)}</div>` : ''}
-                    <div class="stsc-answer-text">${escapeHtml(answer.answer || '（未识别到回答）')}</div>
-                </div>`).join('')
+            ? latest.answers.map((answer, i) => renderAnswerCard(answer, i)).join('')
             : `<div class="stsc-test-result">${escapeHtml(latest.rawCheck || '没有可显示的自检内容。')}</div>`;
 
         const issues = (latest.formatIssues || []).length
@@ -1770,7 +1837,7 @@ function renderSettingsTab() {
         </div>
         <div class="stsc-section">
             <div class="stsc-section-title">上下文处理</div>
-            <div>自检问答不会保留在聊天正文中；流式生成时会隐藏专用自检标签，只显示“正在自检”的占位提示；完成后自检只在插件与悬浮窗中查看。</div>
+            <div>自检问答不会保留在聊天正文中；流式生成时仅在自检阶段显示占位提示，进入正文阶段后会继续实时显示正在生成的正文；完成后自检只在插件与悬浮窗中查看。</div>
             <div>聊天记录只保留正文、状态栏和其他正常输出；下一轮AI读取不到上一轮自检。</div>
             <div class="stsc-code-note">&lt;stsc_self_check&gt;…&lt;/stsc_self_check&gt; → 仅插件可见\n&lt;stsc_response&gt;…&lt;/stsc_response&gt; → 正常聊天正文</div>
         </div>
@@ -1787,6 +1854,8 @@ function renderFloating() {
     const enabled = Boolean(settings.appearance?.floatingEnabled);
     $root.toggleClass('stsc-hidden', !enabled).attr('aria-hidden', enabled ? 'false' : 'true');
     if (!enabled) {
+        const panel = document.getElementById('stsc_floating_panel');
+        panel?.style?.removeProperty('display');
         $('#stsc_floating_panel').addClass('stsc-hidden').attr('aria-hidden', 'true');
         return;
     }
@@ -1806,11 +1875,7 @@ function renderFloating() {
         ? `<div class="stsc-section"><div class="stsc-section-title stsc-status-warning">格式提示</div>${latest.formatIssues.map(x => `<div>• ${escapeHtml(x)}</div>`).join('')}</div>`
         : '';
     const answers = (latest.answers || []).length
-        ? latest.answers.map((answer, index) => `
-            <div class="stsc-answer-card">
-                <div class="stsc-question-text">${index + 1}. ${escapeHtml(answer.question)}</div>
-                <div class="stsc-answer-text">${escapeHtml(answer.answer || '（未识别到回答）')}</div>
-            </div>`).join('')
+        ? latest.answers.map((answer, index) => renderAnswerCard(answer, index)).join('')
         : `<div class="stsc-test-result">${escapeHtml(latest.rawCheck || '没有可显示的自检内容。')}</div>`;
     $('#stsc_floating_content').html(`${issues}${answers}`);
     if (!$('#stsc_floating_panel').hasClass('stsc-hidden')) requestAnimationFrame(layoutFloatingPanel);
@@ -2051,8 +2116,22 @@ function bindUiEvents() {
     $('#stsc_floating_button').on('pointerdown', beginFloatingDrag);
     $(document).on('pointermove.stscFloating', moveFloatingDrag);
     $(document).on('pointerup.stscFloating pointercancel.stscFloating', endFloatingDrag);
-    $('#stsc_floating_close').on('click', () => toggleFloatingPanel(false));
-    $('#stsc_floating_open_manager').on('click', () => { toggleFloatingPanel(false); openManager('status'); });
+    const closeFloating = (event) => {
+        event?.preventDefault?.();
+        event?.stopPropagation?.();
+        event?.stopImmediatePropagation?.();
+        toggleFloatingPanel(false);
+    };
+    const floatingCloseButton = document.getElementById('stsc_floating_close');
+    floatingCloseButton?.addEventListener('pointerup', closeFloating, { passive: false });
+    floatingCloseButton?.addEventListener('touchend', closeFloating, { passive: false });
+    floatingCloseButton?.addEventListener('click', closeFloating, { passive: false });
+    $('#stsc_floating_open_manager').on('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        toggleFloatingPanel(false);
+        openManager('status');
+    });
     $('#stsc_dialog_close').on('click', closeDialog);
 
     // 不再点击黑色背景关闭，避免用户拖选/复制文字时误退出插件。
