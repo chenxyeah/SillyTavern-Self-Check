@@ -1,0 +1,58 @@
+<div id="stsc_settings_block" class="stsc-settings-block">
+  <div class="inline-drawer">
+    <div class="inline-drawer-toggle inline-drawer-header">
+      <b>写作前置自检</b>
+      <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+    </div>
+    <div class="inline-drawer-content">
+      <label class="checkbox_label stsc-main-toggle">
+        <input id="stsc_enabled" type="checkbox" />
+        <span>启用插件</span>
+      </label>
+
+      <div class="stsc-compact-row">
+        <span>当前模式</span>
+        <select id="stsc_mode_quick" class="text_pole">
+          <option value="single">单次模式（省额度）</option>
+          <option value="strict">双阶段严格模式（两次调用）</option>
+        </select>
+      </div>
+
+      <div id="stsc_compact_summary" class="stsc-compact-summary"></div>
+      <div id="stsc_compact_status" class="stsc-compact-status"></div>
+
+      <div class="stsc-button-row">
+        <button id="stsc_open_manager" class="menu_button">打开管理器</button>
+        <button id="stsc_open_latest" class="menu_button">查看最新自检</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="stsc_manager_overlay" class="stsc-overlay stsc-hidden" aria-hidden="true">
+  <div class="stsc-manager" role="dialog" aria-modal="true" aria-label="写作前置自检管理器">
+    <div class="stsc-manager-header">
+      <div>
+        <div class="stsc-manager-title">写作前置自检</div>
+        <div id="stsc_manager_subtitle" class="stsc-manager-subtitle"></div>
+      </div>
+      <button id="stsc_close_manager" class="menu_button stsc-icon-button" title="关闭">✕</button>
+    </div>
+
+    <div class="stsc-tabs" role="tablist">
+      <button class="stsc-tab active" data-tab="status">当前状态</button>
+      <button class="stsc-tab" data-tab="presets">自检预设</button>
+      <button class="stsc-tab" data-tab="references">参考资料库</button>
+      <button class="stsc-tab" data-tab="temporary">临时指令</button>
+      <button class="stsc-tab" data-tab="settings">插件设置</button>
+    </div>
+
+    <div class="stsc-manager-body">
+      <section id="stsc_tab_status" class="stsc-tab-panel active"></section>
+      <section id="stsc_tab_presets" class="stsc-tab-panel"></section>
+      <section id="stsc_tab_references" class="stsc-tab-panel"></section>
+      <section id="stsc_tab_temporary" class="stsc-tab-panel"></section>
+      <section id="stsc_tab_settings" class="stsc-tab-panel"></section>
+    </div>
+  </div>
+</div>
