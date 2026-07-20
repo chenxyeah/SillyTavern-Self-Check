@@ -1510,3 +1510,154 @@ body.stsc-modal-open {
   opacity: 0 !important;
   pointer-events: none !important;
 }
+
+/* v0.2.1：世界书式参考资料库 */
+.stsc-reference-list {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  width: 100%;
+  min-width: 0;
+  margin-top: 10px;
+}
+
+.stsc-reference-card {
+  margin-top: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+.stsc-reference-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  padding: 9px 11px;
+}
+
+.stsc-reference-collapse-button {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin: 0;
+  padding: 4px 2px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.stsc-reference-collapse-button:hover .stsc-reference-summary-name {
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+
+.stsc-reference-chevron {
+  flex: 0 0 18px;
+  width: 18px;
+  font-size: 1rem;
+  text-align: center;
+  color: var(--stsc-accent);
+}
+
+.stsc-reference-summary-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 700;
+  line-height: 1.4;
+}
+
+.stsc-reference-enable {
+  flex: 0 0 auto;
+  display: inline-flex !important;
+  align-items: center;
+  gap: 6px;
+  margin: 0 !important;
+  white-space: nowrap;
+  font-size: 0.86rem;
+}
+
+.stsc-reference-body {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  padding: 12px;
+  border-top: 1px solid var(--stsc-border);
+}
+
+.stsc-reference-card.is-collapsed .stsc-reference-body {
+  display: none;
+}
+
+.stsc-reference-injection-section {
+  margin: 12px 0 0;
+  background: color-mix(in srgb, var(--stsc-accent) 7%, transparent);
+}
+
+.stsc-reference-question-section {
+  width: 100%;
+  min-width: 0;
+  margin-top: 12px;
+  padding: 11px;
+  border: 1px solid var(--stsc-border);
+  border-radius: 9px;
+  background: var(--stsc-soft);
+}
+
+.stsc-reference-question-section.is-disabled {
+  opacity: 0.68;
+}
+
+.stsc-reference-question-section.is-disabled textarea {
+  opacity: 0.85;
+}
+
+.stsc-reference-danger-row {
+  margin-top: 12px;
+  justify-content: flex-end;
+}
+
+.stsc-reference-danger-row .menu_button {
+  flex: 0 0 auto;
+}
+
+.stsc-reference-type-help {
+  display: grid;
+  gap: 7px;
+  margin-top: 11px;
+  padding: 10px 11px;
+  border: 1px solid var(--stsc-border);
+  border-radius: 9px;
+  background: var(--stsc-soft);
+  color: var(--stsc-muted-text);
+  font-size: 0.88rem;
+  line-height: 1.55;
+}
+
+@media (max-width: 720px) {
+  .stsc-reference-summary {
+    gap: 7px;
+    padding: 9px 10px;
+  }
+
+  .stsc-reference-enable {
+    font-size: 0.82rem;
+  }
+
+  .stsc-reference-body {
+    padding: 10px;
+  }
+
+  .stsc-reference-danger-row .menu_button {
+    flex: 1 1 100%;
+    width: 100%;
+  }
+}

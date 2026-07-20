@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.2.0';
+const STSC_VERSION = '0.2.1';
 const STSC_CHECK_TAG = 'stsc_self_check';
 const STSC_RESPONSE_TAG = 'stsc_response';
 const STSC_CHECK_OPEN_RE = /<stsc_self_check\b[^>]*>/i;
@@ -11,6 +11,36 @@ const STSC_RESPONSE_CLOSE_RE = /<\/stsc_response>/i;
 const STSC_PRESET_EXPORT_FORMAT = 'sillytavern-self-check-preset';
 const STSC_PRESET_EXPORT_VERSION = 1;
 const STSC_PRESET_IMPORT_MAX_BYTES = 2 * 1024 * 1024;
+
+const REFERENCE_TYPE_CONFIG = Object.freeze({
+    style: Object.freeze({
+        label: '文风',
+        position: 'prompt',
+        depth: 0,
+        role: 'system',
+        autoQuestion: '是否遵照【{{name}}】文风进行本轮写作？本轮将通过哪些具体语言、节奏与描写方式体现？',
+        promptTitle: '文风',
+        promptLead: '以下内容是本轮写作必须遵循的文风规范。请将其落实到措辞、句式、节奏、叙事视角与描写方式中，不要在正文中解释这些规则：',
+    }),
+    restriction: Object.freeze({
+        label: '限制',
+        position: 'chat',
+        depth: 0,
+        role: 'system',
+        autoQuestion: '是否遵照【{{name}}】限制？本轮将如何具体执行，并避免出现违反限制的内容？',
+        promptTitle: '强制限制',
+        promptLead: '以下内容是本轮必须遵守的强制限制。其要求应优先落实到最终正文中，不得忽略、弱化、绕开或仅口头承诺：',
+    }),
+    other: Object.freeze({
+        label: '其他',
+        position: 'before',
+        depth: 0,
+        role: 'system',
+        autoQuestion: '是否遵照【{{name}}】资料？本轮将如何具体体现其中要求？',
+        promptTitle: '其他资料',
+        promptLead: '以下内容是本轮需要参考并落实的外置资料。请结合当前剧情与角色设定执行，不要在正文中复述资料本身：',
+    }),
+});
 
 const POSITION_MAP = Object.freeze({
     prompt: 0,
@@ -70,6 +100,7 @@ let editDirty = false;
 let pendingUnsavedAction = null;
 let floatingDragState = null;
 let suppressFloatingClickUntil = 0;
+let expandedReferenceIds = new Set();
 
 function ctx() {
     return globalThis.SillyTavern?.getContext?.();
@@ -248,30 +279,59 @@ function normalizeQuestion(question) {
     if (question.enabled === undefined) question.enabled = true;
 }
 
-function createReference() {
+function referenceTypeConfig(type) {
+    return REFERENCE_TYPE_CONFIG[type] || REFERENCE_TYPE_CONFIG.other;
+}
+
+function createReference(name = '新参考资料', type = 'other') {
+    const config = referenceTypeConfig(type);
     return {
         id: uid('ref'),
-        name: '新参考资料',
+        name,
+        type: Object.hasOwn(REFERENCE_TYPE_CONFIG, type) ? type : 'other',
         content: '',
         enabled: true,
         scope: 'global',
         characterKey: '',
-        position: 'before',
-        depth: 0,
-        role: 'system',
+        position: config.position,
+        depth: config.depth,
+        role: config.role,
         addToCheck: false,
-        autoQuestion: '请结合当前剧情与设定，说明本轮是否遵守了【{{name}}】；若存在风险，具体应如何调整？',
+        autoQuestion: config.autoQuestion,
     };
 }
 
 function normalizeReference(reference) {
-    const defaults = createReference();
+    reference.type = Object.hasOwn(REFERENCE_TYPE_CONFIG, reference.type) ? reference.type : 'other';
+    const defaults = createReference('新参考资料', reference.type);
     for (const [key, value] of Object.entries(defaults)) {
         if (!Object.hasOwn(reference, key)) reference[key] = value;
     }
-    reference.position = ['before', 'prompt', 'chat'].includes(reference.position) ? reference.position : 'before';
-    reference.role = ['system', 'user', 'assistant'].includes(reference.role) ? reference.role : 'system';
-    reference.depth = clampNumber(reference.depth, 0, 20, 0);
+    reference.id ||= uid('ref');
+    reference.name ||= '未命名资料';
+    reference.content ||= '';
+    reference.enabled = Boolean(reference.enabled);
+    reference.scope = reference.scope === 'character' ? 'character' : 'global';
+    reference.characterKey ||= '';
+    reference.position = ['before', 'prompt', 'chat'].includes(reference.position) ? reference.position : defaults.position;
+    reference.role = ['system', 'user', 'assistant'].includes(reference.role) ? reference.role : defaults.role;
+    reference.depth = clampNumber(reference.depth, 0, 20, defaults.depth);
+    reference.addToCheck = Boolean(reference.addToCheck);
+    reference.autoQuestion = String(reference.autoQuestion || defaults.autoQuestion);
+    if (!reference.enabled) reference.addToCheck = false;
+}
+
+function applyReferenceTypeDefaults(reference, nextType, { preserveCustomQuestion = true } = {}) {
+    if (!reference) return;
+    const previousConfig = referenceTypeConfig(reference.type);
+    const nextConfig = referenceTypeConfig(nextType);
+    const currentQuestion = String(reference.autoQuestion || '').trim();
+    const isDefaultQuestion = !currentQuestion || Object.values(REFERENCE_TYPE_CONFIG).some(config => config.autoQuestion === currentQuestion) || currentQuestion === previousConfig.autoQuestion;
+    reference.type = Object.hasOwn(REFERENCE_TYPE_CONFIG, nextType) ? nextType : 'other';
+    reference.position = nextConfig.position;
+    reference.depth = nextConfig.depth;
+    reference.role = nextConfig.role;
+    if (!preserveCustomQuestion || isDefaultQuestion) reference.autoQuestion = nextConfig.autoQuestion;
 }
 
 function createTemporaryInstruction() {
@@ -706,7 +766,8 @@ function getActiveReferences(settings = normalizeSettings()) {
 }
 
 function makeReferenceQuestion(reference) {
-    const text = String(reference.autoQuestion || '')
+    const config = referenceTypeConfig(reference.type);
+    const text = String(reference.autoQuestion || config.autoQuestion || '')
         .replaceAll('{{name}}', reference.name || '未命名资料')
         .trim() || `请说明本轮是否遵守了【${reference.name || '未命名资料'}】。`;
 
@@ -717,7 +778,7 @@ function makeReferenceQuestion(reference) {
         length: 'standard',
         requireEvidence: true,
         enabled: true,
-        source: `参考资料-${reference.name}`,
+        source: `参考资料库-${config.label}-${reference.name}`,
     };
 }
 
@@ -861,9 +922,10 @@ ${buildQuestionXml(questions)}
 }
 
 function buildReferencePrompt(reference) {
+    const config = referenceTypeConfig(reference.type);
     return `
-[写作前置自检插件｜参考资料：${reference.name}]
-以下内容是本轮必须参考的外置协议、文风或限制：
+[写作前置自检插件｜参考资料库｜${config.promptTitle}：${reference.name}]
+${config.promptLead}
 
 ${reference.content.trim()}
 `.trim();
@@ -1563,56 +1625,125 @@ function renderReferencesTab() {
     const settings = getUiSettings();
     const entity = getCurrentEntity();
     const references = settings.references.length
-        ? settings.references.map(reference => `
-            <div class="stsc-reference-card" data-reference-id="${escapeHtml(reference.id)}">
-                <div class="stsc-card-header">
-                    <div class="stsc-card-title">${escapeHtml(reference.name)}</div>
-                    <button class="menu_button stsc-small-button stsc-danger-button" data-action="delete-reference">删除</button>
+        ? settings.references.map(reference => {
+            const expanded = expandedReferenceIds.has(reference.id);
+            const config = referenceTypeConfig(reference.type);
+            const questionDisabled = !reference.enabled;
+            const scopeText = reference.scope === 'character'
+                ? `角色专属${reference.characterKey ? '（已绑定）' : '（未绑定）'}`
+                : '通用生效';
+
+            return `
+            <div class="stsc-reference-card ${expanded ? 'is-expanded' : 'is-collapsed'}" data-reference-id="${escapeHtml(reference.id)}">
+                <div class="stsc-reference-summary">
+                    <button class="stsc-reference-collapse-button" type="button" data-action="toggle-reference-collapse" aria-expanded="${expanded ? 'true' : 'false'}">
+                        <span class="stsc-reference-chevron" aria-hidden="true">${expanded ? '▾' : '▸'}</span>
+                        <span class="stsc-reference-summary-name">${escapeHtml(reference.name)}</span>
+                    </button>
+                    <label class="checkbox_label stsc-reference-enable">
+                        <input type="checkbox" data-reference-field="enabled" ${reference.enabled ? 'checked' : ''}>
+                        <span>${reference.enabled ? '已启用' : '未启用'}</span>
+                    </label>
                 </div>
-                <div class="stsc-grid-2">
-                    <div class="stsc-field"><label>资料名称</label><input class="text_pole" data-reference-field="name" type="text" value="${escapeHtml(reference.name)}"></div>
-                    <div class="stsc-field"><label>启用与范围</label>
-                        <label class="checkbox_label"><input type="checkbox" data-reference-field="enabled" ${reference.enabled ? 'checked' : ''}> 启用资料</label>
-                        <select class="text_pole" data-reference-field="scope">
-                            <option value="global" ${reference.scope === 'global' ? 'selected' : ''}>通用生效</option>
-                            <option value="character" ${reference.scope === 'character' ? 'selected' : ''}>绑定角色：${escapeHtml(reference.characterKey ? '已绑定' : '未绑定')}</option>
-                        </select>
+
+                <div class="stsc-reference-body">
+                    <div class="stsc-grid-2">
+                        <div class="stsc-field">
+                            <label>资料库名称</label>
+                            <input class="text_pole" data-reference-field="name" type="text" maxlength="80" value="${escapeHtml(reference.name)}">
+                            <div class="stsc-dialog-error" data-reference-name-error></div>
+                        </div>
+                        <div class="stsc-field">
+                            <label>资料类型</label>
+                            <select class="text_pole" data-reference-field="type">
+                                <option value="style" ${reference.type === 'style' ? 'selected' : ''}>文风</option>
+                                <option value="restriction" ${reference.type === 'restriction' ? 'selected' : ''}>限制</option>
+                                <option value="other" ${reference.type === 'other' ? 'selected' : ''}>其他</option>
+                            </select>
+                            <div class="stsc-muted">${escapeHtml(referencePositionHint(reference))}</div>
+                        </div>
+                    </div>
+
+                    <div class="stsc-field" style="margin-top:9px">
+                        <label>${config.label}内容</label>
+                        <textarea class="text_pole stsc-textarea" data-reference-field="content" placeholder="在这里填写要注入给 AI 的完整资料内容">${escapeHtml(reference.content)}</textarea>
+                    </div>
+
+                    <div class="stsc-grid-2" style="margin-top:9px">
+                        <div class="stsc-field">
+                            <label>生效范围</label>
+                            <select class="text_pole" data-reference-field="scope">
+                                <option value="global" ${reference.scope === 'global' ? 'selected' : ''}>通用生效</option>
+                                <option value="character" ${reference.scope === 'character' ? 'selected' : ''}>角色专属</option>
+                            </select>
+                            <div class="stsc-muted">当前：${escapeHtml(scopeText)}</div>
+                        </div>
+                        <div class="stsc-field">
+                            <label>角色绑定</label>
+                            <button class="menu_button" type="button" data-action="bind-reference-character">绑定到 ${escapeHtml(entity.name)}</button>
+                            ${reference.characterKey ? `<div class="stsc-muted">已保存角色绑定；切换为“通用生效”时不会删除绑定记录。</div>` : '<div class="stsc-muted">角色专属资料需要先进入对应角色聊天并完成绑定。</div>'}
+                        </div>
+                    </div>
+
+                    <div class="stsc-section stsc-reference-injection-section">
+                        <div class="stsc-section-title">注入设置</div>
+                        <div class="stsc-muted">创建时已按“${config.label}”自动选择推荐位置，仍可手动调整。</div>
+                        <div class="stsc-grid-3" style="margin-top:9px">
+                            <div class="stsc-field">
+                                <label>注入位置</label>
+                                <select class="text_pole" data-reference-field="position">
+                                    <option value="before" ${reference.position === 'before' ? 'selected' : ''}>系统最前</option>
+                                    <option value="prompt" ${reference.position === 'prompt' ? 'selected' : ''}>主提示词内</option>
+                                    <option value="chat" ${reference.position === 'chat' ? 'selected' : ''}>聊天深度</option>
+                                </select>
+                            </div>
+                            <div class="stsc-field">
+                                <label>深度（0～20）</label>
+                                <input class="text_pole" data-reference-field="depth" type="number" min="0" max="20" value="${reference.depth}">
+                            </div>
+                            <div class="stsc-field">
+                                <label>角色</label>
+                                <select class="text_pole" data-reference-field="role">
+                                    <option value="system" ${reference.role === 'system' ? 'selected' : ''}>System</option>
+                                    <option value="user" ${reference.role === 'user' ? 'selected' : ''}>User</option>
+                                    <option value="assistant" ${reference.role === 'assistant' ? 'selected' : ''}>Assistant</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="stsc-reference-question-section ${questionDisabled ? 'is-disabled' : ''}">
+                        <label class="checkbox_label">
+                            <input type="checkbox" data-reference-field="addToCheck" ${reference.addToCheck ? 'checked' : ''} ${questionDisabled ? 'disabled' : ''}>
+                            自动加入自检问答末尾
+                        </label>
+                        <div class="stsc-muted">${questionDisabled ? '请先启用这个资料库，才能启用对应的自检问题。' : '启用后，AI 会先看到资料内容，再回答下面的自检问题。'}</div>
+                        <div class="stsc-field" style="margin-top:8px">
+                            <label>自动生成的自检问题（可修改）</label>
+                            <textarea class="text_pole" data-reference-field="autoQuestion">${escapeHtml(reference.autoQuestion)}</textarea>
+                            <div class="stsc-muted">可使用 {{name}} 代表资料库名称。该问题固定要求提供依据。</div>
+                        </div>
+                    </div>
+
+                    <div class="stsc-button-row stsc-reference-danger-row">
+                        <button class="menu_button stsc-danger-button" type="button" data-action="delete-reference">删除这个资料库</button>
                     </div>
                 </div>
-                <div class="stsc-field" style="margin-top:9px"><label>协议、文风或限制内容</label><textarea class="text_pole stsc-textarea" data-reference-field="content">${escapeHtml(reference.content)}</textarea></div>
-                <div class="stsc-grid-4" style="margin-top:9px">
-                    <div class="stsc-field"><label>注入位置</label><select class="text_pole" data-reference-field="position">
-                        <option value="before" ${reference.position === 'before' ? 'selected' : ''}>系统最前</option>
-                        <option value="prompt" ${reference.position === 'prompt' ? 'selected' : ''}>主提示词内</option>
-                        <option value="chat" ${reference.position === 'chat' ? 'selected' : ''}>聊天深度</option>
-                    </select></div>
-                    <div class="stsc-field"><label>深度（0～20）</label><input class="text_pole" data-reference-field="depth" type="number" min="0" max="20" value="${reference.depth}"></div>
-                    <div class="stsc-field"><label>角色</label><select class="text_pole" data-reference-field="role">
-                        <option value="system" ${reference.role === 'system' ? 'selected' : ''}>System</option>
-                        <option value="user" ${reference.role === 'user' ? 'selected' : ''}>User</option>
-                        <option value="assistant" ${reference.role === 'assistant' ? 'selected' : ''}>Assistant</option>
-                    </select></div>
-                    <div class="stsc-field"><label>当前角色绑定</label><button class="menu_button" data-action="bind-reference-character">绑定到 ${escapeHtml(entity.name)}</button></div>
-                </div>
-                <div class="stsc-field" style="margin-top:9px">
-                    <label class="checkbox_label"><input type="checkbox" data-reference-field="addToCheck" ${reference.addToCheck ? 'checked' : ''}> 自动加入自检问答末尾</label>
-                    <label>自动生成的自检问题（可修改）</label>
-                    <textarea class="text_pole" data-reference-field="autoQuestion">${escapeHtml(reference.autoQuestion)}</textarea>
-                    <div class="stsc-muted">可使用 {{name}} 代表资料名称。</div>
-                </div>
-            </div>`).join('')
+            </div>`;
+        }).join('')
         : '<div class="stsc-empty">资料库还是空的。</div>';
 
     $('#stsc_tab_references').html(`
         <div class="stsc-section">
             <div class="stsc-section-title">参考资料库</div>
-            <div class="stsc-muted">存放文风、防人机协议、感情限制等内容。勾选“自动加入自检问答”后，会在用户问题末尾自动补充对应问题。</div>
-            <div class="stsc-toolbar" style="margin-top:9px"><button class="menu_button" data-action="add-reference">＋ 新建参考资料</button></div>
-            ${references}
+            <div class="stsc-muted">像世界书一样保存文风、强制限制或其他长期资料。所有资料默认折叠；只有启用资料库后，才能开启它对应的自检问题。</div>
+            <div class="stsc-toolbar" style="margin-top:9px">
+                <button class="menu_button" type="button" data-action="open-create-reference">＋ 新建资料库</button>
+            </div>
+            <div class="stsc-reference-list">${references}</div>
         </div>
     `);
 }
-
 function renderTemporaryTab() {
     const settings = getUiSettings();
     const selected = new Set(settings.pendingInstructionIds);
@@ -1765,6 +1896,7 @@ function openManager(tab = null) {
 
 function performCloseManager() {
     closeDialog();
+    expandedReferenceIds.clear();
     $('#stsc_manager_overlay').addClass('stsc-hidden').attr('aria-hidden', 'true');
     $('body').removeClass('stsc-modal-open');
     if (editDraft?.ui) {
@@ -1833,6 +1965,21 @@ function makeUniquePresetName(baseName) {
     return `${base} ${index}`;
 }
 
+function referenceNameExists(name, excludeId = '') {
+    const normalized = normalizePresetName(name);
+    return Boolean(normalized && getUiSettings().references.some(reference => reference.id !== excludeId && normalizePresetName(reference.name) === normalized));
+}
+
+function referenceTypeLabel(type) {
+    return referenceTypeConfig(type).label;
+}
+
+function referencePositionHint(reference) {
+    const config = referenceTypeConfig(reference.type);
+    if (reference.type === 'style') return '文风默认放在主提示词内，作为持续写作风格使用。';
+    if (reference.type === 'restriction') return '限制默认以 System 身份插入聊天深度 0，尽量靠近本轮生成位置以加强注意。';
+    return `其他资料默认使用“${positionLabel(config.position)}”，可按需要手动调整。`;
+}
 
 function presetKindText(kind) {
     return kind === 'character' ? '角色预设' : '通用预设';
@@ -1988,6 +2135,33 @@ function openCreatePresetDialog(kind) {
          <button class="menu_button" type="button" data-dialog-action="create-preset" data-kind="${kind}">确认创建</button>`
     );
     setTimeout(() => $('#stsc_new_preset_name').trigger('focus'), 0);
+}
+
+function openCreateReferenceDialog() {
+    openDialog(
+        '新建参考资料库',
+        `<div class="stsc-field">
+            <label>资料库名称</label>
+            <input id="stsc_new_reference_name" class="text_pole" type="text" maxlength="80" placeholder="请输入不重复的资料库名称">
+        </div>
+        <div class="stsc-field" style="margin-top:10px">
+            <label>资料类型</label>
+            <select id="stsc_new_reference_type" class="text_pole">
+                <option value="style">文风</option>
+                <option value="restriction">限制</option>
+                <option value="other">其他</option>
+            </select>
+        </div>
+        <div class="stsc-reference-type-help">
+            <div><strong>文风：</strong>自动放在主提示词内，并生成“是否遵照该文风、如何体现”的自检问题。</div>
+            <div><strong>限制：</strong>自动以 System 身份插入聊天深度 0，靠近本轮生成位置，并生成强制限制检查问题。</div>
+            <div><strong>其他：</strong>使用通用推荐位置与通用检查问题，之后仍可手动调整。</div>
+        </div>
+        <div id="stsc_new_reference_error" class="stsc-dialog-error"></div>`,
+        `<button class="menu_button" type="button" data-dialog-action="cancel">取消</button>
+         <button class="menu_button stsc-primary-button" type="button" data-dialog-action="create-reference">确认创建</button>`
+    );
+    setTimeout(() => $('#stsc_new_reference_name').trigger('focus'), 0);
 }
 
 function looksLikeQuestion(text) {
@@ -2211,12 +2385,75 @@ function bindUiEvents() {
         renderManagerSubtitle();
     });
 
-    $('#stsc_manager_overlay').on('input change', '[data-reference-field]', function () {
-        const id = $(this).closest('[data-reference-id]').data('reference-id');
+    $('#stsc_manager_overlay').on('input change', '[data-reference-field]', function (event) {
+        const $card = $(this).closest('[data-reference-id]');
+        const id = $card.data('reference-id');
         const reference = getUiSettings().references.find(x => x.id === id);
         if (!reference) return;
         const field = $(this).data('reference-field');
-        reference[field] = this.type === 'checkbox' ? this.checked : this.value;
+
+        if (field === 'name') {
+            const nextName = String(this.value || '').trim();
+            const $error = $card.find('[data-reference-name-error]');
+            if (!nextName) {
+                $error.text('资料库名称不能为空。');
+                if (event.type === 'change') {
+                    this.value = reference.name;
+                    $error.empty();
+                    toastr.warning('资料库名称不能为空。', '写作前置自检');
+                }
+                return;
+            }
+            if (referenceNameExists(nextName, reference.id)) {
+                $error.text('已经存在同名资料库，请换一个名称。');
+                if (event.type === 'change') {
+                    this.value = reference.name;
+                    $error.empty();
+                    toastr.warning('已经存在同名资料库，请换一个名称。', '写作前置自检');
+                }
+                return;
+            }
+            $error.empty();
+            reference.name = nextName;
+            $card.find('.stsc-reference-summary-name').text(nextName);
+            markDirty();
+            renderCompact();
+            renderManagerSubtitle();
+            return;
+        }
+
+        if (field === 'enabled') {
+            reference.enabled = this.checked;
+            if (!reference.enabled) reference.addToCheck = false;
+            markDirty();
+            renderReferencesTab();
+            renderCompact();
+            renderManagerSubtitle();
+            return;
+        }
+
+        if (field === 'type') {
+            applyReferenceTypeDefaults(reference, this.value);
+            markDirty();
+            renderReferencesTab();
+            renderCompact();
+            renderManagerSubtitle();
+            toastr.info(`已切换为“${referenceTypeLabel(reference.type)}”，并应用推荐注入位置。`, '写作前置自检');
+            return;
+        }
+
+        if (field === 'addToCheck') {
+            if (!reference.enabled) {
+                reference.addToCheck = false;
+                this.checked = false;
+                toastr.warning('请先启用这个资料库，才能启用对应的自检问题。', '写作前置自检');
+                return;
+            }
+            reference.addToCheck = this.checked;
+        } else {
+            reference[field] = this.type === 'checkbox' ? this.checked : this.value;
+        }
+
         if (field === 'depth') reference.depth = clampNumber(reference.depth, 0, 20, 0);
         markDirty();
         renderCompact();
@@ -2296,6 +2533,15 @@ function bindUiEvents() {
         if (action === 'open-create-preset') {
             openCreatePresetDialog($(this).data('kind'));
             return;
+        } else if (action === 'open-create-reference') {
+            openCreateReferenceDialog();
+            return;
+        } else if (action === 'toggle-reference-collapse') {
+            const id = $(this).closest('[data-reference-id]').data('reference-id');
+            if (expandedReferenceIds.has(id)) expandedReferenceIds.delete(id);
+            else expandedReferenceIds.add(id);
+            renderReferencesTab();
+            return;
         } else if (action === 'export-preset') {
             downloadPresetFile(preset);
             return;
@@ -2364,11 +2610,10 @@ function bindUiEvents() {
             if (index >= 0 && action === 'delete-question') preset.questions.splice(index, 1);
             if (index > 0 && action === 'move-question-up') [preset.questions[index - 1], preset.questions[index]] = [preset.questions[index], preset.questions[index - 1]];
             if (index >= 0 && index < preset.questions.length - 1 && action === 'move-question-down') [preset.questions[index + 1], preset.questions[index]] = [preset.questions[index], preset.questions[index + 1]];
-        } else if (action === 'add-reference') {
-            settings.references.push(createReference());
         } else if (action === 'delete-reference') {
             const id = $(this).closest('[data-reference-id]').data('reference-id');
             settings.references = settings.references.filter(x => x.id !== id);
+            expandedReferenceIds.delete(id);
         } else if (action === 'bind-reference-character') {
             const id = $(this).closest('[data-reference-id]').data('reference-id');
             const reference = settings.references.find(x => x.id === id);
@@ -2415,6 +2660,13 @@ function bindUiEvents() {
         if (event.key === 'Enter') {
             event.preventDefault();
             $('#stsc_dialog_overlay [data-dialog-action="create-preset"]').trigger('click');
+        }
+    });
+
+    $('#stsc_dialog_overlay').on('keydown', '#stsc_new_reference_name', function (event) {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            $('#stsc_dialog_overlay [data-dialog-action="create-reference"]').trigger('click');
         }
     });
 
@@ -2468,6 +2720,27 @@ function bindUiEvents() {
             markDirty();
             closeDialog();
             renderAll();
+            return;
+        }
+        if (action === 'create-reference') {
+            const name = String($('#stsc_new_reference_name').val() || '').trim();
+            const type = Object.hasOwn(REFERENCE_TYPE_CONFIG, $('#stsc_new_reference_type').val())
+                ? $('#stsc_new_reference_type').val()
+                : 'other';
+            if (!name) {
+                $('#stsc_new_reference_error').text('请输入资料库名称。');
+                return;
+            }
+            if (referenceNameExists(name)) {
+                $('#stsc_new_reference_error').text('已经存在同名资料库，请换一个名称。');
+                return;
+            }
+            const reference = createReference(name, type);
+            settings.references.push(reference);
+            markDirty();
+            closeDialog();
+            renderAll();
+            setTimeout(() => document.querySelector(`[data-reference-id="${CSS.escape(reference.id)}"]`)?.scrollIntoView?.({ behavior: 'smooth', block: 'nearest' }), 0);
             return;
         }
         if (action === 'recognize-bulk') {
