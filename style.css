@@ -1108,59 +1108,7 @@ body.stsc-modal-open {
   }
 }
 
-/* v0.1.6：移动端菜单、悬浮窗与非侵入式流式遮罩 */
-
-/* 只识别本插件自己的标签，绝不影响 <thinking>、<content>、<status_*> 等其他格式。 */
-#chat .mes_text stsc_self_check {
-  display: none !important;
-}
-
-#chat .mes_text stsc_response {
-  display: contents !important;
-}
-
-/*
- * 流式阶段只隐藏本插件自己的自检区段：
- * - 尚未出现 <stsc_response> 时显示简短占位；
- * - 一旦正文标签开始，立即镜像正文，让用户继续边生成边阅读；
- * - 原始流式 DOM 暂时隐藏，最终由 SillyTavern 用剥离后的正文正常重绘。
- */
-#chat .mes.stsc-stream-selfcheck .mes_text,
-#chat .mes.stsc-stream-selfcheck .mes_reasoning,
-#chat .mes.stsc-stream-selfcheck .mes_reasoning_details,
-#chat .mes.stsc-stream-selfcheck .reasoning,
-#chat .mes.stsc-stream-live .mes_text,
-#chat .mes.stsc-stream-live .mes_reasoning,
-#chat .mes.stsc-stream-live .mes_reasoning_details,
-#chat .mes.stsc-stream-live .reasoning {
-  display: none !important;
-}
-
-.stsc-stream-cover {
-  width: 100%;
-  min-height: 42px;
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  padding: 9px 6px;
-  color: var(--SmartThemeBodyColor, #eee);
-  opacity: 0.78;
-  line-height: 1.55;
-  font-size: 0.92em;
-}
-
-.stsc-stream-live-response {
-  width: 100%;
-  min-width: 0;
-  padding: 0;
-  color: var(--SmartThemeBodyColor, inherit);
-  font: inherit;
-  line-height: inherit;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  user-select: text;
-  -webkit-user-select: text;
-}
+/* v0.1.9：流式阶段不再由插件遮罩消息，自检显示交由用户正则控制。 */
 
 /* 所有插件按钮强制横向排字，抵消部分美化主题的窄按钮/竖排规则。 */
 #stsc_manager_overlay button,

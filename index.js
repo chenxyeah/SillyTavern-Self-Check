@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.1.8';
+const STSC_VERSION = '0.1.9';
 const STSC_CHECK_TAG = 'stsc_self_check';
 const STSC_RESPONSE_TAG = 'stsc_response';
 const STSC_CHECK_OPEN_RE = /<stsc_self_check\b[^>]*>/i;
@@ -65,7 +65,6 @@ let bulkDraft = null;
 let editDraft = null;
 let editDirty = false;
 let pendingUnsavedAction = null;
-let streamDomObserver = null;
 let floatingDragState = null;
 let suppressFloatingClickUntil = 0;
 
@@ -814,9 +813,8 @@ function buildSinglePrompt(questions) {
 无需依据：<item id="题目ID"><answer>最终回答</answer></item>
 需要依据：<item id="题目ID"><answer>最终回答</answer><evidence>具体依据</evidence></item>
 </stsc_self_check>
-<stsc_response>
-正文、状态栏以及用户要求的全部正常输出格式
-</stsc_response>
+紧接着直接输出正文、状态栏以及用户要求的全部正常输出格式。
+正文不得再包裹在任何由本插件添加的标签中。
 
 本轮问题：
 ${buildQuestionXml(questions)}
@@ -854,10 +852,8 @@ ${checkText}
 对应问题：
 ${buildQuestionXml(questions)}
 
-只输出：
-<stsc_response>
-正文、状态栏以及用户要求的全部正常输出格式
-</stsc_response>
+只输出正文、状态栏以及用户要求的全部正常输出格式。
+不要输出 <stsc_self_check>，也不要给正文添加任何由本插件定义的包裹标签。
 `.trim();
 }
 
@@ -1039,135 +1035,6 @@ function parseModelOutput(text, expectedQuestions = []) {
     return result;
 }
 
-function streamTextFromEvent(data) {
-    if (typeof data === 'string') return data;
-    if (!data || typeof data !== 'object') return '';
-    return String(data.text ?? data.token ?? data.chunk ?? data.content ?? '');
-}
-
-function mergeStreamText(current, incoming) {
-    const oldText = String(current || '');
-    const nextText = String(incoming || '');
-    if (!nextText) return oldText;
-    if (nextText.startsWith(oldText)) return nextText;
-    if (oldText.endsWith(nextText)) return oldText;
-    return oldText + nextText;
-}
-
-function liveResponseText(raw) {
-    const source = String(raw || '');
-    const open = STSC_RESPONSE_OPEN_RE.exec(source);
-    if (!open) return null;
-    let body = source.slice(open.index + open[0].length);
-    const close = STSC_RESPONSE_CLOSE_RE.exec(body);
-    if (close) body = body.slice(0, close.index);
-    return body;
-}
-
-function getMessageIdFromElement(element) {
-    if (!element) return -1;
-    const raw = element.getAttribute('mesid') ?? element.dataset?.mesid ?? element.getAttribute('data-mesid');
-    return /^\d+$/.test(String(raw ?? '')) ? Number(raw) : -1;
-}
-
-function findStreamingMessageElement() {
-    if (!pendingRun) return $();
-    const context = ctx();
-    const elements = Array.from(document.querySelectorAll('#chat .mes')).reverse();
-    const minId = Number.isInteger(pendingRun.targetMessageFloor) ? pendingRun.targetMessageFloor : 0;
-
-    for (const element of elements) {
-        const id = getMessageIdFromElement(element);
-        if (id < minId) continue;
-        const message = context?.chat?.[id];
-        // 只允许遮罩 AI 消息，绝不根据 CSS 类猜测用户消息。
-        if (!message || message.is_user || message.is_system) continue;
-        const text = element.querySelector('.mes_text');
-        if (!text) continue;
-        return $(element);
-    }
-    return $();
-}
-
-function hasStartedPluginSelfCheck(raw = '') {
-    return /<stsc_self_check\b/i.test(String(raw));
-}
-
-function clearStreamMask(target = null) {
-    const $targets = target ? $(target) : $('#chat .mes.stsc-stream-selfcheck, #chat .mes.stsc-stream-live');
-    $targets.each(function () {
-        const $message = $(this);
-        $message.removeClass('stsc-stream-selfcheck stsc-stream-live');
-        $message.find('.stsc-stream-cover, .stsc-stream-live-response').remove();
-    });
-}
-
-function ensureStreamCover($message) {
-    $message.addClass('stsc-stream-selfcheck').removeClass('stsc-stream-live');
-    $message.find('.stsc-stream-live-response').remove();
-    if (!$message.find('.stsc-stream-cover').length) {
-        const cover = document.createElement('div');
-        cover.className = 'stsc-stream-cover';
-        cover.innerHTML = '<span class="stsc-live-dot"></span><span>正在完成写作前置自检，自检内容仅保存在插件中……</span>';
-        const text = $message.find('.mes_text').first();
-        if (text.length) text.after(cover);
-        else ($message.find('.mes_block').first()[0] || $message[0]).appendChild(cover);
-    }
-}
-
-function ensureLiveResponse($message, body) {
-    $message.removeClass('stsc-stream-selfcheck').addClass('stsc-stream-live');
-    $message.find('.stsc-stream-cover').remove();
-    let live = $message.find('.stsc-stream-live-response').first();
-    if (!live.length) {
-        live = $('<div class="stsc-stream-live-response" aria-live="polite"></div>');
-        const text = $message.find('.mes_text').first();
-        if (text.length) text.after(live);
-        else $message.find('.mes_block').first().append(live);
-    }
-    // 流式阶段只镜像本插件 <stsc_response> 内的正文。使用 textContent，避免临时渲染破坏
-    // Markdown、代码块、状态栏或其他插件标签；生成完成后由 SillyTavern 正常重绘。
-    live[0].textContent = String(body || '');
-}
-
-function updateStreamingSelfCheckDisplay() {
-    if (!pendingRun || pendingRun.mode !== 'single') return;
-    const raw = pendingRun.streamBuffer || '';
-    if (!hasStartedPluginSelfCheck(raw)) return;
-    const $message = findStreamingMessageElement();
-    if (!$message.length) return;
-
-    const responseBody = liveResponseText(raw);
-    if (responseBody === null) {
-        ensureStreamCover($message);
-        return;
-    }
-    ensureLiveResponse($message, responseBody);
-}
-
-function ensureStreamDomObserver() {
-    if (streamDomObserver || !document.querySelector('#chat')) return;
-    streamDomObserver = new MutationObserver(() => {
-        if (!pendingRun || pendingRun.mode !== 'single') return;
-        if (!hasStartedPluginSelfCheck(pendingRun.streamBuffer || '')) return;
-        requestAnimationFrame(updateStreamingSelfCheckDisplay);
-    });
-    streamDomObserver.observe(document.querySelector('#chat'), {
-        childList: true,
-        subtree: true,
-    });
-}
-
-function handleStreamTokenReceived(data) {
-    if (internalQuietActive || !pendingRun || pendingRun.mode !== 'single') return;
-    const text = streamTextFromEvent(data);
-    if (!text) return;
-    pendingRun.streamBuffer = mergeStreamText(pendingRun.streamBuffer, text);
-    if (hasStartedPluginSelfCheck(pendingRun.streamBuffer)) {
-        requestAnimationFrame(updateStreamingSelfCheckDisplay);
-    }
-}
-
 function resolveMessageId(data) {
     const context = ctx();
     if (typeof data === 'number') return data;
@@ -1193,9 +1060,6 @@ function refreshMessageDom(messageId, message) {
         context?.updateMessageBlock?.(id, message);
     } catch (error) {
         console.warn('[STSC] 刷新已剥离自检的正文失败：', error);
-    } finally {
-        const $message = $(`#chat .mes[mesid="${id}"], #chat .mes[data-mesid="${id}"]`).first();
-        clearStreamMask($message);
     }
 }
 
@@ -1329,24 +1193,14 @@ function addMessageBadge(messageId) {
 function handleCharacterMessageRendered(data) {
     const messageId = resolveMessageId(data);
     const latest = getLatestResult();
-    // 只有完成自检剥离后才移除遮罩，避免最终渲染事件早于解析时短暂泄露自检。
-    if (!pendingRun || Number(latest?.messageId) === Number(messageId)) {
-        const $message = $(`#chat .mes[mesid="${messageId}"], #chat .mes[data-mesid="${messageId}"]`).first();
-        clearStreamMask($message);
-    }
     addMessageBadge(messageId);
 }
 
 function onGenerationEnded() {
     clearRuntimePrompts();
-    // 正常情况下 MESSAGE_RECEIVED 会负责剥离和清理；这里仅在流程已经结束时兜底。
-    setTimeout(() => {
-        if (!pendingRun) clearStreamMask();
-    }, 300);
-    // 极端情况下没有收到最终消息事件，避免遮罩永久残留。
+    // 极端情况下没有收到最终消息事件，避免运行状态永久残留。
     setTimeout(() => {
         if (pendingRun && Date.now() - pendingRun.startedAt > 4500) {
-            clearStreamMask();
             pendingRun = null;
         }
     }, 5000);
@@ -1354,7 +1208,6 @@ function onGenerationEnded() {
 
 function onGenerationStopped() {
     clearRuntimePrompts();
-    clearStreamMask();
     pendingRun = null;
     strictBusy = false;
 }
@@ -1396,11 +1249,8 @@ globalThis.sillyTavernSelfCheckInterceptor = async function (_chat, _contextSize
         generationType: type,
         strictCheck: '',
         strictParsed: null,
-        streamBuffer: '',
         targetMessageFloor,
     };
-    ensureStreamDomObserver();
-    requestAnimationFrame(updateStreamingSelfCheckDisplay);
 
     if (settings.mode === 'strict') {
         if (strictBusy) return;
@@ -2535,11 +2385,8 @@ async function initialize() {
     initialized = true;
     bindUiEvents();
     addExtensionsMenuButton();
-    ensureStreamDomObserver();
-
     const events = context.eventTypes || context.event_types;
     context.eventSource.on(events.MESSAGE_RECEIVED, handleMessageReceived);
-    if (events.STREAM_TOKEN_RECEIVED) context.eventSource.on(events.STREAM_TOKEN_RECEIVED, handleStreamTokenReceived);
     context.eventSource.on(events.CHARACTER_MESSAGE_RENDERED, handleCharacterMessageRendered);
     context.eventSource.on(events.CHAT_CHANGED, renderAll);
     context.eventSource.on(events.GENERATION_ENDED, onGenerationEnded);
