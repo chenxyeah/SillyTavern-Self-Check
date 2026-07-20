@@ -1,13 +1,16 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.1.9';
+const STSC_VERSION = '0.2.0';
 const STSC_CHECK_TAG = 'stsc_self_check';
 const STSC_RESPONSE_TAG = 'stsc_response';
 const STSC_CHECK_OPEN_RE = /<stsc_self_check\b[^>]*>/i;
 const STSC_CHECK_CLOSE_RE = /<\/stsc_self_check>/i;
 const STSC_RESPONSE_OPEN_RE = /<stsc_response\b[^>]*>/i;
 const STSC_RESPONSE_CLOSE_RE = /<\/stsc_response>/i;
+const STSC_PRESET_EXPORT_FORMAT = 'sillytavern-self-check-preset';
+const STSC_PRESET_EXPORT_VERSION = 1;
+const STSC_PRESET_IMPORT_MAX_BYTES = 2 * 1024 * 1024;
 
 const POSITION_MAP = Object.freeze({
     prompt: 0,
@@ -1529,8 +1532,12 @@ function renderPresetsTab() {
                 ${presets.length ? `<select id="${selectId}" class="text_pole">${presetOptions(kind, preset?.id, settings)}</select>` : ''}
                 <button class="menu_button" type="button" data-action="open-create-preset" data-kind="${kind}">＋ 新建预设</button>
                 <button class="menu_button" type="button" data-action="copy-preset" ${preset ? '' : 'disabled'}>复制</button>
+                <button class="menu_button" type="button" data-action="export-preset" ${preset ? '' : 'disabled'}>导出当前预设</button>
+                <button class="menu_button" type="button" data-action="import-preset">导入预设</button>
                 <button class="menu_button stsc-danger-button" type="button" data-action="delete-preset" ${preset ? '' : 'disabled'}>删除</button>
+                <input id="stsc_preset_import_file" class="stsc-file-input" type="file" accept=".json,.stsc-preset.json,application/json" aria-label="选择要导入的自检预设文件">
             </div>
+            <div class="stsc-muted" style="margin-top:8px">导出文件只包含预设名称、类型和问题设置，不包含角色绑定、聊天记录或自检结果。导入内容会先作为未保存更改加入插件。</div>
             ${presetDetails}
         </div>
 
@@ -1687,9 +1694,10 @@ function renderSettingsTab() {
         </div>
         <div class="stsc-section">
             <div class="stsc-section-title">上下文处理</div>
-            <div>自检问答不会保留在聊天正文中；流式生成时仅在自检阶段显示占位提示，进入正文阶段后会继续实时显示正在生成的正文；完成后自检只在插件与悬浮窗中查看。</div>
-            <div>聊天记录只保留正文、状态栏和其他正常输出；下一轮AI读取不到上一轮自检。</div>
-            <div class="stsc-code-note">&lt;stsc_self_check&gt;…&lt;/stsc_self_check&gt; → 仅插件可见\n&lt;stsc_response&gt;…&lt;/stsc_response&gt; → 正常聊天正文</div>
+            <div>插件不会在流式生成期间添加整段遮罩。建议使用 README 中提供的正则，仅隐藏 &lt;stsc_self_check&gt; 标签内的自检内容。</div>
+            <div>生成完成后，插件会提取自检并从聊天正文中剥离；聊天记录只保留正文、状态栏和其他正常输出，下一轮AI读取不到上一轮自检。</div>
+            <div class="stsc-code-note">&lt;stsc_self_check&gt;…&lt;/stsc_self_check&gt; → 正则隐藏并由插件保存
+结束标签之后 → 正常流式正文</div>
         </div>
     `);
 }
@@ -1823,6 +1831,147 @@ function makeUniquePresetName(baseName) {
     let index = 2;
     while (presetNameExists(`${base} ${index}`)) index += 1;
     return `${base} ${index}`;
+}
+
+
+function presetKindText(kind) {
+    return kind === 'character' ? '角色预设' : '通用预设';
+}
+
+function sanitizeExportFileName(name) {
+    const cleaned = String(name || '自检预设')
+        .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 80);
+    return cleaned || '自检预设';
+}
+
+function makePresetExportPayload(preset) {
+    return {
+        format: STSC_PRESET_EXPORT_FORMAT,
+        formatVersion: STSC_PRESET_EXPORT_VERSION,
+        pluginVersion: STSC_VERSION,
+        exportedAt: new Date().toISOString(),
+        preset: {
+            name: preset.name,
+            kind: preset.kind,
+            enabled: Boolean(preset.enabled),
+            questions: preset.questions.map(question => ({
+                text: question.text,
+                type: question.type,
+                length: question.length,
+                requireEvidence: Boolean(question.requireEvidence),
+                enabled: Boolean(question.enabled),
+            })),
+        },
+    };
+}
+
+function downloadPresetFile(preset) {
+    if (!preset) {
+        toastr.warning('当前没有可以导出的自检预设。', '写作前置自检');
+        return;
+    }
+
+    const payload = makePresetExportPayload(preset);
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `${sanitizeExportFileName(preset.name)}.stsc-preset.json`;
+    anchor.style.display = 'none';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toastr.success(`已导出“${preset.name}”。`, '写作前置自检');
+}
+
+function isPlainObject(value) {
+    return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+function validateImportedPresetPayload(payload) {
+    if (!isPlainObject(payload)) throw new Error('文件内容不是有效的预设对象。');
+    if (payload.format !== STSC_PRESET_EXPORT_FORMAT) throw new Error('文件不是由写作前置自检插件导出的预设。');
+    if (payload.formatVersion !== STSC_PRESET_EXPORT_VERSION) throw new Error('该预设文件版本暂不受支持。');
+    if (!isPlainObject(payload.preset)) throw new Error('文件中缺少自检预设内容。');
+
+    const preset = payload.preset;
+    const name = typeof preset.name === 'string' ? preset.name.trim() : '';
+    if (!name || name.length > 80) throw new Error('预设名称为空或长度异常。');
+    if (!['general', 'character'].includes(preset.kind)) throw new Error('预设类型不正确。');
+    if (typeof preset.enabled !== 'boolean') throw new Error('预设启用状态格式不正确。');
+    if (!Array.isArray(preset.questions) || preset.questions.length > 500) throw new Error('问题列表缺失或数量异常。');
+
+    const questions = preset.questions.map((question, index) => {
+        if (!isPlainObject(question)) throw new Error(`第 ${index + 1} 个问题格式不正确。`);
+        const text = typeof question.text === 'string' ? question.text.trim() : '';
+        if (!text || text.length > 10000) throw new Error(`第 ${index + 1} 个问题内容为空或长度异常。`);
+        if (!['open', 'boolean'].includes(question.type)) throw new Error(`第 ${index + 1} 个问题类型不正确。`);
+        if (!['brief', 'standard', 'detailed'].includes(question.length)) throw new Error(`第 ${index + 1} 个问题回答程度不正确。`);
+        if (typeof question.requireEvidence !== 'boolean') throw new Error(`第 ${index + 1} 个问题的依据选项格式不正确。`);
+        if (typeof question.enabled !== 'boolean') throw new Error(`第 ${index + 1} 个问题的启用状态格式不正确。`);
+        return {
+            text,
+            type: question.type,
+            length: question.length,
+            requireEvidence: question.requireEvidence,
+            enabled: question.enabled,
+        };
+    });
+
+    return {
+        name,
+        kind: preset.kind,
+        enabled: preset.enabled,
+        questions,
+    };
+}
+
+async function importPresetFile(file) {
+    if (!file) return;
+    if (file.size > STSC_PRESET_IMPORT_MAX_BYTES) {
+        toastr.error('格式不匹配：文件过大，无法作为自检预设导入。', '写作前置自检');
+        return;
+    }
+
+    try {
+        const text = await file.text();
+        let payload;
+        try {
+            payload = JSON.parse(text.replace(/^\uFEFF/, ''));
+        } catch {
+            throw new Error('文件不是有效的 JSON 预设文件。');
+        }
+
+        const imported = validateImportedPresetPayload(payload);
+        const settings = getUiSettings();
+        const preset = createPreset(makeUniquePresetName(imported.name), imported.kind);
+        preset.enabled = imported.enabled;
+        preset.questions = imported.questions.map(question => ({
+            id: uid('q'),
+            ...question,
+        }));
+        // 分享文件不携带任何人的角色卡绑定；角色预设导入后需要用户自行绑定。
+        preset.boundCharacterKey = '';
+        preset.boundCharacterName = '';
+
+        settings.presets.push(preset);
+        settings.ui.presetSection = preset.kind;
+        if (preset.kind === 'character') settings.ui.editingCharacterPresetId = preset.id;
+        else settings.ui.editingGeneralPresetId = preset.id;
+
+        markDirty();
+        renderAll();
+        const renameNote = preset.name === imported.name ? '' : `；因名称重复，已改名为“${preset.name}”`;
+        const bindingNote = preset.kind === 'character' ? '；角色绑定不会随文件导入，请手动绑定当前角色' : '';
+        toastr.success(`已导入${presetKindText(preset.kind)}“${preset.name}”，共 ${preset.questions.length} 个问题${renameNote}${bindingNote}。请点击“保存更改”正式保存。`, '写作前置自检');
+    } catch (error) {
+        console.warn('[STSC] 导入自检预设失败：', error);
+        toastr.error(`格式不匹配，文件错误或不是本插件导出的自检预设。${error?.message ? ` ${error.message}` : ''}`, '写作前置自检', { timeOut: 7000 });
+    }
 }
 
 function openCreatePresetDialog(kind) {
@@ -2147,6 +2296,16 @@ function bindUiEvents() {
         if (action === 'open-create-preset') {
             openCreatePresetDialog($(this).data('kind'));
             return;
+        } else if (action === 'export-preset') {
+            downloadPresetFile(preset);
+            return;
+        } else if (action === 'import-preset') {
+            const input = document.getElementById('stsc_preset_import_file');
+            if (input) {
+                input.value = '';
+                input.click();
+            }
+            return;
         } else if (action === 'copy-preset' && preset) {
             const copied = clone(preset);
             copied.id = uid('preset');
@@ -2234,6 +2393,12 @@ function bindUiEvents() {
 
         markDirty();
         renderAll();
+    });
+
+    $('#stsc_manager_overlay').on('change', '#stsc_preset_import_file', async function () {
+        const file = this.files?.[0] || null;
+        this.value = '';
+        await importPresetFile(file);
     });
 
     $('#stsc_dialog_overlay').on('input', '#stsc_bulk_raw', function () {

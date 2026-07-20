@@ -1498,3 +1498,15 @@ body.stsc-modal-open {
   }
 }
 
+
+
+/* v0.2.0：预设导入文件选择器保留在页面中，但不占布局。 */
+.stsc-file-input {
+  position: fixed !important;
+  left: -10000px !important;
+  top: -10000px !important;
+  width: 1px !important;
+  height: 1px !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
