@@ -701,3 +701,233 @@ body.stsc-modal-open {
     max-height: 28dvh;
   }
 }
+
+/* v0.1.3：显式保存、配色与悬浮自检 */
+.stsc-header-actions {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-width: 0;
+}
+
+.stsc-save-state {
+  font-size: 0.82rem;
+  opacity: 0.72;
+  white-space: nowrap;
+}
+
+.stsc-save-state.stsc-unsaved {
+  color: var(--stsc-warning);
+  opacity: 1;
+  font-weight: 700;
+}
+
+.stsc-save-button {
+  min-width: 90px !important;
+}
+
+.stsc-save-button.stsc-save-dirty,
+.stsc-primary-button {
+  border-color: var(--stsc-accent) !important;
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--stsc-accent) 45%, transparent);
+}
+
+.stsc-unsaved-message {
+  line-height: 1.7;
+  padding: 8px 2px;
+}
+
+/* 默认跟随 SillyTavern 主题；其他配色只影响本插件。 */
+#stsc_manager_overlay[data-stsc-theme="rose"],
+#stsc_dialog_overlay[data-stsc-theme="rose"],
+#stsc_floating_root[data-stsc-theme="rose"] {
+  --stsc-accent: #e89aaa;
+  --stsc-panel: rgba(49, 31, 39, 0.97);
+  --stsc-card: rgba(88, 52, 67, 0.58);
+  --stsc-soft: rgba(232, 154, 170, 0.09);
+}
+
+#stsc_manager_overlay[data-stsc-theme="blue"],
+#stsc_dialog_overlay[data-stsc-theme="blue"],
+#stsc_floating_root[data-stsc-theme="blue"] {
+  --stsc-accent: #76aee8;
+  --stsc-panel: rgba(27, 39, 55, 0.97);
+  --stsc-card: rgba(51, 78, 108, 0.58);
+  --stsc-soft: rgba(118, 174, 232, 0.09);
+}
+
+#stsc_manager_overlay[data-stsc-theme="mint"],
+#stsc_dialog_overlay[data-stsc-theme="mint"],
+#stsc_floating_root[data-stsc-theme="mint"] {
+  --stsc-accent: #72c7ad;
+  --stsc-panel: rgba(27, 48, 43, 0.97);
+  --stsc-card: rgba(48, 91, 79, 0.56);
+  --stsc-soft: rgba(114, 199, 173, 0.09);
+}
+
+#stsc_manager_overlay[data-stsc-theme="violet"],
+#stsc_dialog_overlay[data-stsc-theme="violet"],
+#stsc_floating_root[data-stsc-theme="violet"] {
+  --stsc-accent: #aa8be4;
+  --stsc-panel: rgba(39, 31, 55, 0.97);
+  --stsc-card: rgba(73, 54, 105, 0.58);
+  --stsc-soft: rgba(170, 139, 228, 0.09);
+}
+
+#stsc_manager_overlay[data-stsc-theme="gold"],
+#stsc_dialog_overlay[data-stsc-theme="gold"],
+#stsc_floating_root[data-stsc-theme="gold"] {
+  --stsc-accent: #d9b56f;
+  --stsc-panel: rgba(51, 43, 28, 0.97);
+  --stsc-card: rgba(94, 75, 41, 0.58);
+  --stsc-soft: rgba(217, 181, 111, 0.09);
+}
+
+.stsc-floating-root {
+  position: fixed;
+  right: max(14px, env(safe-area-inset-right));
+  bottom: max(88px, calc(env(safe-area-inset-bottom) + 76px));
+  z-index: 2147482500;
+  color: var(--SmartThemeBodyColor, #eee);
+}
+
+.stsc-floating-button {
+  position: relative;
+  width: 48px;
+  height: 48px;
+  border: 1px solid color-mix(in srgb, var(--stsc-accent) 60%, transparent);
+  border-radius: 50%;
+  background: var(--stsc-panel);
+  color: inherit;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.42);
+  cursor: pointer;
+  backdrop-filter: blur(16px);
+}
+
+.stsc-floating-icon {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  font-size: 21px;
+  font-weight: 800;
+  color: var(--stsc-accent);
+}
+
+.stsc-floating-badge {
+  position: absolute;
+  top: -4px;
+  right: -3px;
+  min-width: 19px;
+  height: 19px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--stsc-danger);
+  color: #fff;
+  font-size: 12px;
+  line-height: 19px;
+  font-weight: 800;
+}
+
+.stsc-floating-panel {
+  position: absolute;
+  right: 0;
+  bottom: 58px;
+  width: min(390px, calc(100vw - 24px));
+  max-height: min(560px, 62dvh);
+  border: 1px solid var(--stsc-border);
+  border-radius: 13px;
+  background: var(--stsc-panel);
+  box-shadow: 0 16px 55px rgba(0, 0, 0, 0.52);
+  overflow: hidden;
+  backdrop-filter: blur(18px);
+}
+
+.stsc-floating-header,
+.stsc-floating-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 11px 12px;
+  border-bottom: 1px solid var(--stsc-border);
+}
+
+.stsc-floating-footer {
+  justify-content: flex-end;
+  border-top: 1px solid var(--stsc-border);
+  border-bottom: 0;
+}
+
+.stsc-floating-title {
+  font-weight: 800;
+}
+
+.stsc-floating-content {
+  max-height: min(430px, 48dvh);
+  padding: 10px;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.stsc-floating-content .stsc-answer-card {
+  margin-top: 8px;
+  padding: 10px;
+}
+
+.stsc-live-wait {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  opacity: 0.78;
+  font-size: 0.92em;
+  padding: 6px 0;
+}
+
+.stsc-live-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--SmartThemeQuoteColor, #8c76c8);
+  animation: stsc-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes stsc-pulse {
+  0%, 100% { opacity: 0.35; transform: scale(0.86); }
+  50% { opacity: 1; transform: scale(1.16); }
+}
+
+@media (max-width: 700px) {
+  .stsc-manager-header {
+    align-items: flex-start;
+  }
+
+  .stsc-header-actions {
+    gap: 5px;
+  }
+
+  .stsc-save-state {
+    display: none;
+  }
+
+  .stsc-save-button {
+    min-width: 74px !important;
+    padding-inline: 9px !important;
+  }
+
+  .stsc-floating-root {
+    right: 10px;
+    bottom: max(76px, calc(env(safe-area-inset-bottom) + 68px));
+  }
+
+  .stsc-floating-panel {
+    position: fixed;
+    right: 10px;
+    left: 10px;
+    bottom: max(132px, calc(env(safe-area-inset-bottom) + 124px));
+    width: auto;
+    max-height: 58dvh;
+  }
+}

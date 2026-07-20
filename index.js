@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.1.2';
+const STSC_VERSION = '0.1.3';
 
 const POSITION_MAP = Object.freeze({
     prompt: 0,
@@ -31,6 +31,10 @@ const DEFAULT_SETTINGS = Object.freeze({
     references: [],
     temporaryInstructions: [],
     pendingInstructionIds: [],
+    appearance: {
+        theme: 'default',
+        floatingEnabled: false,
+    },
     ui: {
         editingPresetId: '',
         editingGeneralPresetId: '',
@@ -48,6 +52,10 @@ let internalQuietActive = false;
 let runtimePromptKeys = new Set();
 let initialized = false;
 let bulkDraft = null;
+let editDraft = null;
+let editDirty = false;
+let pendingUnsavedAction = null;
+let streamDomObserver = null;
 
 function ctx() {
     return globalThis.SillyTavern?.getContext?.();
@@ -92,6 +100,9 @@ function normalizeSettings() {
     if (!Array.isArray(settings.temporaryInstructions)) settings.temporaryInstructions = [];
     if (!Array.isArray(settings.pendingInstructionIds)) settings.pendingInstructionIds = [];
     if (!settings.characterBindings || typeof settings.characterBindings !== 'object') settings.characterBindings = {};
+    if (!settings.appearance || typeof settings.appearance !== 'object') settings.appearance = clone(DEFAULT_SETTINGS.appearance);
+    settings.appearance.theme = ['default', 'rose', 'blue', 'mint', 'violet', 'gold'].includes(settings.appearance.theme) ? settings.appearance.theme : 'default';
+    settings.appearance.floatingEnabled = Boolean(settings.appearance.floatingEnabled);
 
     if (settings.presets.length === 0) {
         const general = createPreset('默认（初始默认）', 'general');
@@ -263,6 +274,79 @@ function saveSettings() {
     ctx()?.saveSettingsDebounced?.();
 }
 
+function getUiSettings() {
+    return editDraft || normalizeSettings();
+}
+
+function beginEditSession() {
+    editDraft = clone(normalizeSettings());
+    editDirty = false;
+    pendingUnsavedAction = null;
+    updateSaveState();
+}
+
+function markDirty() {
+    if (!editDraft) editDraft = clone(normalizeSettings());
+    editDirty = true;
+    updateSaveState();
+}
+
+function commitEditDraft({ notify = true } = {}) {
+    if (!editDraft) return;
+    const context = ctx();
+    if (!context?.extensionSettings) return;
+    context.extensionSettings[STSC_MODULE] = clone(editDraft);
+    normalizeSettings();
+    saveSettings();
+    editDraft = clone(context.extensionSettings[STSC_MODULE]);
+    editDirty = false;
+    applyTheme(editDraft);
+    renderAll();
+    if (notify) toastr.success('更改已保存。', '写作前置自检');
+}
+
+function discardEditDraft({ notify = false } = {}) {
+    editDraft = clone(normalizeSettings());
+    editDirty = false;
+    applyTheme(editDraft);
+    renderAll();
+    if (notify) toastr.info('已放弃未保存的更改。', '写作前置自检');
+}
+
+function updateSaveState() {
+    const $button = $('#stsc_save_changes');
+    const $state = $('#stsc_save_state');
+    if (!$button.length) return;
+    $button.prop('disabled', !editDirty).toggleClass('stsc-save-dirty', editDirty);
+    $state.text(editDirty ? '有未保存的更改' : '已保存').toggleClass('stsc-unsaved', editDirty);
+}
+
+function runPendingUnsavedAction() {
+    const action = pendingUnsavedAction;
+    pendingUnsavedAction = null;
+    if (typeof action === 'function') action();
+}
+
+function requestUnsavedDecision(action) {
+    if (!editDirty) {
+        action?.();
+        return;
+    }
+    pendingUnsavedAction = action;
+    openDialog(
+        '当前内容尚未保存',
+        '<div class="stsc-unsaved-message">你刚刚修改的内容还没有保存。请选择保存、放弃更改，或继续留在当前页面。</div>',
+        '<button class="menu_button" type="button" data-dialog-action="unsaved-cancel">继续编辑</button>' +
+        '<button class="menu_button stsc-danger-button" type="button" data-dialog-action="unsaved-discard">放弃更改</button>' +
+        '<button class="menu_button stsc-primary-button" type="button" data-dialog-action="unsaved-save">保存并继续</button>'
+    );
+}
+
+function applyTheme(settings = getUiSettings()) {
+    const theme = settings?.appearance?.theme || 'default';
+    $('#stsc_manager_overlay, #stsc_dialog_overlay, #stsc_floating_root').attr('data-stsc-theme', theme);
+}
+
 function characterEntityFrom(character, index = '') {
     if (!character) return { key: '', name: '', index: -1 };
     const stableKey = character.avatar || character.data?.avatar || character.data?.name || character.name || String(index);
@@ -310,12 +394,11 @@ function getCurrentChatId() {
     return String(context?.getCurrentChatId?.() ?? context?.chatId ?? '');
 }
 
-function getPresetById(id) {
-    return normalizeSettings()?.presets.find(x => x.id === id) || null;
+function getPresetById(id, settings = normalizeSettings()) {
+    return settings?.presets.find(x => x.id === id) || null;
 }
 
-function getBoundPreset() {
-    const settings = normalizeSettings();
+function getBoundPreset(settings = normalizeSettings()) {
     const character = getCurrentCharacterEntity();
     if (!character.key) return null;
     return settings.presets.find(x => x.kind === 'character' && x.boundCharacterKey === character.key) || null;
@@ -337,8 +420,8 @@ function referenceApplies(reference) {
     return Boolean(entity.key && reference.characterKey === entity.key);
 }
 
-function getActiveReferences() {
-    return normalizeSettings().references.filter(referenceApplies);
+function getActiveReferences(settings = normalizeSettings()) {
+    return settings.references.filter(referenceApplies);
 }
 
 function makeReferenceQuestion(reference) {
@@ -357,11 +440,10 @@ function makeReferenceQuestion(reference) {
     };
 }
 
-function getActiveQuestions() {
-    const settings = normalizeSettings();
+function getActiveQuestions(settings = normalizeSettings()) {
     const result = [];
     const general = settings.presets.find(x => x.id === settings.generalPresetId);
-    const character = getBoundPreset();
+    const character = getBoundPreset(settings);
 
     if (settings.generalEnabled && general?.enabled) {
         for (const question of general.questions.filter(x => x.enabled && x.text.trim())) {
@@ -375,15 +457,15 @@ function getActiveQuestions() {
         }
     }
 
-    for (const reference of getActiveReferences()) {
+    for (const reference of getActiveReferences(settings)) {
         if (reference.addToCheck) result.push(makeReferenceQuestion(reference));
     }
 
     return result;
 }
 
-function getSelectedTemporaryInstructions({ consume = false } = {}) {
-    const settings = normalizeSettings();
+function getSelectedTemporaryInstructions({ consume = false, settings = null } = {}) {
+    settings ||= normalizeSettings();
     const selectedSet = new Set(settings.pendingInstructionIds);
     const selected = settings.temporaryInstructions.filter(x => selectedSet.has(x.id) && x.content.trim());
 
@@ -636,6 +718,85 @@ function parseModelOutput(text, expectedQuestions = []) {
     return result;
 }
 
+function streamTextFromEvent(data) {
+    if (typeof data === 'string') return data;
+    if (!data || typeof data !== 'object') return '';
+    return String(data.text ?? data.token ?? data.chunk ?? data.content ?? '');
+}
+
+function mergeStreamText(current, incoming) {
+    const oldText = String(current || '');
+    const nextText = String(incoming || '');
+    if (!nextText) return oldText;
+    if (nextText.startsWith(oldText)) return nextText;
+    if (oldText.endsWith(nextText)) return oldText;
+    return oldText + nextText;
+}
+
+function liveResponseText(raw) {
+    const source = String(raw || '');
+    const open = /<response[^>]*>/i.exec(source);
+    if (!open) return null;
+    let body = source.slice(open.index + open[0].length);
+    const close = /<\/response>/i.exec(body);
+    if (close) body = body.slice(0, close.index);
+    return body;
+}
+
+function findStreamingMessageElement() {
+    const context = ctx();
+    const candidateId = Math.max(0, (context?.chat?.length || 1) - 1);
+    const selectors = [
+        `.mes[mesid="${candidateId}"]`,
+        `.mes[data-mesid="${candidateId}"]`,
+        '#chat .mes.last_mes',
+        '#chat .mes:last',
+    ];
+    for (const selector of selectors) {
+        const $message = $(selector).last();
+        if ($message.length && !$message.hasClass('is_user')) return $message;
+    }
+    return $();
+}
+
+function maskStreamingSelfCheck() {
+    if (!pendingRun || pendingRun.mode !== 'single') return;
+    const $message = findStreamingMessageElement();
+    if (!$message.length) return;
+    const $text = $message.find('.mes_text').first();
+    if (!$text.length) return;
+
+    const visibleBody = liveResponseText(pendingRun.streamBuffer || '');
+    $message.addClass('stsc-live-filtered');
+    const desiredHtml = visibleBody === null
+        ? '<div class="stsc-live-wait"><span class="stsc-live-dot"></span>正在完成写作前置自检，自检内容仅保存在插件中……</div>'
+        : (escapeHtml(visibleBody).replaceAll('\n', '<br>') || '<div class="stsc-live-wait"><span class="stsc-live-dot"></span>自检已完成，正在开始正文……</div>');
+    if ($text.attr('data-stsc-live-html') === desiredHtml) return;
+    $text.attr('data-stsc-live-html', desiredHtml).html(desiredHtml);
+}
+
+function ensureStreamDomObserver() {
+    if (streamDomObserver || !document.querySelector('#chat')) return;
+    streamDomObserver = new MutationObserver(() => {
+        if (!pendingRun || pendingRun.mode !== 'single') return;
+        requestAnimationFrame(maskStreamingSelfCheck);
+    });
+    streamDomObserver.observe(document.querySelector('#chat'), {
+        childList: true,
+        subtree: true,
+        characterData: true,
+    });
+}
+
+function handleStreamTokenReceived(data) {
+    if (internalQuietActive || !pendingRun || pendingRun.mode !== 'single') return;
+    const text = streamTextFromEvent(data);
+    if (!text) return;
+    pendingRun.streamBuffer = mergeStreamText(pendingRun.streamBuffer, text);
+    requestAnimationFrame(maskStreamingSelfCheck);
+    setTimeout(maskStreamingSelfCheck, 0);
+}
+
 function resolveMessageId(data) {
     const context = ctx();
     if (typeof data === 'number') return data;
@@ -804,8 +965,8 @@ globalThis.sillyTavernSelfCheckInterceptor = async function (_chat, _contextSize
     if (!settings?.enabled || skipGenerationType(type)) return;
 
     const context = ctx();
-    const questions = getActiveQuestions();
-    const references = getActiveReferences();
+    const questions = getActiveQuestions(settings);
+    const references = getActiveReferences(settings);
     const temporaryInstructions = getSelectedTemporaryInstructions({ consume: true });
 
     clearRuntimePrompts();
@@ -824,6 +985,7 @@ globalThis.sillyTavernSelfCheckInterceptor = async function (_chat, _contextSize
         generationType: type,
         strictCheck: '',
         strictParsed: null,
+        streamBuffer: '',
     };
 
     if (settings.mode === 'strict') {
@@ -865,14 +1027,13 @@ globalThis.sillyTavernSelfCheckInterceptor = async function (_chat, _contextSize
     }
 };
 
-function activeSummary() {
-    const settings = normalizeSettings();
+function activeSummary(settings = getUiSettings()) {
     const entity = getCurrentEntity();
-    const general = settings.generalEnabled ? getPresetById(settings.generalPresetId) : null;
-    const character = settings.characterEnabled ? getBoundPreset() : null;
-    const questions = getActiveQuestions();
-    const refs = getActiveReferences();
-    const temps = getSelectedTemporaryInstructions();
+    const general = settings.generalEnabled ? getPresetById(settings.generalPresetId, settings) : null;
+    const character = settings.characterEnabled ? getBoundPreset(settings) : null;
+    const questions = getActiveQuestions(settings);
+    const refs = getActiveReferences(settings);
+    const temps = getSelectedTemporaryInstructions({ settings });
 
     const parts = [];
     if (general?.enabled) parts.push(`通用：${general.name}`);
@@ -889,7 +1050,7 @@ function activeSummary() {
 }
 
 function renderCompact() {
-    const settings = normalizeSettings();
+    const settings = getUiSettings();
     if (!settings) return;
     const summary = activeSummary();
     const latest = getLatestResult();
@@ -918,7 +1079,8 @@ function renderManagerSubtitle() {
 }
 
 function renderStatusTab() {
-    const summary = activeSummary();
+    const settings = getUiSettings();
+    const summary = activeSummary(settings);
     const latest = getLatestResult();
     const questionList = summary.questions.length
         ? summary.questions.map((q, i) => `<div class="stsc-question-card"><div class="stsc-card-title">${i + 1}. ${escapeHtml(q.text)}</div><div class="stsc-muted">${escapeHtml(q.source || '')}｜${q.type === 'boolean' ? '判断题' : '开放问答'}｜${q.length === 'brief' ? '简短' : q.length === 'detailed' ? '详细' : '标准'}${q.requireEvidence ? '｜需要依据' : ''}</div></div>`).join('')
@@ -961,7 +1123,7 @@ function renderStatusTab() {
             <div><b>角色：</b>${escapeHtml(summary.entity.name)}</div>
             <div><b>预设：</b>${escapeHtml(summary.presetText)}</div>
             <div><b>参考资料：</b>${summary.refs.length ? summary.refs.map(x => escapeHtml(x.name)).join('、') : '无'}</div>
-            <div><b>模式：</b>${normalizeSettings().mode === 'strict' ? '双阶段严格模式（两次调用）' : '单次模式（一次调用）'}</div>
+            <div><b>模式：</b>${settings.mode === 'strict' ? '双阶段严格模式（两次调用）' : '单次模式（一次调用）'}</div>
             <div class="stsc-section-title" style="margin-top:12px">下轮临时指令</div>
             ${tempPills}
         </div>
@@ -976,15 +1138,14 @@ function renderStatusTab() {
     `);
 }
 
-function presetOptions(kind, selectedId) {
-    return normalizeSettings().presets
+function presetOptions(kind, selectedId, settings = getUiSettings()) {
+    return settings.presets
         .filter(preset => preset.kind === kind)
         .map(preset => `<option value="${escapeHtml(preset.id)}" ${preset.id === selectedId ? 'selected' : ''}>${escapeHtml(preset.name)}</option>`)
         .join('');
 }
 
-function getEditingPreset(kind = null) {
-    const settings = normalizeSettings();
+function getEditingPreset(kind = null, settings = getUiSettings()) {
     const actualKind = kind || settings.ui.presetSection || 'general';
     const id = actualKind === 'character' ? settings.ui.editingCharacterPresetId : settings.ui.editingGeneralPresetId;
     return settings.presets.find(x => x.id === id && x.kind === actualKind) || null;
@@ -1032,7 +1193,7 @@ function renderQuestionCards(preset) {
 }
 
 function renderPresetsTab() {
-    const settings = normalizeSettings();
+    const settings = getUiSettings();
     const kind = settings.ui.presetSection === 'character' ? 'character' : 'general';
     const presets = settings.presets.filter(x => x.kind === kind);
     let preset = getEditingPreset(kind);
@@ -1044,7 +1205,7 @@ function renderPresetsTab() {
 
     const currentCharacter = getCurrentCharacterEntity();
     const binding = getPresetBindingState(preset);
-    const activeGeneral = getPresetById(settings.generalPresetId);
+    const activeGeneral = getPresetById(settings.generalPresetId, settings);
     const pageTitle = kind === 'general' ? '通用预设' : '角色预设';
     const selectId = kind === 'general' ? 'stsc_general_preset_select' : 'stsc_character_preset_select';
     const questionsHtml = renderQuestionCards(preset);
@@ -1088,7 +1249,7 @@ function renderPresetsTab() {
             <div class="stsc-section-title">${pageTitle}</div>
             <div class="stsc-muted">${kind === 'general' ? '通用预设可在所有角色中持续生效；可以创建多套，但同一时间只选择一套作为当前通用预设。' : '角色预设创建后默认不绑定。打开角色卡聊天页面后，再手动绑定到当前角色。'}</div>
             <div class="stsc-toolbar" style="margin-top:10px">
-                ${presets.length ? `<select id="${selectId}" class="text_pole">${presetOptions(kind, preset?.id)}</select>` : ''}
+                ${presets.length ? `<select id="${selectId}" class="text_pole">${presetOptions(kind, preset?.id, settings)}</select>` : ''}
                 <button class="menu_button" type="button" data-action="open-create-preset" data-kind="${kind}">＋ 新建预设</button>
                 <button class="menu_button" type="button" data-action="copy-preset" ${preset ? '' : 'disabled'}>复制</button>
                 <button class="menu_button stsc-danger-button" type="button" data-action="delete-preset" ${preset ? '' : 'disabled'}>删除</button>
@@ -1115,7 +1276,7 @@ function renderPresetsTab() {
 }
 
 function renderReferencesTab() {
-    const settings = normalizeSettings();
+    const settings = getUiSettings();
     const entity = getCurrentEntity();
     const references = settings.references.length
         ? settings.references.map(reference => `
@@ -1169,7 +1330,7 @@ function renderReferencesTab() {
 }
 
 function renderTemporaryTab() {
-    const settings = normalizeSettings();
+    const settings = getUiSettings();
     const selected = new Set(settings.pendingInstructionIds);
     const instructions = settings.temporaryInstructions.length
         ? settings.temporaryInstructions.map(instruction => `
@@ -1197,7 +1358,7 @@ function renderTemporaryTab() {
 }
 
 function renderSettingsTab() {
-    const settings = normalizeSettings();
+    const settings = getUiSettings();
     $('#stsc_tab_settings').html(`
         <div class="stsc-section">
             <div class="stsc-section-title">运行方式</div>
@@ -1231,12 +1392,66 @@ function renderSettingsTab() {
             </div>
         </div>
         <div class="stsc-section">
+            <div class="stsc-section-title">界面显示</div>
+            <div class="stsc-grid-2">
+                <div class="stsc-field"><label>插件配色</label><select id="stsc_theme" class="text_pole">
+                    <option value="default" ${settings.appearance.theme === 'default' ? 'selected' : ''}>默认：跟随 SillyTavern 美化</option>
+                    <option value="rose" ${settings.appearance.theme === 'rose' ? 'selected' : ''}>柔粉</option>
+                    <option value="blue" ${settings.appearance.theme === 'blue' ? 'selected' : ''}>雾蓝</option>
+                    <option value="mint" ${settings.appearance.theme === 'mint' ? 'selected' : ''}>薄荷</option>
+                    <option value="violet" ${settings.appearance.theme === 'violet' ? 'selected' : ''}>紫罗兰</option>
+                    <option value="gold" ${settings.appearance.theme === 'gold' ? 'selected' : ''}>暖金</option>
+                </select></div>
+                <div class="stsc-field"><label>悬浮窗</label>
+                    <label class="checkbox_label"><input id="stsc_floating_enabled" type="checkbox" ${settings.appearance.floatingEnabled ? 'checked' : ''}> 开启悬浮按钮，快速查看最新一轮问答</label>
+                    <div class="stsc-muted">悬浮窗只展示插件保存的自检，不会把问答重新写入聊天正文。</div>
+                </div>
+            </div>
+        </div>
+        <div class="stsc-section">
             <div class="stsc-section-title">上下文处理</div>
-            <div>自检结果会在生成后从AI消息中剥离，保存到当前聊天的插件元数据中。</div>
-            <div>下一轮AI只能读取正文和状态栏，读取不到上一轮自检。</div>
+            <div>自检问答不会保留在聊天正文中；流式生成时会显示“正在自检”的占位提示，完成后只在插件与悬浮窗中查看。</div>
+            <div>聊天记录只保留正文、状态栏和其他正常输出；下一轮AI读取不到上一轮自检。</div>
             <div class="stsc-code-note">&lt;self_check&gt;…&lt;/self_check&gt; → 仅插件可见\n&lt;response&gt;…&lt;/response&gt; → 正常聊天正文</div>
         </div>
     `);
+}
+
+function renderFloating() {
+    const settings = getUiSettings();
+    const $root = $('#stsc_floating_root');
+    if (!$root.length) return;
+    applyTheme(settings);
+
+    const enabled = Boolean(settings.appearance?.floatingEnabled);
+    $root.toggleClass('stsc-hidden', !enabled).attr('aria-hidden', enabled ? 'false' : 'true');
+    if (!enabled) {
+        $('#stsc_floating_panel').addClass('stsc-hidden');
+        return;
+    }
+
+    const latest = getLatestResult();
+    const hasIssue = latest && ['missing', 'format_error'].includes(latest.status);
+    $('#stsc_floating_badge').toggleClass('stsc-hidden', !hasIssue).text(latest?.status === 'format_error' ? '⚠' : '!');
+
+    if (!latest) {
+        $('#stsc_floating_subtitle').text('还没有自检记录');
+        $('#stsc_floating_content').html('<div class="stsc-empty">完成一次角色回复后，这里会显示最新一轮自检问答。</div>');
+        return;
+    }
+
+    $('#stsc_floating_subtitle').text(`${statusText(latest.status)}｜${new Date(latest.timestamp).toLocaleString()}`);
+    const issues = (latest.formatIssues || []).length
+        ? `<div class="stsc-section"><div class="stsc-section-title stsc-status-warning">格式提示</div>${latest.formatIssues.map(x => `<div>• ${escapeHtml(x)}</div>`).join('')}</div>`
+        : '';
+    const answers = (latest.answers || []).length
+        ? latest.answers.map((answer, index) => `
+            <div class="stsc-answer-card">
+                <div class="stsc-question-text">${index + 1}. ${escapeHtml(answer.question)}</div>
+                <div class="stsc-answer-text">${escapeHtml(answer.answer || '（未识别到回答）')}</div>
+            </div>`).join('')
+        : `<div class="stsc-test-result">${escapeHtml(latest.rawCheck || '没有可显示的自检内容。')}</div>`;
+    $('#stsc_floating_content').html(`${issues}${answers}`);
 }
 
 function renderAll() {
@@ -1248,21 +1463,37 @@ function renderAll() {
     renderReferencesTab();
     renderTemporaryTab();
     renderSettingsTab();
+    renderFloating();
+    applyTheme(getUiSettings());
+    updateSaveState();
 }
 
 function openManager(tab = null) {
-    const settings = normalizeSettings();
+    if (!editDraft) beginEditSession();
+    const settings = getUiSettings();
     if (tab) settings.ui.activeTab = tab;
     $('#stsc_manager_overlay').removeClass('stsc-hidden').attr('aria-hidden', 'false');
     $('body').addClass('stsc-modal-open');
-    switchTab(settings.ui.activeTab || 'status');
+    performSwitchTab(settings.ui.activeTab || 'status');
     renderAll();
 }
 
-function closeManager() {
+function performCloseManager() {
     closeDialog();
     $('#stsc_manager_overlay').addClass('stsc-hidden').attr('aria-hidden', 'true');
     $('body').removeClass('stsc-modal-open');
+    if (editDraft?.ui) {
+        normalizeSettings().ui = clone(editDraft.ui);
+        saveSettings();
+    }
+    editDraft = null;
+    editDirty = false;
+    applyTheme(normalizeSettings());
+    renderFloating();
+}
+
+function closeManager() {
+    requestUnsavedDecision(performCloseManager);
 }
 
 function openDialog(title, bodyHtml, footerHtml = '') {
@@ -1274,19 +1505,30 @@ function openDialog(title, bodyHtml, footerHtml = '') {
 }
 
 function closeDialog() {
+    const hadPendingUnsavedAction = Boolean(pendingUnsavedAction);
     bulkDraft = null;
+    pendingUnsavedAction = null;
     $('#stsc_dialog_overlay').addClass('stsc-hidden').attr('aria-hidden', 'true');
     $('#stsc_dialog_title, #stsc_dialog_body, #stsc_dialog_footer').empty();
+    if (hadPendingUnsavedAction && initialized) renderAll();
 }
 
-function switchTab(tab) {
-    const settings = normalizeSettings();
+function performSwitchTab(tab) {
+    const settings = getUiSettings();
     settings.ui.activeTab = tab;
-    saveSettings();
     $('.stsc-tab').removeClass('active');
     $(`.stsc-tab[data-tab="${tab}"]`).addClass('active');
     $('.stsc-tab-panel').removeClass('active');
     $(`#stsc_tab_${tab}`).addClass('active');
+}
+
+function switchTab(tab) {
+    const current = getUiSettings().ui.activeTab || 'status';
+    if (tab === current) return;
+    requestUnsavedDecision(() => {
+        performSwitchTab(tab);
+        renderAll();
+    });
 }
 
 function normalizePresetName(name) {
@@ -1295,7 +1537,7 @@ function normalizePresetName(name) {
 
 function presetNameExists(name, excludeId = '') {
     const normalized = normalizePresetName(name);
-    return Boolean(normalized && normalizeSettings().presets.some(x => x.id !== excludeId && normalizePresetName(x.name) === normalized));
+    return Boolean(normalized && getUiSettings().presets.some(x => x.id !== excludeId && normalizePresetName(x.name) === normalized));
 }
 
 function makeUniquePresetName(baseName) {
@@ -1388,8 +1630,9 @@ function openBulkImportDialog(preset) {
 async function testCurrentPreset() {
     if (testBusy) return;
     const context = ctx();
-    const questions = getActiveQuestions();
-    const references = getActiveReferences();
+    const settings = getUiSettings();
+    const questions = getActiveQuestions(settings);
+    const references = getActiveReferences(settings);
     if (!questions.length) {
         toastr.warning('当前没有生效的问题可以测试。', '写作前置自检');
         return;
@@ -1437,6 +1680,10 @@ ${questionText}
 
 function bindUiEvents() {
     $('#stsc_close_manager').on('click', closeManager);
+    $('#stsc_save_changes').on('click', () => commitEditDraft());
+    $('#stsc_floating_button').on('click', function () { $('#stsc_floating_panel').toggleClass('stsc-hidden'); renderFloating(); });
+    $('#stsc_floating_close').on('click', () => $('#stsc_floating_panel').addClass('stsc-hidden'));
+    $('#stsc_floating_open_manager').on('click', () => { $('#stsc_floating_panel').addClass('stsc-hidden'); openManager('status'); });
     $('#stsc_dialog_close').on('click', closeDialog);
 
     // 不再点击黑色背景关闭，避免用户拖选/复制文字时误退出插件。
@@ -1451,22 +1698,31 @@ function bindUiEvents() {
     });
 
     $('#stsc_manager_overlay').on('click', '[data-preset-section]', function () {
-        const settings = normalizeSettings();
-        settings.ui.presetSection = $(this).data('preset-section') === 'character' ? 'character' : 'general';
-        saveSettings();
-        renderPresetsTab();
+        const next = $(this).data('preset-section') === 'character' ? 'character' : 'general';
+        if (next === getUiSettings().ui.presetSection) return;
+        requestUnsavedDecision(() => {
+            getUiSettings().ui.presetSection = next;
+            renderPresetsTab();
+            updateSaveState();
+        });
     });
 
     $('#stsc_manager_overlay').on('change', '#stsc_general_preset_select', function () {
-        normalizeSettings().ui.editingGeneralPresetId = this.value;
-        saveSettings();
-        renderPresetsTab();
+        const next = this.value;
+        requestUnsavedDecision(() => {
+            getUiSettings().ui.editingGeneralPresetId = next;
+            renderPresetsTab();
+            updateSaveState();
+        });
     });
 
     $('#stsc_manager_overlay').on('change', '#stsc_character_preset_select', function () {
-        normalizeSettings().ui.editingCharacterPresetId = this.value;
-        saveSettings();
-        renderPresetsTab();
+        const next = this.value;
+        requestUnsavedDecision(() => {
+            getUiSettings().ui.editingCharacterPresetId = next;
+            renderPresetsTab();
+            updateSaveState();
+        });
     });
 
     $('#stsc_manager_overlay').on('change', '#stsc_preset_name', function () {
@@ -1484,7 +1740,7 @@ function bindUiEvents() {
             return;
         }
         preset.name = nextName;
-        saveSettings();
+        markDirty();
         renderAll();
     });
 
@@ -1492,7 +1748,7 @@ function bindUiEvents() {
         const preset = getEditingPreset();
         if (!preset) return;
         preset.enabled = this.checked;
-        saveSettings();
+        markDirty();
         renderAll();
     });
 
@@ -1503,80 +1759,92 @@ function bindUiEvents() {
         if (!question) return;
         const field = $(this).data('question-field');
         question[field] = this.type === 'checkbox' ? this.checked : this.value;
-        saveSettings();
+        markDirty();
         renderCompact();
         renderManagerSubtitle();
     });
 
     $('#stsc_manager_overlay').on('input change', '[data-reference-field]', function () {
         const id = $(this).closest('[data-reference-id]').data('reference-id');
-        const reference = normalizeSettings().references.find(x => x.id === id);
+        const reference = getUiSettings().references.find(x => x.id === id);
         if (!reference) return;
         const field = $(this).data('reference-field');
         reference[field] = this.type === 'checkbox' ? this.checked : this.value;
         if (field === 'depth') reference.depth = clampNumber(reference.depth, 0, 20, 0);
-        saveSettings();
+        markDirty();
         renderCompact();
         renderManagerSubtitle();
     });
 
     $('#stsc_manager_overlay').on('input change', '[data-temp-field]', function () {
         const id = $(this).closest('[data-temp-id]').data('temp-id');
-        const instruction = normalizeSettings().temporaryInstructions.find(x => x.id === id);
+        const instruction = getUiSettings().temporaryInstructions.find(x => x.id === id);
         if (!instruction) return;
         instruction[$(this).data('temp-field')] = this.value;
-        saveSettings();
+        markDirty();
     });
 
     $('#stsc_manager_overlay').on('change', '[data-action="toggle-temp-selected"]', function () {
-        const settings = normalizeSettings();
+        const settings = getUiSettings();
         const id = $(this).closest('[data-temp-id]').data('temp-id');
         const selected = new Set(settings.pendingInstructionIds);
         this.checked ? selected.add(id) : selected.delete(id);
         settings.pendingInstructionIds = [...selected];
-        saveSettings();
+        markDirty();
         renderCompact();
         renderStatusTab();
     });
 
     $('#stsc_manager_overlay').on('change', '#stsc_setting_enabled', function () {
-        normalizeSettings().enabled = this.checked;
-        saveSettings();
+        getUiSettings().enabled = this.checked;
+        markDirty();
         renderAll();
     });
     $('#stsc_manager_overlay').on('change', '#stsc_setting_mode', function () {
-        normalizeSettings().mode = this.value;
-        saveSettings();
+        getUiSettings().mode = this.value;
+        markDirty();
         renderAll();
     });
     $('#stsc_manager_overlay').on('change', '#stsc_general_enabled', function () {
-        normalizeSettings().generalEnabled = this.checked;
-        saveSettings();
+        getUiSettings().generalEnabled = this.checked;
+        markDirty();
         renderAll();
     });
     $('#stsc_manager_overlay').on('change', '#stsc_character_enabled', function () {
-        normalizeSettings().characterEnabled = this.checked;
-        saveSettings();
+        getUiSettings().characterEnabled = this.checked;
+        markDirty();
         renderAll();
     });
     $('#stsc_manager_overlay').on('change', '#stsc_injection_position', function () {
-        normalizeSettings().injection.position = this.value;
-        saveSettings();
+        getUiSettings().injection.position = this.value;
+        markDirty();
         renderAll();
     });
     $('#stsc_manager_overlay').on('change', '#stsc_injection_depth', function () {
-        normalizeSettings().injection.depth = clampNumber(this.value, 0, 20, 0);
-        saveSettings();
+        getUiSettings().injection.depth = clampNumber(this.value, 0, 20, 0);
+        markDirty();
     });
     $('#stsc_manager_overlay').on('change', '#stsc_injection_role', function () {
-        normalizeSettings().injection.role = this.value;
-        saveSettings();
+        getUiSettings().injection.role = this.value;
+        markDirty();
+    });
+
+    $('#stsc_manager_overlay').on('change', '#stsc_theme', function () {
+        getUiSettings().appearance.theme = this.value;
+        markDirty();
+        applyTheme(getUiSettings());
+        renderFloating();
+    });
+    $('#stsc_manager_overlay').on('change', '#stsc_floating_enabled', function () {
+        getUiSettings().appearance.floatingEnabled = this.checked;
+        markDirty();
+        renderFloating();
     });
 
     $('#stsc_manager_overlay').on('click', '[data-action]', async function () {
         const action = $(this).data('action');
-        const settings = normalizeSettings();
-        const preset = getEditingPreset();
+        const settings = getUiSettings();
+        const preset = getEditingPreset(null, settings);
 
         if (action === 'open-create-preset') {
             openCreatePresetDialog($(this).data('kind'));
@@ -1666,7 +1934,7 @@ function bindUiEvents() {
             return;
         }
 
-        saveSettings();
+        markDirty();
         renderAll();
     });
 
@@ -1689,7 +1957,30 @@ function bindUiEvents() {
 
     $('#stsc_dialog_overlay').on('click', '[data-dialog-action]', function () {
         const action = $(this).data('dialog-action');
-        const settings = normalizeSettings();
+        const settings = getUiSettings();
+
+        if (action === 'unsaved-cancel') {
+            pendingUnsavedAction = null;
+            closeDialog();
+            renderAll();
+            return;
+        }
+        if (action === 'unsaved-discard') {
+            const next = pendingUnsavedAction;
+            pendingUnsavedAction = null;
+            closeDialog();
+            discardEditDraft();
+            next?.();
+            return;
+        }
+        if (action === 'unsaved-save') {
+            const next = pendingUnsavedAction;
+            pendingUnsavedAction = null;
+            closeDialog();
+            commitEditDraft({ notify: false });
+            next?.();
+            return;
+        }
 
         if (action === 'cancel') {
             closeDialog();
@@ -1711,7 +2002,7 @@ function bindUiEvents() {
             settings.ui.presetSection = kind;
             if (kind === 'character') settings.ui.editingCharacterPresetId = preset.id;
             else settings.ui.editingGeneralPresetId = preset.id;
-            saveSettings();
+            markDirty();
             closeDialog();
             renderAll();
             return;
@@ -1748,12 +2039,18 @@ function bindUiEvents() {
                 return;
             }
             preset.questions.push(...items.map(text => createQuestion(text)));
-            saveSettings();
+            markDirty();
             const count = items.length;
             closeDialog();
             renderAll();
             toastr.success(`已确认导入 ${count} 个问题。`, '写作前置自检');
         }
+    });
+
+    window.addEventListener('beforeunload', function (event) {
+        if (!editDirty) return;
+        event.preventDefault();
+        event.returnValue = '';
     });
 }
 
@@ -1777,14 +2074,16 @@ async function initialize() {
     normalizeSettings();
     const html = await context.renderExtensionTemplateAsync(STSC_FOLDER, 'settings');
     // 管理器直接挂到 body，避免被“扩展”侧栏的宽度、overflow 或 transform 裁切。
-    $('#stsc_manager_overlay, #stsc_dialog_overlay').remove();
+    $('#stsc_manager_overlay, #stsc_dialog_overlay, #stsc_floating_root').remove();
     $('body').append(html);
     initialized = true;
     bindUiEvents();
     addExtensionsMenuButton();
+    ensureStreamDomObserver();
 
     const events = context.eventTypes || context.event_types;
     context.eventSource.on(events.MESSAGE_RECEIVED, handleMessageReceived);
+    if (events.STREAM_TOKEN_RECEIVED) context.eventSource.on(events.STREAM_TOKEN_RECEIVED, handleStreamTokenReceived);
     context.eventSource.on(events.CHARACTER_MESSAGE_RENDERED, handleCharacterMessageRendered);
     context.eventSource.on(events.CHAT_CHANGED, renderAll);
     context.eventSource.on(events.GENERATION_ENDED, onGenerationEnded);

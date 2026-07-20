@@ -5,7 +5,11 @@
         <div class="stsc-manager-title">写作前置自检</div>
         <div id="stsc_manager_subtitle" class="stsc-manager-subtitle"></div>
       </div>
-      <button id="stsc_close_manager" class="menu_button stsc-icon-button" type="button" title="关闭" aria-label="关闭">✕</button>
+      <div class="stsc-header-actions">
+        <span id="stsc_save_state" class="stsc-save-state">已保存</span>
+        <button id="stsc_save_changes" class="menu_button stsc-save-button" type="button" disabled>保存更改</button>
+        <button id="stsc_close_manager" class="menu_button stsc-icon-button" type="button" title="关闭" aria-label="关闭">✕</button>
+      </div>
     </div>
 
     <div class="stsc-tabs" role="tablist" aria-label="写作前置自检功能页">
@@ -34,5 +38,25 @@
     </div>
     <div id="stsc_dialog_body" class="stsc-dialog-body"></div>
     <div id="stsc_dialog_footer" class="stsc-dialog-footer"></div>
+  </div>
+</div>
+
+<div id="stsc_floating_root" class="stsc-floating-root stsc-hidden" aria-hidden="true">
+  <button id="stsc_floating_button" class="stsc-floating-button" type="button" title="查看最新自检" aria-label="查看最新自检">
+    <span class="stsc-floating-icon">✓</span>
+    <span id="stsc_floating_badge" class="stsc-floating-badge stsc-hidden">!</span>
+  </button>
+  <div id="stsc_floating_panel" class="stsc-floating-panel stsc-hidden" role="dialog" aria-label="最新一轮自检">
+    <div class="stsc-floating-header">
+      <div>
+        <div class="stsc-floating-title">最新一轮自检</div>
+        <div id="stsc_floating_subtitle" class="stsc-muted"></div>
+      </div>
+      <button id="stsc_floating_close" class="menu_button stsc-icon-button" type="button" aria-label="关闭悬浮窗">✕</button>
+    </div>
+    <div id="stsc_floating_content" class="stsc-floating-content"></div>
+    <div class="stsc-floating-footer">
+      <button id="stsc_floating_open_manager" class="menu_button" type="button">打开完整管理器</button>
+    </div>
   </div>
 </div>
