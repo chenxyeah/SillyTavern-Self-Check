@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.2.8';
+const STSC_VERSION = '0.2.9';
 const STSC_CHECK_TAG = 'stsc_self_check';
 const STSC_RESPONSE_TAG = 'stsc_response';
 const STSC_CHECK_OPEN_RE = /<stsc_self_check\b[^>]*>/i;
@@ -1167,18 +1167,24 @@ function buildQuestionXml(questions) {
 function buildSinglePrompt(questions) {
     return `
 [写作前置自检插件｜强制执行]
-你必须在输出任何角色扮演正文、对白、动作描写、状态栏、HTML、XML或其他自定义格式之前，先完成下面全部自检问题。
+你必须在输出任何角色扮演正文、对白、动作描写、状态栏、HTML、XML或其他正常正文格式之前，完成下面全部自检问题。
+
+兼容规则：
+- 本插件不得压制、替换、改写或省略用户预设、模型接口或 SillyTavern 原本要求的 thinking / reasoning 内容。
+- 如果原预设要求先输出 <thinking>、<think>、<reasoning> 或其他推理块，请先按原规则完整输出该推理块；随后输出插件自检；最后再输出正文。
+- <stsc_self_check> 只需位于正文之前，不要求位于原生思维链或推理块之前。
 
 执行规则：
 1. 先依据当前角色卡、世界观、聊天记录和用户最后一条消息，逐题形成最终写作结论。
-2. 检查你准备输出的正文是否与任一答案冲突；如有冲突，先在内部修改写作方案，再重新核对。
-3. 不展示失败草稿、反复推理过程或隐藏思维，只展示最终可供用户核对的简洁答案。
+2. 检查你准备输出的正文是否与任一答案冲突；如有冲突，先修正写作方案，再重新核对。
+3. 自检区只输出最终可供核对的简洁答案，不得把插件问答混入原生 thinking / reasoning 区域。
 4. 不得漏题、合并题目或改变题目编号。
-5. 自检完成前绝对不得开始正文。
+5. 自检完成前不得开始角色扮演正文；原预设要求的思维链或推理块不属于正文，可正常位于自检之前。
 6. 对标记 evidence_required="true" 的问题，必须在同一个<item>中同时输出非空的<answer>与<evidence>；缺少<evidence>即视为格式错误。
 7. <answer>只写最终结论与本轮演绎方案；<evidence>单独写支撑该结论的具体剧情、角色设定或世界观依据。
 
 你必须严格输出以下结构：
+（如原预设要求，先正常输出其 thinking / reasoning 内容）
 <stsc_self_check>
 无需依据：<item id="题目ID"><answer>最终回答</answer></item>
 需要依据：<item id="题目ID"><answer>最终回答</answer><evidence>具体依据</evidence></item>
@@ -1195,7 +1201,7 @@ function buildStrictCheckPrompt(questions) {
     return `
 这是“双阶段严格模式”的第一阶段。请只完成写作前置自检，不得输出角色扮演正文、对白、动作描写或状态栏。
 
-请结合当前角色卡、世界观、聊天记录和用户最后一条消息，逐题给出最终写作结论。发现潜在冲突时，先调整本轮写作计划，再给出最终答案。不要展示隐藏推理或失败草稿。
+请结合当前角色卡、世界观、聊天记录和用户最后一条消息，逐题给出最终写作结论。发现潜在冲突时，先调整本轮写作计划，再给出最终答案。本阶段只规定插件自检的输出格式，不修改用户原预设的思维链规则。
 
 严格输出：
 <stsc_self_check>
@@ -1222,8 +1228,8 @@ ${checkText}
 对应问题：
 ${buildQuestionXml(questions)}
 
-只输出正文、状态栏以及用户要求的全部正常输出格式。
-不要输出 <stsc_self_check>，也不要给正文添加任何由本插件定义的包裹标签。
+按照用户原预设正常输出其要求的 thinking / reasoning 内容、正文、状态栏以及全部正常输出格式。
+不要重复输出 <stsc_self_check>，也不要给正文或原生思维链添加任何由本插件定义的包裹标签。
 `.trim();
 }
 
@@ -1327,28 +1333,31 @@ function parseItems(checkInner) {
 }
 
 function unwrapResponse(text) {
+    // 兼容极早期版本的 <stsc_response> 标签，但绝不删除标签之前的内容。
     const source = String(text ?? '');
     const open = STSC_RESPONSE_OPEN_RE.exec(source);
     if (!open) return source.trim();
-    const afterOpen = source.slice(open.index + open[0].length);
+
+    const afterOpenStart = open.index + open[0].length;
+    const afterOpen = source.slice(afterOpenStart);
     const close = STSC_RESPONSE_CLOSE_RE.exec(afterOpen);
-    return (close ? afterOpen.slice(0, close.index) : afterOpen).trim();
+    if (!close) return source.trim();
+
+    const closeEnd = afterOpenStart + close.index + close[0].length;
+    return `${source.slice(0, open.index)}${source.slice(afterOpenStart, afterOpenStart + close.index)}${source.slice(closeEnd)}`.trim();
+}
+
+function removeSelfCheckBlocks(text) {
+    const source = String(text ?? '');
+    // 只删除完整闭合的插件自检块。标签前后的 thinking、reasoning、正文及其他自定义格式全部原样保留。
+    return source
+        .replace(/<stsc_self_check\b[^>]*>[\s\S]*?<\/stsc_self_check>/gi, '')
+        .trim();
 }
 
 function extractVisibleBody(text) {
-    const source = String(text ?? '');
-    const responseOpen = STSC_RESPONSE_OPEN_RE.exec(source);
-    if (responseOpen) return unwrapResponse(source);
-
-    const checkOpen = STSC_CHECK_OPEN_RE.exec(source);
-    if (!checkOpen) return source.trim();
-    const checkClose = STSC_CHECK_CLOSE_RE.exec(source);
-    if (checkClose && checkClose.index > checkOpen.index) {
-        return source.slice(checkClose.index + checkClose[0].length).trim();
-    }
-
-    // 标签残缺时也不把自检泄漏进正文，只保留标签前的正常内容。
-    return source.slice(0, checkOpen.index).trim();
+    // 自检标签未闭合时不做破坏性裁切，避免误吞原生思维链或后续正文。
+    return removeSelfCheckBlocks(text);
 }
 
 function parseModelOutput(text, expectedQuestions = []) {
@@ -1375,17 +1384,12 @@ function parseModelOutput(text, expectedQuestions = []) {
         return result;
     }
 
-    const firstVisibleIndex = source.search(/\S/);
-    if (firstVisibleIndex !== openMatch.index) {
-        result.formatIssues.push('自检没有出现在全部正文格式之前。');
-    }
-
     const innerStart = openMatch.index + openMatch[0].length;
     const inner = source.slice(innerStart, closeMatch.index).trim();
-    const after = source.slice(closeMatch.index + closeMatch[0].length).trim();
     result.rawCheck = inner;
     result.items = parseItems(inner);
-    result.body = unwrapResponse(after);
+    // 仅精准移除 <stsc_self_check>…</stsc_self_check>，保留它之前的原生 thinking / reasoning 与之后的正文。
+    result.body = extractVisibleBody(source);
 
     const itemMap = new Map(result.items.map(item => [item.id, item]));
     result.answers = expectedQuestions.map(question => {
@@ -1433,6 +1437,7 @@ function resolveMessageId(data) {
 }
 
 function updateMessageText(message, body) {
+    // 只改写可见正文文本，不读取、不覆盖 message.extra.reasoning 或各 swipe 的 reasoning 数据。
     message.mes = body;
     if (Array.isArray(message.swipes) && Number.isInteger(message.swipe_id) && message.swipes[message.swipe_id] !== undefined) {
         message.swipes[message.swipe_id] = body;
@@ -1518,7 +1523,7 @@ async function handleMessageReceived(data) {
 
     if (mode === 'strict' && run?.strictCheck) {
         const mainParsed = parseModelOutput(rawText, []);
-        const body = mainParsed.status === 'missing' ? unwrapResponse(rawText) : mainParsed.body;
+        const body = mainParsed.status === 'missing' ? String(rawText ?? '').trim() : mainParsed.body;
         updateMessageText(message, body);
 
         const checkParsed = run.strictParsed || parseModelOutput(run.strictCheck, questions);
