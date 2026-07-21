@@ -402,30 +402,6 @@ body.stsc-modal-open {
   overflow-wrap: anywhere;
 }
 
-.stsc-message-badge {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 22px;
-  height: 22px;
-  margin-left: 4px;
-  border-radius: 50%;
-  font-size: 13px;
-  font-weight: 800;
-  cursor: help;
-  border: 1px solid currentColor;
-}
-
-.stsc-message-badge.stsc-missing {
-  color: #ff6f6f;
-  background: rgba(224, 84, 84, 0.13);
-}
-
-.stsc-message-badge.stsc-format-error {
-  color: #e9ae4b;
-  background: rgba(215, 154, 53, 0.13);
-}
-
 .stsc-selected-instructions {
   display: flex;
   gap: 6px;
@@ -2022,7 +1998,7 @@ body.stsc-modal-open {
 }
 
 
-/* v0.2.3：悬浮窗样式、透明度与自定义尺寸 */
+/* v0.2.4：悬浮窗样式、尺寸与悬浮按钮透明度 */
 .stsc-floating-customizer {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2051,11 +2027,17 @@ body.stsc-modal-open {
 }
 
 #stsc_floating_panel {
-  background: color-mix(in srgb, var(--stsc-panel) var(--stsc-floating-opacity-percent, 94%), transparent) !important;
+  background: color-mix(in srgb, var(--stsc-panel) 94%, transparent) !important;
   transition: background 150ms ease, border-radius 150ms ease, box-shadow 150ms ease, backdrop-filter 150ms ease;
 }
 
+#stsc_floating_button {
+  background: color-mix(in srgb, var(--stsc-panel) var(--stsc-floating-button-opacity-percent, 94%), transparent) !important;
+  transition: background 150ms ease, transform 150ms ease, border-color 150ms ease, box-shadow 150ms ease;
+}
+
 #stsc_floating_panel[data-floating-style="glass"] {
+  background: color-mix(in srgb, var(--stsc-panel) 82%, transparent) !important;
   border-color: color-mix(in srgb, var(--stsc-accent) 28%, var(--stsc-border)) !important;
   border-radius: 18px !important;
   box-shadow: 0 20px 66px rgba(0, 0, 0, 0.46), inset 0 1px 0 rgba(255, 255, 255, 0.08) !important;
@@ -2064,6 +2046,7 @@ body.stsc-modal-open {
 }
 
 #stsc_floating_panel[data-floating-style="solid"] {
+  background: var(--stsc-panel) !important;
   border-radius: 12px !important;
   box-shadow: 0 16px 46px rgba(0, 0, 0, 0.48) !important;
   backdrop-filter: none !important;
@@ -2071,6 +2054,7 @@ body.stsc-modal-open {
 }
 
 #stsc_floating_panel[data-floating-style="minimal"] {
+  background: color-mix(in srgb, var(--stsc-panel) 92%, transparent) !important;
   border-radius: 8px !important;
   border-color: color-mix(in srgb, var(--stsc-border) 72%, transparent) !important;
   box-shadow: 0 9px 28px rgba(0, 0, 0, 0.34) !important;

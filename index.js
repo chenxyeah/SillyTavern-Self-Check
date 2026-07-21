@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.2.3';
+const STSC_VERSION = '0.2.4';
 const STSC_CHECK_TAG = 'stsc_self_check';
 const STSC_RESPONSE_TAG = 'stsc_response';
 const STSC_CHECK_OPEN_RE = /<stsc_self_check\b[^>]*>/i;
@@ -167,7 +167,8 @@ function normalizeSettings() {
     settings.appearance.theme = ['default', 'rose', 'blue', 'mint', 'violet', 'gold'].includes(settings.appearance.theme) ? settings.appearance.theme : 'default';
     settings.appearance.floatingEnabled = Boolean(settings.appearance.floatingEnabled);
     settings.appearance.floatingStyle = ['theme', 'glass', 'solid', 'minimal'].includes(settings.appearance.floatingStyle) ? settings.appearance.floatingStyle : 'theme';
-    settings.appearance.floatingOpacity = clampNumber(settings.appearance.floatingOpacity, 0.45, 1, 0.94);
+    // v0.2.4 起该字段表示悬浮按钮背景透明度，不再控制悬浮面板整体。
+    settings.appearance.floatingOpacity = clampNumber(settings.appearance.floatingOpacity, 0.1, 1, 0.94);
     settings.appearance.floatingWidth = clampNumber(settings.appearance.floatingWidth, 300, 680, 420);
     settings.appearance.floatingHeight = clampNumber(settings.appearance.floatingHeight, 300, 820, 640);
     if (!settings.appearance.floatingPosition || typeof settings.appearance.floatingPosition !== 'object') {
@@ -554,18 +555,19 @@ function applyTheme(settings = getUiSettings()) {
 function applyFloatingAppearance(settings = getUiSettings()) {
     const appearance = settings?.appearance || DEFAULT_SETTINGS.appearance;
     const style = ['theme', 'glass', 'solid', 'minimal'].includes(appearance.floatingStyle) ? appearance.floatingStyle : 'theme';
-    const opacity = clampNumber(appearance.floatingOpacity, 0.45, 1, 0.94);
+    const buttonOpacity = clampNumber(appearance.floatingOpacity, 0.1, 1, 0.94);
     const width = clampNumber(appearance.floatingWidth, 300, 680, 420);
     const height = clampNumber(appearance.floatingHeight, 300, 820, 640);
     const panel = document.getElementById('stsc_floating_panel');
+    const button = document.getElementById('stsc_floating_button');
     if (!panel) return;
 
     panel.dataset.floatingStyle = style;
-    panel.style.setProperty('--stsc-floating-opacity-percent', `${Math.round(opacity * 100)}%`);
     panel.style.setProperty('--stsc-floating-preferred-width', `${Math.round(width)}px`);
     panel.style.setProperty('--stsc-floating-preferred-height', `${Math.round(height)}px`);
+    button?.style?.setProperty('--stsc-floating-button-opacity-percent', `${Math.round(buttonOpacity * 100)}%`);
 
-    $('#stsc_floating_opacity_value').text(`${Math.round(opacity * 100)}%`);
+    $('#stsc_floating_opacity_value').text(`${Math.round(buttonOpacity * 100)}%`);
     $('#stsc_floating_width_value').text(`${Math.round(width)}px`);
     $('#stsc_floating_height_value').text(`${Math.round(height)}px`);
 }
@@ -1403,33 +1405,9 @@ async function handleMessageReceived(data) {
     renderAll();
 }
 
-function addMessageBadge(messageId) {
-    const latest = getLatestResult();
-    if (!latest || Number(latest.messageId) !== Number(messageId)) return;
-    if (!['missing', 'format_error'].includes(latest.status)) return;
-
-    const selector = `.mes[mesid="${messageId}"], .mes[data-mesid="${messageId}"]`;
-    const $message = $(selector).first();
-    if (!$message.length || $message.find('.stsc-message-badge').length) return;
-
-    const missing = latest.status === 'missing';
-    const title = missing
-        ? '本轮AI未输出自检问答，该正文可能没有受到当前自检预设约束。'
-        : `本轮自检格式有误：${(latest.formatIssues || []).join('；')}`;
-    const badge = $('<span>')
-        .addClass(`stsc-message-badge ${missing ? 'stsc-missing' : 'stsc-format-error'}`)
-        .attr('title', title)
-        .text(missing ? '!' : '⚠');
-
-    const target = $message.find('.mes_buttons').first();
-    if (target.length) target.prepend(badge);
-    else $message.find('.mes_block').first().prepend(badge);
-}
-
-function handleCharacterMessageRendered(data) {
-    const messageId = resolveMessageId(data);
-    const latest = getLatestResult();
-    addMessageBadge(messageId);
+function removeLegacyMessageBadges() {
+    // v0.2.4：格式错误只在悬浮按钮上提示，不再往正文楼层插入任何标记。
+    $('.stsc-message-badge').remove();
 }
 
 function onGenerationEnded() {
@@ -2030,7 +2008,7 @@ function renderSettingsTab() {
                     <option value="solid" ${settings.appearance.floatingStyle === 'solid' ? 'selected' : ''}>纯色卡片</option>
                     <option value="minimal" ${settings.appearance.floatingStyle === 'minimal' ? 'selected' : ''}>轻量极简</option>
                 </select></div>
-                <div class="stsc-field stsc-range-field"><label>背景透明度 <span id="stsc_floating_opacity_value">${Math.round(settings.appearance.floatingOpacity * 100)}%</span></label><input id="stsc_floating_opacity" type="range" min="45" max="100" step="1" value="${Math.round(settings.appearance.floatingOpacity * 100)}"></div>
+                <div class="stsc-field stsc-range-field"><label>悬浮按钮透明度 <span id="stsc_floating_opacity_value">${Math.round(settings.appearance.floatingOpacity * 100)}%</span></label><input id="stsc_floating_opacity" type="range" min="10" max="100" step="1" value="${Math.round(settings.appearance.floatingOpacity * 100)}"><div class="stsc-muted">只调整圆形悬浮按钮的背景透明度，不影响打开后的悬浮窗内容。</div></div>
                 <div class="stsc-field stsc-range-field"><label>悬浮窗宽度 <span id="stsc_floating_width_value">${Math.round(settings.appearance.floatingWidth)}px</span></label><input id="stsc_floating_width" type="range" min="300" max="680" step="10" value="${Math.round(settings.appearance.floatingWidth)}"></div>
                 <div class="stsc-field stsc-range-field"><label>悬浮窗高度 <span id="stsc_floating_height_value">${Math.round(settings.appearance.floatingHeight)}px</span></label><input id="stsc_floating_height" type="range" min="300" max="820" step="10" value="${Math.round(settings.appearance.floatingHeight)}"></div>
             </div>
@@ -2077,10 +2055,16 @@ function renderFloatingInstructionPage() {
     $('#stsc_floating_content').html(`<div class="stsc-floating-instruction-list">${html}</div>`);
 }
 
-function renderFloatingCheckPage() {
+function renderFloatingBadge() {
     const latest = getLatestResult();
     const hasUnreadIssue = latestHasUnreadIssue(latest);
-    $('#stsc_floating_badge').toggleClass('stsc-hidden', !hasUnreadIssue).text(latest?.status === 'format_error' ? '⚠' : '!');
+    $('#stsc_floating_badge')
+        .toggleClass('stsc-hidden', !hasUnreadIssue)
+        .text(latest?.status === 'format_error' ? '⚠' : '!');
+}
+
+function renderFloatingCheckPage() {
+    const latest = getLatestResult();
     $('#stsc_floating_title').text('最新一轮自检');
 
     if (!latest) {
@@ -2116,11 +2100,12 @@ function renderFloating() {
         return;
     }
 
+    renderFloatingBadge();
+    removeLegacyMessageBadges();
     $('#stsc_floating_panel [data-floating-page]').removeClass('active').attr('aria-selected', 'false');
     $(`#stsc_floating_panel [data-floating-page="${floatingPanelPage}"]`).addClass('active').attr('aria-selected', 'true');
 
     if (floatingPanelPage === 'instructions') {
-        $('#stsc_floating_badge').addClass('stsc-hidden');
         renderFloatingInstructionPage();
     } else {
         renderFloatingCheckPage();
@@ -2134,6 +2119,7 @@ function renderFloating() {
 
 function renderAll() {
     if (!initialized) return;
+    removeLegacyMessageBadges();
     renderCompact();
     renderManagerSubtitle();
     renderStatusTab();
@@ -2946,7 +2932,7 @@ function bindUiEvents() {
         layoutFloatingPanel();
     });
     $('#stsc_manager_overlay').on('input change', '#stsc_floating_opacity', function () {
-        getUiSettings().appearance.floatingOpacity = clampNumber(Number(this.value) / 100, 0.45, 1, 0.94);
+        getUiSettings().appearance.floatingOpacity = clampNumber(Number(this.value) / 100, 0.1, 1, 0.94);
         $('#stsc_floating_opacity_value').text(`${Math.round(getUiSettings().appearance.floatingOpacity * 100)}%`);
         markDirty();
         applyFloatingAppearance(getUiSettings());
@@ -3355,12 +3341,12 @@ async function initialize() {
     // 管理器直接挂到 body，避免被“扩展”侧栏的宽度、overflow 或 transform 裁切。
     $('#stsc_manager_overlay, #stsc_dialog_overlay, #stsc_floating_root, #stsc_floating_panel').remove();
     $('body').append(html);
+    removeLegacyMessageBadges();
     initialized = true;
     bindUiEvents();
     addExtensionsMenuButton();
     const events = context.eventTypes || context.event_types;
     context.eventSource.on(events.MESSAGE_RECEIVED, handleMessageReceived);
-    context.eventSource.on(events.CHARACTER_MESSAGE_RENDERED, handleCharacterMessageRendered);
     context.eventSource.on(events.CHAT_CHANGED, renderAll);
     context.eventSource.on(events.GENERATION_ENDED, onGenerationEnded);
     context.eventSource.on(events.GENERATION_STOPPED, onGenerationStopped);
