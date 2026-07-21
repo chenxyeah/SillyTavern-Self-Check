@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.2.5';
+const STSC_VERSION = '0.2.7';
 const STSC_CHECK_TAG = 'stsc_self_check';
 const STSC_RESPONSE_TAG = 'stsc_response';
 const STSC_CHECK_OPEN_RE = /<stsc_self_check\b[^>]*>/i;
@@ -94,6 +94,8 @@ const DEFAULT_SETTINGS = Object.freeze({
     migrations: {
         defaultGeneralCoreV1: false,
         defaultGeneralCoreV2: false,
+        defaultGeneralCoreV3: false,
+        defaultGeneralCoreV4: false,
     },
     updateNotice: {
         lastCheckedAt: 0,
@@ -223,6 +225,23 @@ function normalizeSettings() {
         settingsMigrated = true;
     }
 
+    // v0.2.6：上一版迁移依赖整段文字完全匹配。部分用户的内置题目文本
+    // 曾被旧版本规范化或轻微改写，导致类型没有从判断题改成开放问答。
+    // 这里按“内置预设 + 题目标题”再次修复，已跑过 v0.2.5 的用户也会生效。
+    if (!settings.migrations.defaultGeneralCoreV3) {
+        migrateBuiltInGeneralPresetV3(settings);
+        settings.migrations.defaultGeneralCoreV3 = true;
+        settingsMigrated = true;
+    }
+
+    // v0.2.7：将内置“默认通用自检”的六道核心题全部改为开放问答。
+    // 迁移只处理内置默认预设，不影响用户自行创建的其他预设。
+    if (!settings.migrations.defaultGeneralCoreV4) {
+        migrateBuiltInGeneralPresetV4(settings);
+        settings.migrations.defaultGeneralCoreV4 = true;
+        settingsMigrated = true;
+    }
+
     let generalPresets = settings.presets.filter(x => x.kind === 'general');
     if (!generalPresets.length) {
         const general = createBuiltInGeneralPreset();
@@ -297,10 +316,10 @@ function createBuiltInGeneralPreset() {
     const preset = createPreset(STSC_BUILTIN_GENERAL_NAME, 'general');
     preset.builtinKey = STSC_BUILTIN_GENERAL_KEY;
     preset.questions = [
-        createQuestion('【固定格式完整性】本轮是否存在角色卡、世界书、参考资料库或当前预设明确要求的固定输出格式，例如正文前置内容、内心独白、状态栏、特定标签或结尾模块？若存在，是否按照规定的位置、顺序与标签完整输出，所有字段均无遗漏、无重复、无擅自改名？若不存在相关要求，不得自行添加格式。', 'boolean', 'standard', true),
-        createQuestion('【角色信息边界与上帝视角】本轮角色是否只依据自己亲眼所见、亲耳所闻、他人告知、过往经历或合理推测作出反应？是否避免读取{{user}}或其他角色内心、知晓未曾接触的信息、准确判断隐瞒事实、提前知道场外事件等上帝视角？角色可以推测，但必须符合其能力与已有线索，并保留误判和不确定性。', 'boolean', 'standard', true),
-        createQuestion('【情绪强度与占有欲】本轮角色情绪是否符合角色设定、事件刺激程度、当前关系阶段与此前情绪积累？是否避免缺乏铺垫的暴怒、崩溃、嫉妒、偏执或过度占有欲，例如“她属于我”“她一辈子都离不开我”等将{{user}}物化或剥夺其选择权的表达？若强烈占有欲本就是角色设定，也应作为角色自身的情绪、欲望或缺陷表现，不得否定{{user}}的完整人权、独立意志与拒绝权。', 'boolean', 'standard', true),
-        createQuestion('【关系阶段与亲密行为】本轮角色对{{user}}的态度、信任、依赖、暧昧、身体接触与情感表达，是否符合当前关系阶段、已有经历和角色性格？是否避免缺乏事件推动的突然心软、突然深爱、突然吃醋、突然表白、突然亲密或默认双方已经建立恋爱关系？若角色本身轻浮、冲动或擅长调情，也应区分其表面行为与真实感情进度。', 'boolean', 'standard', true),
+        createQuestion('【固定格式完整性】本轮需要输出哪些由角色卡、世界书、参考资料库或当前预设明确要求的固定格式？请逐项确认它们应出现的位置、顺序、标签和字段，并说明如何避免遗漏、重复、擅自改名，或在没有相关要求时自行添加格式。', 'open', 'standard', true),
+        createQuestion('【角色信息边界与上帝视角】本轮角色能够依据哪些已知信息作出判断？请说明这些信息来自亲眼所见、亲耳所闻、他人告知、过往经历还是合理推测，并指出如何避免读取{{user}}或其他角色内心、知晓未曾接触的信息、提前知道场外事件，或把推测写成确定事实。', 'open', 'standard', true),
+        createQuestion('【情绪强度与占有欲】本轮角色会出现怎样的情绪及其强度？请结合角色设定、事件刺激、当前关系阶段与此前情绪积累说明依据，并说明如何避免无铺垫的暴怒、崩溃、嫉妒、偏执或过度占有。若强烈占有欲属于角色设定，应如何将其作为角色的欲望或缺陷体现，同时保留{{user}}的完整人权、独立意志与拒绝权？', 'open', 'standard', true),
+        createQuestion('【关系阶段与亲密行为】当前角色与{{user}}处于什么关系阶段？本轮允许出现怎样的态度、信任、依赖、暧昧、身体接触与情感表达？请说明如何避免缺乏事件推动的突然心软、突然深爱、突然吃醋、突然表白、突然亲密或默认恋爱关系；若角色本身轻浮、冲动或擅长调情，也应区分表面行为与真实感情进度。', 'open', 'standard', true),
         createQuestion('【角色一致性但不僵化】本轮准备如何体现角色的核心性格、立场与个人习惯？角色可能因当前事件产生哪些合理的犹豫、矛盾或变化？请说明如何在避免 OOC 的同时，不把角色演绎成僵硬不变的设定集合。', 'open', 'standard', true),
         createQuestion('【真实人类表达】本轮角色的台词、旁白和心理活动准备采用怎样的表达方式？请结合当前情境说明如何体现角色个人语气，并避免报告式分析、术语堆砌、长篇说教、机械总结或过度准确地解释心理。', 'open', 'standard', true),
     ];
@@ -359,6 +378,88 @@ function migrateBuiltInGeneralPresetV2(settings) {
         question.type = 'open';
         question.length = 'standard';
         question.requireEvidence = true;
+    }
+}
+
+function migrateBuiltInGeneralPresetV3(settings) {
+    const targetPresets = settings.presets.filter(preset =>
+        preset.kind === 'general'
+        && (preset.builtinKey === STSC_BUILTIN_GENERAL_KEY || String(preset.name || '').trim() === STSC_BUILTIN_GENERAL_NAME)
+    );
+
+    const repairs = [
+        {
+            title: '【角色一致性但不僵化】',
+            newText: '【角色一致性但不僵化】本轮准备如何体现角色的核心性格、立场与个人习惯？角色可能因当前事件产生哪些合理的犹豫、矛盾或变化？请说明如何在避免 OOC 的同时，不把角色演绎成僵硬不变的设定集合。',
+            legacyHints: ['本轮角色的语言、行为、判断与情绪是否能够', '是否避免为了推动剧情而突然降智'],
+        },
+        {
+            title: '【真实人类表达】',
+            newText: '【真实人类表达】本轮角色的台词、旁白和心理活动准备采用怎样的表达方式？请结合当前情境说明如何体现角色个人语气，并避免报告式分析、术语堆砌、长篇说教、机械总结或过度准确地解释心理。',
+            legacyHints: ['本轮台词、旁白与心理活动是否符合真实人类', '是否避免过度分析、持续总结'],
+        },
+    ];
+
+    for (const preset of targetPresets) {
+        for (const repair of repairs) {
+            const question = (preset.questions || []).find(item => String(item.text || '').trim().startsWith(repair.title));
+            if (!question) continue;
+
+            const currentText = String(question.text || '').trim();
+            const looksLikeOldDefault = repair.legacyHints.some(hint => currentText.includes(hint));
+            if (looksLikeOldDefault) question.text = repair.newText;
+
+            // 即使文字因旧版空格、标点或本地保存差异没有完全匹配，
+            // 只要仍是内置默认题，就确保题型正确迁移为开放问答。
+            question.type = 'open';
+            question.length = 'standard';
+            question.requireEvidence = true;
+        }
+    }
+}
+
+function migrateBuiltInGeneralPresetV4(settings) {
+    const targetPresets = settings.presets.filter(preset =>
+        preset.kind === 'general'
+        && (preset.builtinKey === STSC_BUILTIN_GENERAL_KEY || String(preset.name || '').trim() === STSC_BUILTIN_GENERAL_NAME)
+    );
+
+    const openQuestions = [
+        {
+            title: '【固定格式完整性】',
+            text: '【固定格式完整性】本轮需要输出哪些由角色卡、世界书、参考资料库或当前预设明确要求的固定格式？请逐项确认它们应出现的位置、顺序、标签和字段，并说明如何避免遗漏、重复、擅自改名，或在没有相关要求时自行添加格式。',
+        },
+        {
+            title: '【角色信息边界与上帝视角】',
+            text: '【角色信息边界与上帝视角】本轮角色能够依据哪些已知信息作出判断？请说明这些信息来自亲眼所见、亲耳所闻、他人告知、过往经历还是合理推测，并指出如何避免读取{{user}}或其他角色内心、知晓未曾接触的信息、提前知道场外事件，或把推测写成确定事实。',
+        },
+        {
+            title: '【情绪强度与占有欲】',
+            text: '【情绪强度与占有欲】本轮角色会出现怎样的情绪及其强度？请结合角色设定、事件刺激、当前关系阶段与此前情绪积累说明依据，并说明如何避免无铺垫的暴怒、崩溃、嫉妒、偏执或过度占有。若强烈占有欲属于角色设定，应如何将其作为角色的欲望或缺陷体现，同时保留{{user}}的完整人权、独立意志与拒绝权？',
+        },
+        {
+            title: '【关系阶段与亲密行为】',
+            text: '【关系阶段与亲密行为】当前角色与{{user}}处于什么关系阶段？本轮允许出现怎样的态度、信任、依赖、暧昧、身体接触与情感表达？请说明如何避免缺乏事件推动的突然心软、突然深爱、突然吃醋、突然表白、突然亲密或默认恋爱关系；若角色本身轻浮、冲动或擅长调情，也应区分表面行为与真实感情进度。',
+        },
+        {
+            title: '【角色一致性但不僵化】',
+            text: '【角色一致性但不僵化】本轮准备如何体现角色的核心性格、立场与个人习惯？角色可能因当前事件产生哪些合理的犹豫、矛盾或变化？请说明如何在避免 OOC 的同时，不把角色演绎成僵硬不变的设定集合。',
+        },
+        {
+            title: '【真实人类表达】',
+            text: '【真实人类表达】本轮角色的台词、旁白和心理活动准备采用怎样的表达方式？请结合当前情境说明如何体现角色个人语气，并避免报告式分析、术语堆砌、长篇说教、机械总结或过度准确地解释心理。',
+        },
+    ];
+
+    for (const preset of targetPresets) {
+        for (const config of openQuestions) {
+            const question = (preset.questions || []).find(item => String(item.text || '').trim().startsWith(config.title));
+            if (!question) continue;
+            question.text = config.text;
+            question.type = 'open';
+            question.length = 'standard';
+            question.requireEvidence = true;
+        }
     }
 }
 
