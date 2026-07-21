@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.2.2';
+const STSC_VERSION = '0.2.3';
 const STSC_CHECK_TAG = 'stsc_self_check';
 const STSC_RESPONSE_TAG = 'stsc_response';
 const STSC_CHECK_OPEN_RE = /<stsc_self_check\b[^>]*>/i;
@@ -14,6 +14,8 @@ const STSC_PRESET_IMPORT_MAX_BYTES = 2 * 1024 * 1024;
 const STSC_REFERENCE_EXPORT_FORMAT = 'sillytavern-self-check-reference';
 const STSC_REFERENCE_EXPORT_VERSION = 1;
 const STSC_REFERENCE_IMPORT_MAX_BYTES = 4 * 1024 * 1024;
+const STSC_BUILTIN_GENERAL_KEY = 'default-general-core-v1';
+const STSC_BUILTIN_GENERAL_NAME = '默认通用自检';
 
 const REFERENCE_TYPE_CONFIG = Object.freeze({
     style: Object.freeze({
@@ -77,10 +79,17 @@ const DEFAULT_SETTINGS = Object.freeze({
     appearance: {
         theme: 'default',
         floatingEnabled: false,
+        floatingStyle: 'theme',
+        floatingOpacity: 0.94,
+        floatingWidth: 420,
+        floatingHeight: 640,
         floatingPosition: {
             leftRatio: 0.82,
             topRatio: 0.68,
         },
+    },
+    migrations: {
+        defaultGeneralCoreV1: false,
     },
     ui: {
         editingPresetId: '',
@@ -157,6 +166,10 @@ function normalizeSettings() {
     if (!settings.appearance || typeof settings.appearance !== 'object') settings.appearance = clone(DEFAULT_SETTINGS.appearance);
     settings.appearance.theme = ['default', 'rose', 'blue', 'mint', 'violet', 'gold'].includes(settings.appearance.theme) ? settings.appearance.theme : 'default';
     settings.appearance.floatingEnabled = Boolean(settings.appearance.floatingEnabled);
+    settings.appearance.floatingStyle = ['theme', 'glass', 'solid', 'minimal'].includes(settings.appearance.floatingStyle) ? settings.appearance.floatingStyle : 'theme';
+    settings.appearance.floatingOpacity = clampNumber(settings.appearance.floatingOpacity, 0.45, 1, 0.94);
+    settings.appearance.floatingWidth = clampNumber(settings.appearance.floatingWidth, 300, 680, 420);
+    settings.appearance.floatingHeight = clampNumber(settings.appearance.floatingHeight, 300, 820, 640);
     if (!settings.appearance.floatingPosition || typeof settings.appearance.floatingPosition !== 'object') {
         settings.appearance.floatingPosition = clone(DEFAULT_SETTINGS.appearance.floatingPosition);
     }
@@ -168,15 +181,13 @@ function normalizeSettings() {
     settings.appearance.floatingPosition.topRatio = clampNumber(settings.appearance.floatingPosition.topRatio, 0, 1, 0.68);
     delete settings.appearance.floatingPosition.side;
 
+    let settingsMigrated = false;
     if (settings.presets.length === 0) {
-        const general = createPreset('默认（初始默认）', 'general');
-        general.questions.push(
-            createQuestion('当前角色与{{user}}处于什么关系阶段？本轮应当如何表现？', 'open', 'standard', true),
-            createQuestion('本轮是否出现了缺少剧情或设定依据的好感、亲密或占有欲？', 'boolean', 'brief', true),
-            createQuestion('本轮是否尊重{{user}}的行动、语言和心理自主权？', 'boolean', 'brief', true),
-        );
+        const general = createBuiltInGeneralPreset();
         settings.presets.push(general);
         settings.generalPresetId = general.id;
+        settings.migrations.defaultGeneralCoreV1 = true;
+        settingsMigrated = true;
     }
 
     const legacyGeneralId = settings.generalPresetId || settings.presets[0]?.id || '';
@@ -188,9 +199,15 @@ function normalizeSettings() {
         normalizePreset(preset);
     }
 
+    if (!settings.migrations.defaultGeneralCoreV1) {
+        ensureBuiltInGeneralPreset(settings);
+        settings.migrations.defaultGeneralCoreV1 = true;
+        settingsMigrated = true;
+    }
+
     let generalPresets = settings.presets.filter(x => x.kind === 'general');
     if (!generalPresets.length) {
-        const general = createPreset('默认（初始默认）', 'general');
+        const general = createBuiltInGeneralPreset();
         settings.presets.unshift(general);
         generalPresets = [general];
     }
@@ -232,6 +249,7 @@ function normalizeSettings() {
     const persistentIds = new Set(settings.persistentInstructionIds);
     settings.pendingInstructionIds = [...new Set(settings.pendingInstructionIds.filter(id => validInstructionIds.has(id) && !persistentIds.has(id)))];
 
+    if (settingsMigrated) context.saveSettingsDebounced?.();
     return settings;
 }
 
@@ -257,6 +275,48 @@ function createPreset(name = '新自检预设', kind = 'general') {
     };
 }
 
+function createBuiltInGeneralPreset() {
+    const preset = createPreset(STSC_BUILTIN_GENERAL_NAME, 'general');
+    preset.builtinKey = STSC_BUILTIN_GENERAL_KEY;
+    preset.questions = [
+        createQuestion('【固定格式完整性】本轮是否存在角色卡、世界书、参考资料库或当前预设明确要求的固定输出格式，例如正文前置内容、内心独白、状态栏、特定标签或结尾模块？若存在，是否按照规定的位置、顺序与标签完整输出，所有字段均无遗漏、无重复、无擅自改名？若不存在相关要求，不得自行添加格式。', 'boolean', 'standard', true),
+        createQuestion('【角色信息边界与上帝视角】本轮角色是否只依据自己亲眼所见、亲耳所闻、他人告知、过往经历或合理推测作出反应？是否避免读取{{user}}或其他角色内心、知晓未曾接触的信息、准确判断隐瞒事实、提前知道场外事件等上帝视角？角色可以推测，但必须符合其能力与已有线索，并保留误判和不确定性。', 'boolean', 'standard', true),
+        createQuestion('【情绪强度与占有欲】本轮角色情绪是否符合角色设定、事件刺激程度、当前关系阶段与此前情绪积累？是否避免缺乏铺垫的暴怒、崩溃、嫉妒、偏执或过度占有欲，例如“她属于我”“她一辈子都离不开我”等将{{user}}物化或剥夺其选择权的表达？若强烈占有欲本就是角色设定，也应作为角色自身的情绪、欲望或缺陷表现，不得否定{{user}}的完整人权、独立意志与拒绝权。', 'boolean', 'standard', true),
+        createQuestion('【关系阶段与亲密行为】本轮角色对{{user}}的态度、信任、依赖、暧昧、身体接触与情感表达，是否符合当前关系阶段、已有经历和角色性格？是否避免缺乏事件推动的突然心软、突然深爱、突然吃醋、突然表白、突然亲密或默认双方已经建立恋爱关系？若角色本身轻浮、冲动或擅长调情，也应区分其表面行为与真实感情进度。', 'boolean', 'standard', true),
+        createQuestion('【角色一致性但不僵化】本轮角色的语言、行为、判断与情绪是否能够从其设定、当前处境和已发生事件中得到解释？是否避免为了推动剧情而突然降智、失去原则、改变立场或表现出不属于该角色的习惯？同时是否避免把角色设定机械化，允许角色因具体事件产生合理的犹豫、变化、矛盾和成长。', 'boolean', 'standard', true),
+        createQuestion('【真实人类表达】本轮台词、旁白与心理活动是否符合真实人类在当前场景中的表达习惯？是否避免过度分析、持续总结、堆砌术语、机械解释心理、像报告一样列出结论，或把简单情绪包装成复杂理论？聪明、理性或专业能力应更多通过判断、反应和行动体现，同时保留个人语气、情绪、缺点与认知局限。', 'boolean', 'standard', true),
+    ];
+    return preset;
+}
+
+function isLegacyInitialGeneralPreset(preset) {
+    if (!preset || preset.kind !== 'general') return false;
+    if (!['默认（初始默认）', '通用自检预设'].includes(String(preset.name || '').trim())) return false;
+    const legacyQuestions = [
+        '当前角色与{{user}}处于什么关系阶段？本轮应当如何表现？',
+        '本轮是否出现了缺少剧情或设定依据的好感、亲密或占有欲？',
+        '本轮是否尊重{{user}}的行动、语言和心理自主权？',
+    ];
+    const actual = (preset.questions || []).map(question => String(question.text || '').trim());
+    return actual.length === legacyQuestions.length && legacyQuestions.every((question, index) => actual[index] === question);
+}
+
+function ensureBuiltInGeneralPreset(settings) {
+    let builtin = settings.presets.find(preset => preset.kind === 'general' && preset.builtinKey === STSC_BUILTIN_GENERAL_KEY);
+    if (builtin) return builtin;
+
+    const current = settings.presets.find(preset => preset.id === settings.generalPresetId && preset.kind === 'general');
+    const shouldReplaceLegacySelection = isLegacyInitialGeneralPreset(current);
+    builtin = createBuiltInGeneralPreset();
+    settings.presets.push(builtin);
+
+    if (shouldReplaceLegacySelection || !settings.generalPresetId) {
+        settings.generalPresetId = builtin.id;
+        if (settings.ui) settings.ui.editingGeneralPresetId = builtin.id;
+    }
+    return builtin;
+}
+
 function normalizePreset(preset) {
     preset.id ||= uid('preset');
     preset.name ||= '未命名预设';
@@ -265,6 +325,7 @@ function normalizePreset(preset) {
     if (!Array.isArray(preset.questions)) preset.questions = [];
     preset.boundCharacterKey ||= '';
     preset.boundCharacterName ||= '';
+    preset.builtinKey = String(preset.builtinKey || '');
     if (preset.kind === 'general') {
         preset.boundCharacterKey = '';
         preset.boundCharacterName = '';
@@ -490,6 +551,25 @@ function applyTheme(settings = getUiSettings()) {
     $('#stsc_manager_overlay, #stsc_dialog_overlay, #stsc_floating_root, #stsc_floating_panel').attr('data-stsc-theme', theme);
 }
 
+function applyFloatingAppearance(settings = getUiSettings()) {
+    const appearance = settings?.appearance || DEFAULT_SETTINGS.appearance;
+    const style = ['theme', 'glass', 'solid', 'minimal'].includes(appearance.floatingStyle) ? appearance.floatingStyle : 'theme';
+    const opacity = clampNumber(appearance.floatingOpacity, 0.45, 1, 0.94);
+    const width = clampNumber(appearance.floatingWidth, 300, 680, 420);
+    const height = clampNumber(appearance.floatingHeight, 300, 820, 640);
+    const panel = document.getElementById('stsc_floating_panel');
+    if (!panel) return;
+
+    panel.dataset.floatingStyle = style;
+    panel.style.setProperty('--stsc-floating-opacity-percent', `${Math.round(opacity * 100)}%`);
+    panel.style.setProperty('--stsc-floating-preferred-width', `${Math.round(width)}px`);
+    panel.style.setProperty('--stsc-floating-preferred-height', `${Math.round(height)}px`);
+
+    $('#stsc_floating_opacity_value').text(`${Math.round(opacity * 100)}%`);
+    $('#stsc_floating_width_value').text(`${Math.round(width)}px`);
+    $('#stsc_floating_height_value').text(`${Math.round(height)}px`);
+}
+
 function visibleRect(selector) {
     const element = document.querySelector(selector);
     if (!element) return null;
@@ -625,6 +705,9 @@ function layoutFloatingPanel() {
 
     const viewport = floatingVisualViewport();
     const { compact, margin, topBoundary, bottomBoundary } = floatingPanelBoundaries(viewport);
+    const appearance = getUiSettings()?.appearance || DEFAULT_SETTINGS.appearance;
+    const preferredWidth = clampNumber(appearance.floatingWidth, 300, 680, 420);
+    const preferredHeight = clampNumber(appearance.floatingHeight, 300, 820, 640);
     setImportantStyle(panel, 'position', 'fixed');
     setImportantStyle(panel, 'right', 'auto');
     setImportantStyle(panel, 'bottom', 'auto');
@@ -633,12 +716,16 @@ function layoutFloatingPanel() {
     setImportantStyle(panel, 'display', 'flex');
 
     if (compact) {
-        const width = Math.max(240, viewport.width - margin * 2);
-        const height = Math.max(220, bottomBoundary - topBoundary);
-        setImportantStyle(panel, 'left', `${Math.round(viewport.left + margin)}px`);
-        setImportantStyle(panel, 'top', `${Math.round(topBoundary)}px`);
+        const availableWidth = Math.max(240, viewport.width - margin * 2);
+        const availableHeight = Math.max(220, bottomBoundary - topBoundary);
+        const width = Math.min(availableWidth, Math.max(240, preferredWidth));
+        const height = Math.min(availableHeight, Math.max(220, preferredHeight));
+        const left = viewport.left + Math.max(margin, (viewport.width - width) / 2);
+        const top = topBoundary + Math.max(0, (availableHeight - height) / 2);
+        setImportantStyle(panel, 'left', `${Math.round(left)}px`);
+        setImportantStyle(panel, 'top', `${Math.round(top)}px`);
         setImportantStyle(panel, 'width', `${Math.round(width)}px`);
-        setImportantStyle(panel, 'height', `${Math.round(Math.min(height, viewport.height - margin * 2))}px`);
+        setImportantStyle(panel, 'height', `${Math.round(height)}px`);
         setImportantStyle(panel, 'max-width', 'none');
         setImportantStyle(panel, 'max-height', 'none');
         panel.dataset.layout = 'mobile';
@@ -647,8 +734,8 @@ function layoutFloatingPanel() {
 
     const button = document.getElementById('stsc_floating_button');
     const buttonRect = button?.getBoundingClientRect?.() || { left: viewport.right - 64, right: viewport.right - 14, top: viewport.top + 90, bottom: viewport.top + 140 };
-    const width = Math.min(420, viewport.width - margin * 2);
-    const height = Math.min(640, Math.max(300, viewport.height * 0.72), viewport.height - margin * 2);
+    const width = Math.min(preferredWidth, viewport.width - margin * 2);
+    const height = Math.min(preferredHeight, Math.max(220, viewport.height - margin * 2));
     const openLeft = buttonRect.left + buttonRect.width / 2 < viewport.left + viewport.width / 2;
     const openDown = buttonRect.top + buttonRect.height / 2 < viewport.top + viewport.height / 2;
     const desiredLeft = openLeft ? buttonRect.left : buttonRect.right - width;
@@ -681,6 +768,7 @@ function toggleFloatingPanel(forceOpen = null) {
 
     $panel.removeClass('stsc-hidden').attr('aria-hidden', 'false');
     renderFloating();
+    if (floatingPanelPage === 'check') void markLatestIssueViewed();
     requestAnimationFrame(() => {
         layoutFloatingPanel();
         panel.focus?.({ preventScroll: true });
@@ -1058,6 +1146,18 @@ function getLatestResult() {
     return ctx()?.chatMetadata?.[STSC_CHAT_META_KEY] || null;
 }
 
+function latestHasUnreadIssue(latest = getLatestResult()) {
+    return Boolean(latest && ['missing', 'format_error'].includes(latest.status) && latest.issueViewed !== true);
+}
+
+async function markLatestIssueViewed() {
+    const latest = getLatestResult();
+    if (!latest || !['missing', 'format_error'].includes(latest.status) || latest.issueViewed === true) return;
+    latest.issueViewed = true;
+    $('#stsc_floating_badge').addClass('stsc-hidden');
+    await saveLatestResult(latest);
+}
+
 function parseItems(checkInner) {
     const items = [];
     const itemRegex = /<item\s+[^>]*id=["']([^"']+)["'][^>]*>([\s\S]*?)<\/item>/gi;
@@ -1202,6 +1302,7 @@ function makeLatestResult({ parsed, questions, mode, messageId, strictRaw = '', 
     const boundPreset = getBoundPreset();
     const settings = normalizeSettings();
 
+    const status = strictStatus || parsed.status;
     return {
         version: STSC_VERSION,
         timestamp: Date.now(),
@@ -1210,7 +1311,8 @@ function makeLatestResult({ parsed, questions, mode, messageId, strictRaw = '', 
         characterKey: entity.key,
         characterName: entity.name,
         mode,
-        status: strictStatus || parsed.status,
+        status,
+        issueViewed: !['missing', 'format_error'].includes(status),
         formatIssues: parsed.formatIssues || [],
         rawCheck: strictRaw || parsed.rawCheck || '',
         answers: parsed.answers || [],
@@ -1918,9 +2020,21 @@ function renderSettingsTab() {
                 </select></div>
                 <div class="stsc-field"><label>悬浮窗</label>
                     <label class="checkbox_label"><input id="stsc_floating_enabled" type="checkbox" ${settings.appearance.floatingEnabled ? 'checked' : ''}> 开启悬浮按钮，查看自检问答并快速启用指令</label>
-                    <div class="stsc-muted">悬浮按钮支持鼠标或手指在屏幕安全区域内自由拖动，并会记住位置；自动避开顶部菜单和底部输入框。悬浮窗包含“自检问答”和“快捷指令”两个页面。</div>
+                    <div class="stsc-muted">悬浮按钮支持鼠标或手指拖动，并会记住位置；悬浮窗包含“自检问答”和“快捷指令”两个页面。</div>
                 </div>
             </div>
+            <div class="stsc-floating-customizer">
+                <div class="stsc-field"><label>悬浮窗样式</label><select id="stsc_floating_style" class="text_pole">
+                    <option value="theme" ${settings.appearance.floatingStyle === 'theme' ? 'selected' : ''}>跟随插件主题</option>
+                    <option value="glass" ${settings.appearance.floatingStyle === 'glass' ? 'selected' : ''}>磨砂玻璃</option>
+                    <option value="solid" ${settings.appearance.floatingStyle === 'solid' ? 'selected' : ''}>纯色卡片</option>
+                    <option value="minimal" ${settings.appearance.floatingStyle === 'minimal' ? 'selected' : ''}>轻量极简</option>
+                </select></div>
+                <div class="stsc-field stsc-range-field"><label>背景透明度 <span id="stsc_floating_opacity_value">${Math.round(settings.appearance.floatingOpacity * 100)}%</span></label><input id="stsc_floating_opacity" type="range" min="45" max="100" step="1" value="${Math.round(settings.appearance.floatingOpacity * 100)}"></div>
+                <div class="stsc-field stsc-range-field"><label>悬浮窗宽度 <span id="stsc_floating_width_value">${Math.round(settings.appearance.floatingWidth)}px</span></label><input id="stsc_floating_width" type="range" min="300" max="680" step="10" value="${Math.round(settings.appearance.floatingWidth)}"></div>
+                <div class="stsc-field stsc-range-field"><label>悬浮窗高度 <span id="stsc_floating_height_value">${Math.round(settings.appearance.floatingHeight)}px</span></label><input id="stsc_floating_height" type="range" min="300" max="820" step="10" value="${Math.round(settings.appearance.floatingHeight)}"></div>
+            </div>
+            <div class="stsc-muted" style="margin-top:8px">移动端会在安全区域内自动限制最大尺寸；调整设置时，已打开的悬浮窗会即时预览。</div>
         </div>
         <div class="stsc-section">
             <div class="stsc-section-title">上下文处理</div>
@@ -1965,8 +2079,8 @@ function renderFloatingInstructionPage() {
 
 function renderFloatingCheckPage() {
     const latest = getLatestResult();
-    const hasIssue = latest && ['missing', 'format_error'].includes(latest.status);
-    $('#stsc_floating_badge').toggleClass('stsc-hidden', !hasIssue).text(latest?.status === 'format_error' ? '⚠' : '!');
+    const hasUnreadIssue = latestHasUnreadIssue(latest);
+    $('#stsc_floating_badge').toggleClass('stsc-hidden', !hasUnreadIssue).text(latest?.status === 'format_error' ? '⚠' : '!');
     $('#stsc_floating_title').text('最新一轮自检');
 
     if (!latest) {
@@ -1990,6 +2104,7 @@ function renderFloating() {
     const $root = $('#stsc_floating_root');
     if (!$root.length) return;
     applyTheme(settings);
+    applyFloatingAppearance(settings);
     applyFloatingPosition(settings);
 
     const enabled = Boolean(settings.appearance?.floatingEnabled);
@@ -2012,7 +2127,9 @@ function renderFloating() {
     }
 
     $('#stsc_floating_open_manager').text(floatingPanelPage === 'instructions' ? '打开指令管理器' : '打开完整管理器');
-    if (!$('#stsc_floating_panel').hasClass('stsc-hidden')) requestAnimationFrame(layoutFloatingPanel);
+    const panelOpen = !$('#stsc_floating_panel').hasClass('stsc-hidden');
+    if (panelOpen) requestAnimationFrame(layoutFloatingPanel);
+    if (panelOpen && floatingPanelPage === 'check') void markLatestIssueViewed();
 }
 
 function renderAll() {
@@ -2037,6 +2154,7 @@ function openManager(tab = null) {
     $('body').addClass('stsc-modal-open');
     performSwitchTab(settings.ui.activeTab || 'status');
     renderAll();
+    if ((settings.ui.activeTab || 'status') === 'status') void markLatestIssueViewed();
 }
 
 function performCloseManager() {
@@ -2106,6 +2224,7 @@ function switchTab(tab) {
     requestUnsavedDecision(() => {
         performSwitchTab(tab);
         renderAll();
+        if (tab === 'status') void markLatestIssueViewed();
     });
 }
 
@@ -2598,6 +2717,7 @@ function bindUiEvents() {
         if (floatingPanelPage === nextPage) return;
         floatingPanelPage = nextPage;
         renderFloating();
+        if (floatingPanelPage === 'check' && !$('#stsc_floating_panel').hasClass('stsc-hidden')) void markLatestIssueViewed();
     });
     $('#stsc_floating_panel').on('change', '[data-floating-instruction-mode]', function () {
         const id = $(this).closest('[data-floating-temp-id]').data('floating-temp-id');
@@ -2819,6 +2939,33 @@ function bindUiEvents() {
         renderFloating();
     });
 
+    $('#stsc_manager_overlay').on('change', '#stsc_floating_style', function () {
+        getUiSettings().appearance.floatingStyle = this.value;
+        markDirty();
+        applyFloatingAppearance(getUiSettings());
+        layoutFloatingPanel();
+    });
+    $('#stsc_manager_overlay').on('input change', '#stsc_floating_opacity', function () {
+        getUiSettings().appearance.floatingOpacity = clampNumber(Number(this.value) / 100, 0.45, 1, 0.94);
+        $('#stsc_floating_opacity_value').text(`${Math.round(getUiSettings().appearance.floatingOpacity * 100)}%`);
+        markDirty();
+        applyFloatingAppearance(getUiSettings());
+    });
+    $('#stsc_manager_overlay').on('input change', '#stsc_floating_width', function () {
+        getUiSettings().appearance.floatingWidth = clampNumber(this.value, 300, 680, 420);
+        $('#stsc_floating_width_value').text(`${Math.round(getUiSettings().appearance.floatingWidth)}px`);
+        markDirty();
+        applyFloatingAppearance(getUiSettings());
+        layoutFloatingPanel();
+    });
+    $('#stsc_manager_overlay').on('input change', '#stsc_floating_height', function () {
+        getUiSettings().appearance.floatingHeight = clampNumber(this.value, 300, 820, 640);
+        $('#stsc_floating_height_value').text(`${Math.round(getUiSettings().appearance.floatingHeight)}px`);
+        markDirty();
+        applyFloatingAppearance(getUiSettings());
+        layoutFloatingPanel();
+    });
+
     $('#stsc_manager_overlay').on('click', '[data-action]', async function () {
         const action = $(this).data('action');
         const settings = getUiSettings();
@@ -2869,6 +3016,7 @@ function bindUiEvents() {
             const copied = clone(preset);
             copied.id = uid('preset');
             copied.name = makeUniquePresetName(`${preset.name} 副本`);
+            copied.builtinKey = '';
             copied.questions = copied.questions.map(q => ({ ...q, id: uid('q') }));
             copied.boundCharacterKey = '';
             copied.boundCharacterName = '';

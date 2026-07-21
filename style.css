@@ -2020,3 +2020,70 @@ body.stsc-modal-open {
     justify-content: flex-end;
   }
 }
+
+
+/* v0.2.3：悬浮窗样式、透明度与自定义尺寸 */
+.stsc-floating-customizer {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--stsc-border);
+}
+
+.stsc-range-field > label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.stsc-range-field > label span {
+  color: var(--stsc-accent);
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+
+.stsc-range-field input[type="range"] {
+  width: 100%;
+  accent-color: var(--stsc-accent);
+}
+
+#stsc_floating_panel {
+  background: color-mix(in srgb, var(--stsc-panel) var(--stsc-floating-opacity-percent, 94%), transparent) !important;
+  transition: background 150ms ease, border-radius 150ms ease, box-shadow 150ms ease, backdrop-filter 150ms ease;
+}
+
+#stsc_floating_panel[data-floating-style="glass"] {
+  border-color: color-mix(in srgb, var(--stsc-accent) 28%, var(--stsc-border)) !important;
+  border-radius: 18px !important;
+  box-shadow: 0 20px 66px rgba(0, 0, 0, 0.46), inset 0 1px 0 rgba(255, 255, 255, 0.08) !important;
+  backdrop-filter: blur(26px) saturate(1.18) !important;
+  -webkit-backdrop-filter: blur(26px) saturate(1.18) !important;
+}
+
+#stsc_floating_panel[data-floating-style="solid"] {
+  border-radius: 12px !important;
+  box-shadow: 0 16px 46px rgba(0, 0, 0, 0.48) !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+#stsc_floating_panel[data-floating-style="minimal"] {
+  border-radius: 8px !important;
+  border-color: color-mix(in srgb, var(--stsc-border) 72%, transparent) !important;
+  box-shadow: 0 9px 28px rgba(0, 0, 0, 0.34) !important;
+  backdrop-filter: blur(9px) !important;
+  -webkit-backdrop-filter: blur(9px) !important;
+}
+
+#stsc_floating_panel[data-floating-style="minimal"] :is(.stsc-floating-header, .stsc-floating-footer, .stsc-floating-tabs) {
+  background: transparent !important;
+}
+
+@media (max-width: 720px) {
+  .stsc-floating-customizer {
+    grid-template-columns: 1fr;
+  }
+}
