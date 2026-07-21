@@ -2071,3 +2071,22 @@ body.stsc-modal-open {
     grid-template-columns: 1fr;
   }
 }
+
+
+/* v0.2.8：更新提醒同时标记魔法棒菜单入口，避免只靠一次 toast 被错过。 */
+#stsc_extensions_menu_button.stsc-has-update {
+  position: relative;
+}
+
+#stsc_extensions_menu_button .stsc-menu-update-badge {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--stsc-danger, #e05454);
+  color: #fff;
+  font-size: 0.72rem;
+  font-weight: 700;
+  line-height: 1.4;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.24);
+}

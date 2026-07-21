@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.2.7';
+const STSC_VERSION = '0.2.8';
 const STSC_CHECK_TAG = 'stsc_self_check';
 const STSC_RESPONSE_TAG = 'stsc_response';
 const STSC_CHECK_OPEN_RE = /<stsc_self_check\b[^>]*>/i;
@@ -16,8 +16,8 @@ const STSC_REFERENCE_EXPORT_VERSION = 1;
 const STSC_REFERENCE_IMPORT_MAX_BYTES = 4 * 1024 * 1024;
 const STSC_BUILTIN_GENERAL_KEY = 'default-general-core-v1';
 const STSC_BUILTIN_GENERAL_NAME = '默认通用自检';
-const STSC_UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
-const STSC_UPDATE_NOTICE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const STSC_UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000;
+const STSC_REMOTE_MANIFEST_URL = 'https://raw.githubusercontent.com/chenxyeah/SillyTavern-Self-Check/main/manifest.json';
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 
 const REFERENCE_TYPE_CONFIG = Object.freeze({
@@ -128,6 +128,11 @@ let expandedQuestionIds = new Set();
 let expandedInstructionIds = new Set();
 let floatingPanelPage = 'check';
 let pendingDeleteRequest = null;
+let updateCheckInFlight = false;
+let updatePollTimer = null;
+let updateToast = null;
+let updateAvailableVersion = '';
+let lastRuntimeUpdateCheckAt = 0;
 
 function ctx() {
     return globalThis.SillyTavern?.getContext?.();
@@ -2278,6 +2283,7 @@ function renderAll() {
 }
 
 function openManager(tab = null) {
+    void checkForPluginUpdate({ force: true });
     if (!editDraft) beginEditSession();
     const settings = getUiSettings();
     if (tab) settings.ui.activeTab = tab;
@@ -3514,41 +3520,113 @@ async function fetchOwnExtensionVersion(isGlobal) {
     return await response.json();
 }
 
-async function checkForPluginUpdate() {
-    const settings = normalizeSettings();
-    if (!settings) return;
+function compareVersions(left, right) {
+    const parse = value => String(value || '')
+        .trim()
+        .replace(/^v/i, '')
+        .split(/[.-]/)
+        .map(part => (/^\d+$/.test(part) ? Number(part) : part));
+    const a = parse(left);
+    const b = parse(right);
+    const length = Math.max(a.length, b.length);
+    for (let index = 0; index < length; index += 1) {
+        const av = a[index] ?? 0;
+        const bv = b[index] ?? 0;
+        if (typeof av === 'number' && typeof bv === 'number') {
+            if (av !== bv) return av > bv ? 1 : -1;
+            continue;
+        }
+        const result = String(av).localeCompare(String(bv), undefined, { numeric: true, sensitivity: 'base' });
+        if (result !== 0) return result > 0 ? 1 : -1;
+    }
+    return 0;
+}
+
+async function fetchRemoteManifestVersion() {
+    const separator = STSC_REMOTE_MANIFEST_URL.includes('?') ? '&' : '?';
+    const response = await fetch(`${STSC_REMOTE_MANIFEST_URL}${separator}stsc=${Date.now()}`, {
+        method: 'GET',
+        cache: 'no-store',
+        headers: { Accept: 'application/json' },
+    });
+    if (!response.ok) throw new Error(`远程 manifest HTTP ${response.status}`);
+    const manifest = await response.json();
+    const version = String(manifest?.version || '').trim();
+    if (!version) throw new Error('远程 manifest 缺少版本号');
+    return version;
+}
+
+function clearPluginUpdateNotice() {
+    updateAvailableVersion = '';
+    $('#stsc_extensions_menu_button').removeClass('stsc-has-update').find('.stsc-menu-update-badge').remove();
+    if (updateToast) {
+        try { toastr.clear(updateToast); } catch { /* 忽略旧 toast 清理失败 */ }
+        updateToast = null;
+    }
+}
+
+function showPluginUpdateNotice(remoteVersion = '') {
+    updateAvailableVersion = String(remoteVersion || '').trim();
+    const $menuButton = $('#stsc_extensions_menu_button');
+    $menuButton.addClass('stsc-has-update');
+    if (!$menuButton.find('.stsc-menu-update-badge').length) {
+        $menuButton.append('<span class="stsc-menu-update-badge">更新</span>');
+    }
+
+    if (updateToast) return;
+    const versionText = updateAvailableVersion ? ` v${updateAvailableVersion}` : '';
+    updateToast = toastr.info(
+        `检测到“写作前置自检”有新版本${versionText}。点击前往扩展管理器更新。`,
+        '插件有更新｜前往更新',
+        {
+            timeOut: 0,
+            extendedTimeOut: 0,
+            closeButton: true,
+            tapToDismiss: false,
+            onclick: () => openExtensionManagerForUpdate(),
+            onHidden: () => { updateToast = null; },
+        },
+    );
+}
+
+async function checkForPluginUpdate({ force = false } = {}) {
+    if (updateCheckInFlight) return;
 
     const now = Date.now();
-    if (now - settings.updateNotice.lastCheckedAt < STSC_UPDATE_CHECK_INTERVAL_MS) return;
-    settings.updateNotice.lastCheckedAt = now;
-    saveSettings();
+    if (!force && now - lastRuntimeUpdateCheckAt < STSC_UPDATE_CHECK_INTERVAL_MS) return;
+    lastRuntimeUpdateCheckAt = now;
+    updateCheckInFlight = true;
+
+    const settings = normalizeSettings();
+    if (settings?.updateNotice) {
+        settings.updateNotice.lastCheckedAt = now;
+        saveSettings();
+    }
 
     try {
         const installType = await getInstalledExtensionType();
-        const versionInfo = await fetchOwnExtensionVersion(installType === 'global');
-        if (versionInfo?.isUpToDate !== false) return;
-        if (now - settings.updateNotice.lastNotifiedAt < STSC_UPDATE_NOTICE_INTERVAL_MS) return;
+        const [gitResult, manifestResult] = await Promise.allSettled([
+            fetchOwnExtensionVersion(installType === 'global'),
+            fetchRemoteManifestVersion(),
+        ]);
 
-        settings.updateNotice.lastNotifiedAt = now;
-        saveSettings();
+        const versionInfo = gitResult.status === 'fulfilled' ? gitResult.value : null;
+        const remoteVersion = manifestResult.status === 'fulfilled' ? manifestResult.value : '';
+        const gitHasUpdate = versionInfo?.isUpToDate === false;
+        const manifestHasUpdate = remoteVersion && compareVersions(remoteVersion, STSC_VERSION) > 0;
 
-        let toast;
-        toast = toastr.info(
-            '检测到“写作前置自检”有新版本。点击这条提示前往扩展管理器更新。',
-            '插件有更新｜点击前往更新',
-            {
-                timeOut: 0,
-                extendedTimeOut: 0,
-                closeButton: true,
-                onclick: () => {
-                    if (toast) toastr.clear(toast);
-                    openExtensionManagerForUpdate();
-                },
-            },
-        );
+        if (gitHasUpdate || manifestHasUpdate) {
+            showPluginUpdateNotice(remoteVersion);
+        } else if (gitResult.status === 'fulfilled' || manifestResult.status === 'fulfilled') {
+            clearPluginUpdateNotice();
+        } else {
+            throw new Error('Git 检查和远程版本检查均失败');
+        }
     } catch (error) {
         // 更新检查失败不影响插件正常使用，也不打扰用户。
         console.debug('[STSC] 插件更新检查失败：', error);
+    } finally {
+        updateCheckInFlight = false;
     }
 }
 
@@ -3585,7 +3663,9 @@ async function initialize() {
     context.eventSource.on(events.GENERATION_STOPPED, onGenerationStopped);
 
     renderAll();
-    setTimeout(() => void checkForPluginUpdate(), 2500);
+    setTimeout(() => void checkForPluginUpdate({ force: true }), 2500);
+    if (updatePollTimer) clearInterval(updatePollTimer);
+    updatePollTimer = setInterval(() => void checkForPluginUpdate(), STSC_UPDATE_CHECK_INTERVAL_MS);
     console.info(`[STSC] 写作前置自检 v${STSC_VERSION} 已加载。`);
 }
 
