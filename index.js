@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.2.4';
+const STSC_VERSION = '0.2.5';
 const STSC_CHECK_TAG = 'stsc_self_check';
 const STSC_RESPONSE_TAG = 'stsc_response';
 const STSC_CHECK_OPEN_RE = /<stsc_self_check\b[^>]*>/i;
@@ -16,6 +16,9 @@ const STSC_REFERENCE_EXPORT_VERSION = 1;
 const STSC_REFERENCE_IMPORT_MAX_BYTES = 4 * 1024 * 1024;
 const STSC_BUILTIN_GENERAL_KEY = 'default-general-core-v1';
 const STSC_BUILTIN_GENERAL_NAME = '默认通用自检';
+const STSC_UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const STSC_UPDATE_NOTICE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 
 const REFERENCE_TYPE_CONFIG = Object.freeze({
     style: Object.freeze({
@@ -90,6 +93,11 @@ const DEFAULT_SETTINGS = Object.freeze({
     },
     migrations: {
         defaultGeneralCoreV1: false,
+        defaultGeneralCoreV2: false,
+    },
+    updateNotice: {
+        lastCheckedAt: 0,
+        lastNotifiedAt: 0,
     },
     ui: {
         editingPresetId: '',
@@ -164,6 +172,9 @@ function normalizeSettings() {
     if (!Array.isArray(settings.persistentInstructionIds)) settings.persistentInstructionIds = [];
     if (!settings.characterBindings || typeof settings.characterBindings !== 'object') settings.characterBindings = {};
     if (!settings.appearance || typeof settings.appearance !== 'object') settings.appearance = clone(DEFAULT_SETTINGS.appearance);
+    if (!settings.updateNotice || typeof settings.updateNotice !== 'object') settings.updateNotice = clone(DEFAULT_SETTINGS.updateNotice);
+    settings.updateNotice.lastCheckedAt = Math.max(0, Number(settings.updateNotice.lastCheckedAt) || 0);
+    settings.updateNotice.lastNotifiedAt = Math.max(0, Number(settings.updateNotice.lastNotifiedAt) || 0);
     settings.appearance.theme = ['default', 'rose', 'blue', 'mint', 'violet', 'gold'].includes(settings.appearance.theme) ? settings.appearance.theme : 'default';
     settings.appearance.floatingEnabled = Boolean(settings.appearance.floatingEnabled);
     settings.appearance.floatingStyle = ['theme', 'glass', 'solid', 'minimal'].includes(settings.appearance.floatingStyle) ? settings.appearance.floatingStyle : 'theme';
@@ -203,6 +214,12 @@ function normalizeSettings() {
     if (!settings.migrations.defaultGeneralCoreV1) {
         ensureBuiltInGeneralPreset(settings);
         settings.migrations.defaultGeneralCoreV1 = true;
+        settingsMigrated = true;
+    }
+
+    if (!settings.migrations.defaultGeneralCoreV2) {
+        migrateBuiltInGeneralPresetV2(settings);
+        settings.migrations.defaultGeneralCoreV2 = true;
         settingsMigrated = true;
     }
 
@@ -284,8 +301,8 @@ function createBuiltInGeneralPreset() {
         createQuestion('【角色信息边界与上帝视角】本轮角色是否只依据自己亲眼所见、亲耳所闻、他人告知、过往经历或合理推测作出反应？是否避免读取{{user}}或其他角色内心、知晓未曾接触的信息、准确判断隐瞒事实、提前知道场外事件等上帝视角？角色可以推测，但必须符合其能力与已有线索，并保留误判和不确定性。', 'boolean', 'standard', true),
         createQuestion('【情绪强度与占有欲】本轮角色情绪是否符合角色设定、事件刺激程度、当前关系阶段与此前情绪积累？是否避免缺乏铺垫的暴怒、崩溃、嫉妒、偏执或过度占有欲，例如“她属于我”“她一辈子都离不开我”等将{{user}}物化或剥夺其选择权的表达？若强烈占有欲本就是角色设定，也应作为角色自身的情绪、欲望或缺陷表现，不得否定{{user}}的完整人权、独立意志与拒绝权。', 'boolean', 'standard', true),
         createQuestion('【关系阶段与亲密行为】本轮角色对{{user}}的态度、信任、依赖、暧昧、身体接触与情感表达，是否符合当前关系阶段、已有经历和角色性格？是否避免缺乏事件推动的突然心软、突然深爱、突然吃醋、突然表白、突然亲密或默认双方已经建立恋爱关系？若角色本身轻浮、冲动或擅长调情，也应区分其表面行为与真实感情进度。', 'boolean', 'standard', true),
-        createQuestion('【角色一致性但不僵化】本轮角色的语言、行为、判断与情绪是否能够从其设定、当前处境和已发生事件中得到解释？是否避免为了推动剧情而突然降智、失去原则、改变立场或表现出不属于该角色的习惯？同时是否避免把角色设定机械化，允许角色因具体事件产生合理的犹豫、变化、矛盾和成长。', 'boolean', 'standard', true),
-        createQuestion('【真实人类表达】本轮台词、旁白与心理活动是否符合真实人类在当前场景中的表达习惯？是否避免过度分析、持续总结、堆砌术语、机械解释心理、像报告一样列出结论，或把简单情绪包装成复杂理论？聪明、理性或专业能力应更多通过判断、反应和行动体现，同时保留个人语气、情绪、缺点与认知局限。', 'boolean', 'standard', true),
+        createQuestion('【角色一致性但不僵化】本轮准备如何体现角色的核心性格、立场与个人习惯？角色可能因当前事件产生哪些合理的犹豫、矛盾或变化？请说明如何在避免 OOC 的同时，不把角色演绎成僵硬不变的设定集合。', 'open', 'standard', true),
+        createQuestion('【真实人类表达】本轮角色的台词、旁白和心理活动准备采用怎样的表达方式？请结合当前情境说明如何体现角色个人语气，并避免报告式分析、术语堆砌、长篇说教、机械总结或过度准确地解释心理。', 'open', 'standard', true),
     ];
     return preset;
 }
@@ -316,6 +333,33 @@ function ensureBuiltInGeneralPreset(settings) {
         if (settings.ui) settings.ui.editingGeneralPresetId = builtin.id;
     }
     return builtin;
+}
+
+function migrateBuiltInGeneralPresetV2(settings) {
+    const builtin = ensureBuiltInGeneralPreset(settings);
+    if (!builtin) return;
+
+    const migrations = [
+        {
+            title: '【角色一致性但不僵化】',
+            oldText: '【角色一致性但不僵化】本轮角色的语言、行为、判断与情绪是否能够从其设定、当前处境和已发生事件中得到解释？是否避免为了推动剧情而突然降智、失去原则、改变立场或表现出不属于该角色的习惯？同时是否避免把角色设定机械化，允许角色因具体事件产生合理的犹豫、变化、矛盾和成长。',
+            newText: '【角色一致性但不僵化】本轮准备如何体现角色的核心性格、立场与个人习惯？角色可能因当前事件产生哪些合理的犹豫、矛盾或变化？请说明如何在避免 OOC 的同时，不把角色演绎成僵硬不变的设定集合。',
+        },
+        {
+            title: '【真实人类表达】',
+            oldText: '【真实人类表达】本轮台词、旁白与心理活动是否符合真实人类在当前场景中的表达习惯？是否避免过度分析、持续总结、堆砌术语、机械解释心理、像报告一样列出结论，或把简单情绪包装成复杂理论？聪明、理性或专业能力应更多通过判断、反应和行动体现，同时保留个人语气、情绪、缺点与认知局限。',
+            newText: '【真实人类表达】本轮角色的台词、旁白和心理活动准备采用怎样的表达方式？请结合当前情境说明如何体现角色个人语气，并避免报告式分析、术语堆砌、长篇说教、机械总结或过度准确地解释心理。',
+        },
+    ];
+
+    for (const migration of migrations) {
+        const question = builtin.questions.find(item => String(item.text || '').trim() === migration.oldText);
+        if (!question) continue;
+        question.text = migration.newText;
+        question.type = 'open';
+        question.length = 'standard';
+        question.requireEvidence = true;
+    }
 }
 
 function normalizePreset(preset) {
@@ -3319,6 +3363,94 @@ function bindUiEvents() {
     });
 }
 
+
+function openExtensionManagerForUpdate() {
+    const detailsButton = document.querySelector('#extensions_details');
+    if (detailsButton) {
+        detailsButton.click();
+        return;
+    }
+
+    const menuButton = document.querySelector('#extensionsMenuButton');
+    menuButton?.click?.();
+    setTimeout(() => {
+        const retryButton = document.querySelector('#extensions_details');
+        if (retryButton) retryButton.click();
+        else window.open('https://github.com/chenxyeah/SillyTavern-Self-Check', '_blank', 'noopener,noreferrer');
+    }, 150);
+}
+
+async function getInstalledExtensionType() {
+    const context = ctx();
+    try {
+        const response = await fetch('/api/extensions/discover', {
+            method: 'GET',
+            headers: context?.getRequestHeaders?.(),
+        });
+        if (!response.ok) return 'local';
+        const extensions = await response.json();
+        const match = Array.isArray(extensions)
+            ? extensions.find(item => item?.name === `third-party/${STSC_EXTENSION_FOLDER_NAME}`)
+            : null;
+        return match?.type === 'global' ? 'global' : 'local';
+    } catch (error) {
+        console.debug('[STSC] 无法判断插件安装位置，将按本地扩展检查更新。', error);
+        return 'local';
+    }
+}
+
+async function fetchOwnExtensionVersion(isGlobal) {
+    const context = ctx();
+    const response = await fetch('/api/extensions/version', {
+        method: 'POST',
+        headers: context?.getRequestHeaders?.() || { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            extensionName: STSC_EXTENSION_FOLDER_NAME,
+            global: Boolean(isGlobal),
+        }),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return await response.json();
+}
+
+async function checkForPluginUpdate() {
+    const settings = normalizeSettings();
+    if (!settings) return;
+
+    const now = Date.now();
+    if (now - settings.updateNotice.lastCheckedAt < STSC_UPDATE_CHECK_INTERVAL_MS) return;
+    settings.updateNotice.lastCheckedAt = now;
+    saveSettings();
+
+    try {
+        const installType = await getInstalledExtensionType();
+        const versionInfo = await fetchOwnExtensionVersion(installType === 'global');
+        if (versionInfo?.isUpToDate !== false) return;
+        if (now - settings.updateNotice.lastNotifiedAt < STSC_UPDATE_NOTICE_INTERVAL_MS) return;
+
+        settings.updateNotice.lastNotifiedAt = now;
+        saveSettings();
+
+        let toast;
+        toast = toastr.info(
+            '检测到“写作前置自检”有新版本。点击这条提示前往扩展管理器更新。',
+            '插件有更新｜点击前往更新',
+            {
+                timeOut: 0,
+                extendedTimeOut: 0,
+                closeButton: true,
+                onclick: () => {
+                    if (toast) toastr.clear(toast);
+                    openExtensionManagerForUpdate();
+                },
+            },
+        );
+    } catch (error) {
+        // 更新检查失败不影响插件正常使用，也不打扰用户。
+        console.debug('[STSC] 插件更新检查失败：', error);
+    }
+}
+
 function addExtensionsMenuButton() {
     if ($('#stsc_extensions_menu_button').length || !$('#extensionsMenu').length) return;
     const button = $(
@@ -3352,6 +3484,7 @@ async function initialize() {
     context.eventSource.on(events.GENERATION_STOPPED, onGenerationStopped);
 
     renderAll();
+    setTimeout(() => void checkForPluginUpdate(), 2500);
     console.info(`[STSC] 写作前置自检 v${STSC_VERSION} 已加载。`);
 }
 
