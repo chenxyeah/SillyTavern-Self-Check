@@ -2090,3 +2090,153 @@ body.stsc-modal-open {
   line-height: 1.4;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.24);
 }
+
+/* v0.3.0 资料库批量导出与版本更新中心 */
+.stsc-manager-version {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 6px;
+  padding: 2px 7px;
+  border: 1px solid color-mix(in srgb, var(--stsc-accent) 45%, transparent);
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.2;
+  color: var(--stsc-accent);
+  vertical-align: middle;
+}
+
+.stsc-batch-reference-tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 12px 0 9px;
+}
+
+.stsc-batch-reference-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  max-height: min(52vh, 520px);
+  overflow: auto;
+  padding: 2px;
+}
+
+.stsc-batch-reference-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 10px 11px;
+  border: 1px solid var(--stsc-border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--stsc-panel) 90%, transparent);
+  cursor: pointer;
+}
+
+.stsc-batch-reference-item:hover {
+  border-color: color-mix(in srgb, var(--stsc-accent) 45%, var(--stsc-border));
+}
+
+.stsc-batch-reference-item input {
+  margin-top: 3px;
+  flex: 0 0 auto;
+}
+
+.stsc-batch-reference-main {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.stsc-batch-reference-main > b,
+.stsc-batch-reference-main > span {
+  overflow-wrap: anywhere;
+}
+
+.stsc-batch-reference-main > span {
+  color: var(--stsc-muted);
+  font-size: 12px;
+}
+
+.stsc-current-version-row,
+.stsc-update-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.stsc-update-card {
+  padding: 13px;
+  border: 1px solid var(--stsc-border);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--stsc-panel) 92%, transparent);
+}
+
+.stsc-update-card.is-available {
+  border-color: color-mix(in srgb, var(--stsc-accent) 58%, var(--stsc-border));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--stsc-accent) 12%, transparent) inset;
+}
+
+.stsc-update-card.is-error {
+  border-color: color-mix(in srgb, #d45b5b 55%, var(--stsc-border));
+}
+
+.stsc-update-kicker {
+  color: var(--stsc-muted);
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.stsc-update-version {
+  margin-top: 2px;
+  font-size: clamp(24px, 4vw, 38px);
+  font-weight: 800;
+  line-height: 1;
+  letter-spacing: -0.02em;
+}
+
+.stsc-release-title {
+  margin-top: 12px;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.stsc-release-change-list {
+  margin: 10px 0 0;
+  padding-left: 1.25em;
+}
+
+.stsc-release-change-list li + li {
+  margin-top: 6px;
+}
+
+.stsc-update-state {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 48px;
+}
+
+@media (max-width: 700px) {
+  .stsc-manager-version {
+    margin-left: 3px;
+    padding: 2px 5px;
+    font-size: 10px;
+  }
+
+  .stsc-batch-reference-list {
+    max-height: 48vh;
+  }
+
+  .stsc-current-version-row .menu_button,
+  .stsc-update-card-head .menu_button {
+    width: auto !important;
+    min-width: 0 !important;
+    flex: 0 0 auto !important;
+  }
+}

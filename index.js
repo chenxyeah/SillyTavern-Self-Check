@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.2.9';
+const STSC_VERSION = '0.3.0';
 const STSC_CHECK_TAG = 'stsc_self_check';
 const STSC_RESPONSE_TAG = 'stsc_response';
 const STSC_CHECK_OPEN_RE = /<stsc_self_check\b[^>]*>/i;
@@ -13,12 +13,26 @@ const STSC_PRESET_EXPORT_VERSION = 1;
 const STSC_PRESET_IMPORT_MAX_BYTES = 2 * 1024 * 1024;
 const STSC_REFERENCE_EXPORT_FORMAT = 'sillytavern-self-check-reference';
 const STSC_REFERENCE_EXPORT_VERSION = 1;
-const STSC_REFERENCE_IMPORT_MAX_BYTES = 4 * 1024 * 1024;
+const STSC_REFERENCE_BUNDLE_EXPORT_FORMAT = 'sillytavern-self-check-reference-bundle';
+const STSC_REFERENCE_BUNDLE_EXPORT_VERSION = 1;
+const STSC_REFERENCE_IMPORT_MAX_BYTES = 16 * 1024 * 1024;
 const STSC_BUILTIN_GENERAL_KEY = 'default-general-core-v1';
 const STSC_BUILTIN_GENERAL_NAME = '默认通用自检';
 const STSC_UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000;
 const STSC_REMOTE_MANIFEST_URL = 'https://raw.githubusercontent.com/chenxyeah/SillyTavern-Self-Check/main/manifest.json';
+const STSC_REMOTE_RELEASE_URL = 'https://raw.githubusercontent.com/chenxyeah/SillyTavern-Self-Check/main/version.json';
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
+const STSC_RELEASE_INFO = Object.freeze({
+    version: STSC_VERSION,
+    releasedAt: '2026-07-22',
+    title: '资料库批量分享与版本更新中心',
+    changes: Object.freeze([
+        '参考资料库支持勾选多个条目，批量导出为一个合集文件。',
+        '导入资料库时同时兼容单个资料库文件和资料库合集文件。',
+        '新增“版本更新”页面，可查看当前版本、本次更新内容与远程新版本说明。',
+        '插件升级到新版本后会显示一次更新完成提示；检测到远程更新时持续提供前往更新入口。',
+    ]),
+});
 
 const REFERENCE_TYPE_CONFIG = Object.freeze({
     style: Object.freeze({
@@ -100,6 +114,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     updateNotice: {
         lastCheckedAt: 0,
         lastNotifiedAt: 0,
+        lastSeenInstalledVersion: '',
     },
     ui: {
         editingPresetId: '',
@@ -132,6 +147,9 @@ let updateCheckInFlight = false;
 let updatePollTimer = null;
 let updateToast = null;
 let updateAvailableVersion = '';
+let latestRemoteReleaseInfo = null;
+let updateCheckState = 'idle';
+let updateCheckError = '';
 let lastRuntimeUpdateCheckAt = 0;
 
 function ctx() {
@@ -182,6 +200,7 @@ function normalizeSettings() {
     if (!settings.updateNotice || typeof settings.updateNotice !== 'object') settings.updateNotice = clone(DEFAULT_SETTINGS.updateNotice);
     settings.updateNotice.lastCheckedAt = Math.max(0, Number(settings.updateNotice.lastCheckedAt) || 0);
     settings.updateNotice.lastNotifiedAt = Math.max(0, Number(settings.updateNotice.lastNotifiedAt) || 0);
+    settings.updateNotice.lastSeenInstalledVersion = String(settings.updateNotice.lastSeenInstalledVersion || '');
     settings.appearance.theme = ['default', 'rose', 'blue', 'mint', 'violet', 'gold'].includes(settings.appearance.theme) ? settings.appearance.theme : 'default';
     settings.appearance.floatingEnabled = Boolean(settings.appearance.floatingEnabled);
     settings.appearance.floatingStyle = ['theme', 'glass', 'solid', 'minimal'].includes(settings.appearance.floatingStyle) ? settings.appearance.floatingStyle : 'theme';
@@ -2058,10 +2077,11 @@ function renderReferencesTab() {
             <div class="stsc-muted">像世界书一样保存文风、强制限制或其他长期资料。所有资料默认折叠；只有启用资料库后，才能开启它对应的自检问题。</div>
             <div class="stsc-toolbar stsc-reference-action-toolbar" style="margin-top:9px">
                 <button class="menu_button stsc-compact-action" type="button" data-action="open-create-reference" title="新建资料库" aria-label="新建资料库"><i class="fa-solid fa-plus"></i><span class="stsc-action-label">新建资料库</span></button>
-                <button class="menu_button stsc-compact-action" type="button" data-action="import-reference" title="导入资料库" aria-label="导入资料库"><i class="fa-solid fa-file-import"></i><span class="stsc-action-label">导入资料库</span></button>
-                <input id="stsc_reference_import_file" class="stsc-file-input" type="file" accept=".json,.stsc-reference.json,application/json" aria-label="选择要导入的参考资料库文件">
+                <button class="menu_button stsc-compact-action" type="button" data-action="batch-export-references" title="批量导出资料库" aria-label="批量导出资料库" ${settings.references.length ? '' : 'disabled'}><i class="fa-solid fa-box-archive"></i><span class="stsc-action-label">批量导出</span></button>
+                <button class="menu_button stsc-compact-action" type="button" data-action="import-reference" title="导入资料库或资料库合集" aria-label="导入资料库或资料库合集"><i class="fa-solid fa-file-import"></i><span class="stsc-action-label">导入资料库</span></button>
+                <input id="stsc_reference_import_file" class="stsc-file-input" type="file" accept=".json,.stsc-reference.json,.stsc-references.json,application/json" aria-label="选择要导入的参考资料库文件或合集文件">
             </div>
-            <div class="stsc-muted" style="margin-top:8px">导入的资料库默认保持关闭，角色绑定不会随文件导入；请展开检查内容后再手动启用。</div>
+            <div class="stsc-muted" style="margin-top:8px">支持导入单个资料库或一次导入整个资料库合集。导入内容默认保持关闭，角色绑定不会随文件导入；请展开检查后再手动启用。</div>
             <div class="stsc-reference-list">${references}</div>
         </div>
     `);
@@ -2179,6 +2199,61 @@ function renderSettingsTab() {
     `);
 }
 
+
+function releaseChangesHtml(info) {
+    const changes = Array.isArray(info?.changes) ? info.changes.filter(item => typeof item === 'string' && item.trim()) : [];
+    if (!changes.length) return '<div class="stsc-muted">暂无详细更新说明。</div>';
+    return `<ul class="stsc-release-change-list">${changes.map(item => `<li>${escapeHtml(item)}</li>`).join('')}</ul>`;
+}
+
+function renderUpdatesTab() {
+    const hasUpdate = updateCheckState === 'available';
+    const remoteVersionLabel = updateAvailableVersion && compareVersions(updateAvailableVersion, STSC_VERSION) > 0
+        ? `v${escapeHtml(updateAvailableVersion)}`
+        : '远程有新提交';
+    let remoteHtml = '';
+    if (updateCheckState === 'checking') {
+        remoteHtml = '<div class="stsc-update-state"><i class="fa-solid fa-spinner fa-spin"></i> 正在检查远程版本……</div>';
+    } else if (hasUpdate) {
+        const remote = latestRemoteReleaseInfo || { version: updateAvailableVersion, changes: [] };
+        remoteHtml = `
+            <div class="stsc-update-card is-available">
+                <div class="stsc-update-card-head">
+                    <div><div class="stsc-update-kicker">发现新版本</div><div class="stsc-update-version">${remoteVersionLabel}</div></div>
+                    <button class="menu_button stsc-primary-button" type="button" data-action="open-extension-manager">前往更新</button>
+                </div>
+                ${remote.title ? `<div class="stsc-release-title">${escapeHtml(remote.title)}</div>` : ''}
+                ${releaseChangesHtml(remote)}
+            </div>`;
+    } else if (updateCheckState === 'error') {
+        remoteHtml = `<div class="stsc-update-card is-error"><b>暂时无法检查更新</b><div class="stsc-muted">${escapeHtml(updateCheckError || '网络或扩展更新接口不可用。')}</div></div>`;
+    } else {
+        remoteHtml = '<div class="stsc-update-card is-latest"><b>当前已经是最新版本。</b><div class="stsc-muted">插件启动、打开管理器以及后台定时检查时都会自动检测新版本。</div></div>';
+    }
+
+    $('#stsc_tab_updates').html(`
+        <div class="stsc-section">
+            <div class="stsc-section-title">当前版本</div>
+            <div class="stsc-current-version-row">
+                <div><div class="stsc-update-kicker">已安装</div><div class="stsc-update-version">v${escapeHtml(STSC_RELEASE_INFO.version)}</div></div>
+                <button class="menu_button" type="button" data-action="check-plugin-update"><i class="fa-solid fa-rotate"></i> 立即检查更新</button>
+            </div>
+            <div class="stsc-release-title">${escapeHtml(STSC_RELEASE_INFO.title)}</div>
+            <div class="stsc-muted">发布日期：${escapeHtml(STSC_RELEASE_INFO.releasedAt)}</div>
+            ${releaseChangesHtml(STSC_RELEASE_INFO)}
+        </div>
+        <div class="stsc-section">
+            <div class="stsc-section-title">更新状态</div>
+            ${remoteHtml}
+        </div>
+        <div class="stsc-section">
+            <div class="stsc-section-title">更新提醒说明</div>
+            <div>检测到远程新版本后，插件会显示“插件有更新”提示，并在魔法棒菜单入口标记“更新”。</div>
+            <div class="stsc-muted" style="margin-top:6px">真正完成插件升级后，本版本的更新内容只弹出一次；之后仍可随时回到此页面查看。</div>
+        </div>
+    `);
+}
+
 function renderFloatingInstructionPage() {
     const runtimeSettings = normalizeSettings();
     const instructions = runtimeSettings.temporaryInstructions;
@@ -2282,6 +2357,7 @@ function renderAll() {
     renderReferencesTab();
     renderTemporaryTab();
     renderSettingsTab();
+    renderUpdatesTab();
     renderFloating();
     applyTheme(getUiSettings());
     updateSaveState();
@@ -2593,25 +2669,77 @@ function downloadReferenceFile(reference) {
     toastr.success(`已导出资料库“${reference.name}”。`, '写作前置自检');
 }
 
-function validateImportedReferencePayload(payload) {
-    if (!isPlainObject(payload)) throw new Error('文件内容不是有效的资料库对象。');
-    if (payload.format !== STSC_REFERENCE_EXPORT_FORMAT) throw new Error('文件不是由写作前置自检插件导出的参考资料库。');
-    if (payload.formatVersion !== STSC_REFERENCE_EXPORT_VERSION) throw new Error('该资料库文件版本暂不受支持。');
-    if (!isPlainObject(payload.reference)) throw new Error('文件中缺少参考资料库内容。');
 
-    const reference = payload.reference;
+function makeReferenceBundleExportPayload(references) {
+    return {
+        format: STSC_REFERENCE_BUNDLE_EXPORT_FORMAT,
+        formatVersion: STSC_REFERENCE_BUNDLE_EXPORT_VERSION,
+        pluginVersion: STSC_VERSION,
+        exportedAt: new Date().toISOString(),
+        references: references.map(reference => makeReferenceExportPayload(reference).reference),
+    };
+}
+
+function downloadReferenceBundleFile(references) {
+    const selected = Array.isArray(references) ? references.filter(Boolean) : [];
+    if (!selected.length) {
+        toastr.warning('请至少选择一个要导出的资料库。', '写作前置自检');
+        return false;
+    }
+    const payload = makeReferenceBundleExportPayload(selected);
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    const date = new Date().toISOString().slice(0, 10);
+    anchor.href = url;
+    anchor.download = `写作前置自检-资料库合集-${date}.stsc-references.json`;
+    anchor.style.display = 'none';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toastr.success(`已将 ${selected.length} 个资料库批量导出为一个合集文件。`, '写作前置自检');
+    return true;
+}
+
+function openBatchReferenceExportDialog() {
+    const references = getUiSettings().references;
+    if (!references.length) {
+        toastr.warning('当前没有可以导出的参考资料库。', '写作前置自检');
+        return;
+    }
+    const items = references.map(reference => `
+        <label class="stsc-batch-reference-item">
+            <input type="checkbox" data-batch-reference-id="${escapeHtml(reference.id)}" checked>
+            <span class="stsc-batch-reference-main"><b>${escapeHtml(reference.name)}</b><span>${escapeHtml(referenceTypeLabel(reference.type))}｜${reference.enabled ? '已启用' : '未启用'}｜${reference.scope === 'character' ? '角色专属' : '通用'}</span></span>
+        </label>`).join('');
+    openDialog(
+        '批量导出资料库',
+        `<div class="stsc-muted">勾选要一起分享的资料库。所有选中内容会被打包为一个文件，接收者导入一次即可全部加入。</div>
+         <div class="stsc-batch-reference-tools">
+            <button class="menu_button stsc-small-button" type="button" data-dialog-action="batch-reference-select-all">全选</button>
+            <button class="menu_button stsc-small-button" type="button" data-dialog-action="batch-reference-select-none">清空</button>
+            <span id="stsc_batch_reference_count" class="stsc-muted">已选择 ${references.length} 个</span>
+         </div>
+         <div class="stsc-batch-reference-list">${items}</div>`,
+        '<button class="menu_button" type="button" data-dialog-action="cancel">取消</button>' +
+        '<button class="menu_button stsc-primary-button" type="button" data-dialog-action="confirm-batch-reference-export">导出所选资料库</button>'
+    );
+}
+
+function validateImportedReferenceRecord(reference) {
+    if (!isPlainObject(reference)) throw new Error('资料库条目不是有效对象。');
     const name = typeof reference.name === 'string' ? reference.name.trim() : '';
     if (!name || name.length > 80) throw new Error('资料库名称为空或长度异常。');
-    if (!Object.hasOwn(REFERENCE_TYPE_CONFIG, reference.type)) throw new Error('资料类型不正确。');
-    if (typeof reference.content !== 'string' || reference.content.length > 2_000_000) throw new Error('资料内容缺失或长度异常。');
-    if (typeof reference.enabled !== 'boolean') throw new Error('资料库启用状态格式不正确。');
-    if (!['global', 'character'].includes(reference.scope)) throw new Error('资料库生效范围不正确。');
-    if (!['before', 'prompt', 'chat'].includes(reference.position)) throw new Error('资料库注入位置不正确。');
-    if (!Number.isInteger(reference.depth) || reference.depth < 0 || reference.depth > 20) throw new Error('资料库注入深度不正确。');
-    if (!['system', 'user', 'assistant'].includes(reference.role)) throw new Error('资料库注入角色不正确。');
-    if (typeof reference.addToCheck !== 'boolean') throw new Error('资料库自动问题状态格式不正确。');
-    if (typeof reference.autoQuestion !== 'string' || reference.autoQuestion.length > 10000) throw new Error('资料库自动问题格式不正确。');
-
+    if (!Object.hasOwn(REFERENCE_TYPE_CONFIG, reference.type)) throw new Error(`资料库“${name}”的资料类型不正确。`);
+    if (typeof reference.content !== 'string' || reference.content.length > 2_000_000) throw new Error(`资料库“${name}”的内容缺失或长度异常。`);
+    if (typeof reference.enabled !== 'boolean') throw new Error(`资料库“${name}”的启用状态格式不正确。`);
+    if (!['global', 'character'].includes(reference.scope)) throw new Error(`资料库“${name}”的生效范围不正确。`);
+    if (!['before', 'prompt', 'chat'].includes(reference.position)) throw new Error(`资料库“${name}”的注入位置不正确。`);
+    if (!Number.isInteger(reference.depth) || reference.depth < 0 || reference.depth > 20) throw new Error(`资料库“${name}”的注入深度不正确。`);
+    if (!['system', 'user', 'assistant'].includes(reference.role)) throw new Error(`资料库“${name}”的注入角色不正确。`);
+    if (typeof reference.addToCheck !== 'boolean') throw new Error(`资料库“${name}”的自动问题状态格式不正确。`);
+    if (typeof reference.autoQuestion !== 'string' || reference.autoQuestion.length > 10000) throw new Error(`资料库“${name}”的自动问题格式不正确。`);
     return {
         name,
         type: reference.type,
@@ -2625,10 +2753,29 @@ function validateImportedReferencePayload(payload) {
     };
 }
 
+function validateImportedReferencePayload(payload) {
+    if (!isPlainObject(payload)) throw new Error('文件内容不是有效的资料库对象。');
+
+    if (payload.format === STSC_REFERENCE_EXPORT_FORMAT) {
+        if (payload.formatVersion !== STSC_REFERENCE_EXPORT_VERSION) throw new Error('该资料库文件版本暂不受支持。');
+        if (!isPlainObject(payload.reference)) throw new Error('文件中缺少参考资料库内容。');
+        return { isBundle: false, references: [validateImportedReferenceRecord(payload.reference)] };
+    }
+
+    if (payload.format === STSC_REFERENCE_BUNDLE_EXPORT_FORMAT) {
+        if (payload.formatVersion !== STSC_REFERENCE_BUNDLE_EXPORT_VERSION) throw new Error('该资料库合集文件版本暂不受支持。');
+        if (!Array.isArray(payload.references) || !payload.references.length) throw new Error('资料库合集为空。');
+        if (payload.references.length > 500) throw new Error('资料库合集条目过多。');
+        return { isBundle: true, references: payload.references.map(validateImportedReferenceRecord) };
+    }
+
+    throw new Error('文件不是由写作前置自检插件导出的资料库或资料库合集。');
+}
+
 async function importReferenceFile(file) {
     if (!file) return;
     if (file.size > STSC_REFERENCE_IMPORT_MAX_BYTES) {
-        toastr.error('格式不匹配：文件过大，无法作为参考资料库导入。', '写作前置自检');
+        toastr.error('格式不匹配：文件过大，无法作为参考资料库或资料库合集导入。', '写作前置自检');
         return;
     }
 
@@ -2641,28 +2788,39 @@ async function importReferenceFile(file) {
             throw new Error('文件不是有效的 JSON 资料库文件。');
         }
 
-        const imported = validateImportedReferencePayload(payload);
+        const importedPayload = validateImportedReferencePayload(payload);
         const settings = getUiSettings();
-        const reference = createReference(makeUniqueReferenceName(imported.name), imported.type);
-        reference.content = imported.content;
-        reference.scope = imported.scope;
-        reference.position = imported.position;
-        reference.depth = imported.depth;
-        reference.role = imported.role;
-        reference.autoQuestion = imported.autoQuestion || reference.autoQuestion;
-        // 分享文件不得自动注入到接收者的角色扮演中；导入后必须由用户检查并手动启用。
-        reference.enabled = false;
-        reference.addToCheck = false;
-        reference.characterKey = '';
+        const created = [];
+        const renamed = [];
+        let containsCharacterScope = false;
 
-        settings.references.push(reference);
-        expandedReferenceIds.add(reference.id);
+        for (const imported of importedPayload.references) {
+            const uniqueName = makeUniqueReferenceName(imported.name);
+            const reference = createReference(uniqueName, imported.type);
+            reference.content = imported.content;
+            reference.scope = imported.scope;
+            reference.position = imported.position;
+            reference.depth = imported.depth;
+            reference.role = imported.role;
+            reference.autoQuestion = imported.autoQuestion || reference.autoQuestion;
+            // 分享文件不得自动注入到接收者的角色扮演中；导入后必须由用户检查并手动启用。
+            reference.enabled = false;
+            reference.addToCheck = false;
+            reference.characterKey = '';
+            settings.references.push(reference);
+            created.push(reference);
+            if (!importedPayload.isBundle) expandedReferenceIds.add(reference.id);
+            if (uniqueName !== imported.name) renamed.push(`${imported.name} → ${uniqueName}`);
+            if (imported.scope === 'character') containsCharacterScope = true;
+        }
+
         markDirty();
         renderAll();
 
-        const renameNote = reference.name === imported.name ? '' : `；因名称重复，已改名为“${reference.name}”`;
-        const bindingNote = reference.scope === 'character' ? '；角色专属绑定不会随文件导入，请手动绑定当前角色' : '';
-        toastr.success(`已导入资料库“${reference.name}”${renameNote}${bindingNote}。为了安全，该资料库保持关闭，请检查后手动启用并保存。`, '写作前置自检', { timeOut: 7000 });
+        const modeText = importedPayload.isBundle ? `已从资料库合集导入 ${created.length} 个资料库` : `已导入资料库“${created[0]?.name || ''}”`;
+        const renameNote = renamed.length ? `；${renamed.length} 个重名条目已自动改名` : '';
+        const bindingNote = containsCharacterScope ? '；角色专属绑定不会随文件导入，请手动绑定当前角色' : '';
+        toastr.success(`${modeText}${renameNote}${bindingNote}。为了安全，所有导入资料库均保持关闭，请检查后手动启用并保存。`, '写作前置自检', { timeOut: 8000 });
     } catch (error) {
         console.warn('[STSC] 导入参考资料库失败：', error);
         toastr.error(`格式不匹配，文件错误或不是本插件导出的参考资料库。${error?.message ? ` ${error.message}` : ''}`, '写作前置自检', { timeOut: 7000 });
@@ -3119,6 +3277,16 @@ function bindUiEvents() {
         } else if (action === 'open-create-reference') {
             openCreateReferenceDialog();
             return;
+        } else if (action === 'batch-export-references') {
+            openBatchReferenceExportDialog();
+            return;
+        } else if (action === 'check-plugin-update') {
+            await checkForPluginUpdate({ force: true });
+            renderUpdatesTab();
+            return;
+        } else if (action === 'open-extension-manager') {
+            openExtensionManagerForUpdate();
+            return;
         } else if (action === 'import-reference') {
             const input = document.getElementById('stsc_reference_import_file');
             if (input) {
@@ -3314,6 +3482,11 @@ function bindUiEvents() {
         await importReferenceFile(file);
     });
 
+    $('#stsc_dialog_overlay').on('change', '[data-batch-reference-id]', function () {
+        const count = $('#stsc_dialog_body [data-batch-reference-id]:checked').length;
+        $('#stsc_batch_reference_count').text(`已选择 ${count} 个`);
+    });
+
     $('#stsc_dialog_overlay').on('input', '#stsc_bulk_raw', function () {
         if (bulkDraft) bulkDraft.raw = this.value;
     });
@@ -3374,6 +3547,21 @@ function bindUiEvents() {
             pendingDeleteRequest = null;
             closeDialog();
             request?.();
+            return;
+        }
+        if (action === 'batch-reference-select-all' || action === 'batch-reference-select-none') {
+            const checked = action === 'batch-reference-select-all';
+            $('#stsc_dialog_body [data-batch-reference-id]').prop('checked', checked).trigger('change');
+            return;
+        }
+        if (action === 'confirm-batch-reference-export') {
+            const ids = $('#stsc_dialog_body [data-batch-reference-id]:checked').map((_, element) => String($(element).data('batch-reference-id') || '')).get().filter(Boolean);
+            const references = settings.references.filter(reference => ids.includes(reference.id));
+            if (!references.length) {
+                toastr.warning('请至少选择一个要导出的资料库。', '写作前置自检');
+                return;
+            }
+            if (downloadReferenceBundleFile(references)) closeDialog();
             return;
         }
         if (action === 'create-preset') {
@@ -3561,8 +3749,47 @@ async function fetchRemoteManifestVersion() {
     return version;
 }
 
+
+async function fetchRemoteReleaseInfo() {
+    const separator = STSC_REMOTE_RELEASE_URL.includes('?') ? '&' : '?';
+    const response = await fetch(`${STSC_REMOTE_RELEASE_URL}${separator}stsc=${Date.now()}`, {
+        method: 'GET',
+        cache: 'no-store',
+        headers: { Accept: 'application/json' },
+    });
+    if (!response.ok) throw new Error(`远程版本说明 HTTP ${response.status}`);
+    const info = await response.json();
+    const version = String(info?.version || '').trim();
+    if (!version) throw new Error('远程版本说明缺少版本号');
+    return {
+        version,
+        releasedAt: String(info?.releasedAt || ''),
+        title: String(info?.title || ''),
+        changes: Array.isArray(info?.changes) ? info.changes.filter(item => typeof item === 'string').slice(0, 30) : [],
+    };
+}
+
+function showInstalledReleaseNoticeIfNeeded() {
+    const settings = normalizeSettings();
+    if (!settings?.updateNotice || settings.updateNotice.lastSeenInstalledVersion === STSC_VERSION) return;
+    settings.updateNotice.lastSeenInstalledVersion = STSC_VERSION;
+    saveSettings();
+    const summary = STSC_RELEASE_INFO.changes.slice(0, 2).join('；');
+    toastr.success(
+        `当前版本 v${STSC_VERSION}。${summary}`,
+        '写作前置自检已安装／更新｜查看更新内容',
+        {
+            timeOut: 12000,
+            extendedTimeOut: 3000,
+            closeButton: true,
+            onclick: () => openManager('updates'),
+        },
+    );
+}
+
 function clearPluginUpdateNotice() {
     updateAvailableVersion = '';
+    latestRemoteReleaseInfo = null;
     $('#stsc_extensions_menu_button').removeClass('stsc-has-update').find('.stsc-menu-update-badge').remove();
     if (updateToast) {
         try { toastr.clear(updateToast); } catch { /* 忽略旧 toast 清理失败 */ }
@@ -3570,8 +3797,9 @@ function clearPluginUpdateNotice() {
     }
 }
 
-function showPluginUpdateNotice(remoteVersion = '') {
-    updateAvailableVersion = String(remoteVersion || '').trim();
+function showPluginUpdateNotice(remoteVersion = '', releaseInfo = null) {
+    updateAvailableVersion = String(remoteVersion || releaseInfo?.version || '').trim();
+    latestRemoteReleaseInfo = releaseInfo || latestRemoteReleaseInfo;
     const $menuButton = $('#stsc_extensions_menu_button');
     $menuButton.addClass('stsc-has-update');
     if (!$menuButton.find('.stsc-menu-update-badge').length) {
@@ -3580,8 +3808,11 @@ function showPluginUpdateNotice(remoteVersion = '') {
 
     if (updateToast) return;
     const versionText = updateAvailableVersion ? ` v${updateAvailableVersion}` : '';
+    const detail = Array.isArray(releaseInfo?.changes) && releaseInfo.changes.length
+        ? ` 更新内容：${releaseInfo.changes.slice(0, 2).join('；')}`
+        : '';
     updateToast = toastr.info(
-        `检测到“写作前置自检”有新版本${versionText}。点击前往扩展管理器更新。`,
+        `检测到“写作前置自检”有新版本${versionText}。${detail} 点击前往扩展管理器更新。`,
         '插件有更新｜前往更新',
         {
             timeOut: 0,
@@ -3601,6 +3832,9 @@ async function checkForPluginUpdate({ force = false } = {}) {
     if (!force && now - lastRuntimeUpdateCheckAt < STSC_UPDATE_CHECK_INTERVAL_MS) return;
     lastRuntimeUpdateCheckAt = now;
     updateCheckInFlight = true;
+    updateCheckState = 'checking';
+    updateCheckError = '';
+    if (initialized) renderUpdatesTab();
 
     const settings = normalizeSettings();
     if (settings?.updateNotice) {
@@ -3610,28 +3844,38 @@ async function checkForPluginUpdate({ force = false } = {}) {
 
     try {
         const installType = await getInstalledExtensionType();
-        const [gitResult, manifestResult] = await Promise.allSettled([
+        const [gitResult, manifestResult, releaseResult] = await Promise.allSettled([
             fetchOwnExtensionVersion(installType === 'global'),
             fetchRemoteManifestVersion(),
+            fetchRemoteReleaseInfo(),
         ]);
 
         const versionInfo = gitResult.status === 'fulfilled' ? gitResult.value : null;
-        const remoteVersion = manifestResult.status === 'fulfilled' ? manifestResult.value : '';
+        const manifestVersion = manifestResult.status === 'fulfilled' ? manifestResult.value : '';
+        const releaseInfo = releaseResult.status === 'fulfilled' ? releaseResult.value : null;
+        const remoteVersion = [manifestVersion, releaseInfo?.version]
+            .filter(Boolean)
+            .sort((a, b) => compareVersions(b, a))[0] || '';
         const gitHasUpdate = versionInfo?.isUpToDate === false;
         const manifestHasUpdate = remoteVersion && compareVersions(remoteVersion, STSC_VERSION) > 0;
 
+        latestRemoteReleaseInfo = releaseInfo;
         if (gitHasUpdate || manifestHasUpdate) {
-            showPluginUpdateNotice(remoteVersion);
-        } else if (gitResult.status === 'fulfilled' || manifestResult.status === 'fulfilled') {
+            updateCheckState = 'available';
+            showPluginUpdateNotice(remoteVersion, releaseInfo);
+        } else if (gitResult.status === 'fulfilled' || manifestResult.status === 'fulfilled' || releaseResult.status === 'fulfilled') {
+            updateCheckState = 'latest';
             clearPluginUpdateNotice();
         } else {
-            throw new Error('Git 检查和远程版本检查均失败');
+            throw new Error('Git 检查、远程版本检查与版本说明检查均失败');
         }
     } catch (error) {
-        // 更新检查失败不影响插件正常使用，也不打扰用户。
+        updateCheckState = 'error';
+        updateCheckError = error?.message || String(error || '未知错误');
         console.debug('[STSC] 插件更新检查失败：', error);
     } finally {
         updateCheckInFlight = false;
+        if (initialized) renderUpdatesTab();
     }
 }
 
@@ -3668,6 +3912,7 @@ async function initialize() {
     context.eventSource.on(events.GENERATION_STOPPED, onGenerationStopped);
 
     renderAll();
+    setTimeout(showInstalledReleaseNoticeIfNeeded, 900);
     setTimeout(() => void checkForPluginUpdate({ force: true }), 2500);
     if (updatePollTimer) clearInterval(updatePollTimer);
     updatePollTimer = setInterval(() => void checkForPluginUpdate(), STSC_UPDATE_CHECK_INTERVAL_MS);
