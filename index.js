@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.3.0';
+const STSC_VERSION = '0.3.1';
 const STSC_CHECK_TAG = 'stsc_self_check';
 const STSC_RESPONSE_TAG = 'stsc_response';
 const STSC_CHECK_OPEN_RE = /<stsc_self_check\b[^>]*>/i;
@@ -24,13 +24,12 @@ const STSC_REMOTE_RELEASE_URL = 'https://raw.githubusercontent.com/chenxyeah/Sil
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-07-22',
-    title: '资料库批量分享与版本更新中心',
+    releasedAt: '2026-07-23',
+    title: '修复关闭插件后仍检测回复',
     changes: Object.freeze([
-        '参考资料库支持勾选多个条目，批量导出为一个合集文件。',
-        '导入资料库时同时兼容单个资料库文件和资料库合集文件。',
-        '新增“版本更新”页面，可查看当前版本、本次更新内容与远程新版本说明。',
-        '插件升级到新版本后会显示一次更新完成提示；检测到远程更新时持续提供前往更新入口。',
+        '关闭插件后不再解析或检查AI回复，也不会再生成“本轮AI未输出自检问答”的记录。',
+        '关闭插件时会立即清理尚未完成的本轮自检运行状态与临时注入。',
+        '插件关闭期间隐藏悬浮按钮上的旧错误红点；重新启用后仍可查看历史自检记录。',
     ]),
 });
 
@@ -670,7 +669,13 @@ function commitEditDraft({ notify = true } = {}) {
     const context = ctx();
     if (!context?.extensionSettings) return;
     context.extensionSettings[STSC_MODULE] = clone(editDraft);
-    normalizeSettings();
+    const savedSettings = normalizeSettings();
+    if (!savedSettings?.enabled) {
+        // 用户关闭插件后立刻终止尚未完成的本轮检测，避免回复完成时被误判为“未输出自检”。
+        pendingRun = null;
+        strictBusy = false;
+        clearRuntimePrompts();
+    }
     saveSettings();
     editDraft = clone(context.extensionSettings[STSC_MODULE]);
     editDirty = false;
@@ -1526,6 +1531,16 @@ function statusClass(status) {
 
 async function handleMessageReceived(data) {
     if (internalQuietActive) return;
+
+    const settings = normalizeSettings();
+    if (!settings?.enabled) {
+        // 插件关闭时不读取、不解析、不改写任何AI回复，也不生成缺失/格式错误提示。
+        pendingRun = null;
+        strictBusy = false;
+        clearRuntimePrompts();
+        return;
+    }
+
     const context = ctx();
     if (!context?.chat?.length) return;
 
@@ -2286,6 +2301,12 @@ function renderFloatingInstructionPage() {
 }
 
 function renderFloatingBadge() {
+    // 插件关闭期间不显示错误红点，避免历史记录被误认为当前仍在检测。
+    if (!getUiSettings()?.enabled) {
+        $('#stsc_floating_badge').addClass('stsc-hidden').text('');
+        return;
+    }
+
     const latest = getLatestResult();
     const hasUnreadIssue = latestHasUnreadIssue(latest);
     $('#stsc_floating_badge')
