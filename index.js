@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.3.1';
+const STSC_VERSION = '0.3.2';
 const STSC_CHECK_TAG = 'stsc_self_check';
 const STSC_RESPONSE_TAG = 'stsc_response';
 const STSC_CHECK_OPEN_RE = /<stsc_self_check\b[^>]*>/i;
@@ -24,12 +24,12 @@ const STSC_REMOTE_RELEASE_URL = 'https://raw.githubusercontent.com/chenxyeah/Sil
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-07-23',
-    title: '修复关闭插件后仍检测回复',
+    releasedAt: '2026-07-25',
+    title: '调整批量问题识别规则',
     changes: Object.freeze([
-        '关闭插件后不再解析或检查AI回复，也不会再生成“本轮AI未输出自检问答”的记录。',
-        '关闭插件时会立即清理尚未完成的本轮自检运行状态与临时注入。',
-        '插件关闭期间隐藏悬浮按钮上的旧错误红点；重新启用后仍可查看历史自检记录。',
+        '自动识别问题现在只按换行分隔，每个非空行视为一道完整问题。',
+        '同一行中出现多个问号时不再被拆成多道问题。',
+        '仍会自动清理行首的序号与项目符号，识别结果可在导入前继续编辑。',
     ]),
 });
 
@@ -2899,24 +2899,16 @@ function looksLikeQuestion(text) {
 }
 
 function splitBulkQuestions(raw) {
-    let text = String(raw || '').replace(/\r\n?/g, '\n').trim();
+    const text = String(raw || '').replace(/\r\n?/g, '\n').trim();
     if (!text) return [];
 
-    text = text.replace(/\s+(?=(?:\d+|[一二三四五六七八九十百]+)[\.、：:)）-]\s*)/g, '\n');
-    const sourceLines = text.split(/\n+/).map(x => x.trim()).filter(Boolean);
-    const output = [];
+    const output = text
+        .split('\n')
+        .map(line => line.trim())
+        .filter(Boolean)
+        .map(line => line.replace(/^\s*(?:[-*•·]+|(?:\d+|[一二三四五六七八九十百]+)[\.、：:)）-])\s*/u, '').trim())
+        .filter(Boolean);
 
-    for (const original of sourceLines) {
-        const marked = /^\s*(?:[-*•·]+|(?:\d+|[一二三四五六七八九十百]+)[\.、：:)）-])\s*/u.test(original);
-        const cleaned = original.replace(/^\s*(?:[-*•·]+|(?:\d+|[一二三四五六七八九十百]+)[\.、：:)）-])\s*/u, '').trim();
-        if (!cleaned) continue;
-        const chunks = cleaned.split(/(?<=[？?])\s*(?=\S)/u).map(x => x.trim()).filter(Boolean);
-        for (const chunk of chunks) {
-            if (looksLikeQuestion(chunk)) output.push(chunk);
-        }
-    }
-
-    if (!output.length && looksLikeQuestion(text)) output.push(text);
     return [...new Set(output)];
 }
 
@@ -2935,13 +2927,13 @@ function renderBulkImportDialog() {
         '批量导入问题',
         `<div class="stsc-field">
             <label>粘贴原始内容</label>
-            <textarea id="stsc_bulk_raw" class="text_pole stsc-bulk-raw" placeholder="把整段问题粘贴到这里。识别后不会立即导入，可以先修改和删除。">${escapeHtml(bulkDraft.raw)}</textarea>
+            <textarea id="stsc_bulk_raw" class="text_pole stsc-bulk-raw" placeholder="每行填写一道问题。即使同一行有多个问号，也只会识别为一道问题。">${escapeHtml(bulkDraft.raw)}</textarea>
         </div>
         <div class="stsc-toolbar" style="margin-top:9px">
             <button class="menu_button" type="button" data-dialog-action="recognize-bulk">开始识别 / 重新识别</button>
             <button class="menu_button" type="button" data-dialog-action="add-bulk-item">＋ 手动补一条</button>
         </div>
-        <div class="stsc-muted" style="margin-top:9px">识别结果只是临时草稿。请先检查、修改或删除，点击“确认导入”后才会正式加入当前预设。</div>
+        <div class="stsc-muted" style="margin-top:9px">仅按换行识别：每个非空行视为一道完整问题，不会按问号拆分。识别结果只是临时草稿，可先修改或删除，确认后才会加入当前预设。</div>
         <div class="stsc-bulk-preview">${itemsHtml}</div>`,
         `<button class="menu_button" type="button" data-dialog-action="cancel">取消</button>
          <button class="menu_button" type="button" data-dialog-action="confirm-bulk" ${bulkDraft.items.length ? '' : 'disabled'}>确认导入（${bulkDraft.items.length}）</button>`
