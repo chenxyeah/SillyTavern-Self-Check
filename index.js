@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.3.3';
+const STSC_VERSION = '0.3.4';
 const STSC_CHECK_TAG = 'stsc_self_check';
 const STSC_RESPONSE_TAG = 'stsc_response';
 const STSC_CHECK_OPEN_RE = /<stsc_self_check\b[^>]*>/i;
@@ -98,6 +98,7 @@ const DEFAULT_SETTINGS = Object.freeze({
         floatingEnabled: false,
         floatingStyle: 'theme',
         floatingOpacity: 0.94,
+        floatingButtonSize: 50,
         floatingWidth: 420,
         floatingHeight: 640,
         floatingPosition: {
@@ -208,6 +209,8 @@ function normalizeSettings() {
     settings.appearance.floatingStyle = ['theme', 'glass', 'solid', 'minimal'].includes(settings.appearance.floatingStyle) ? settings.appearance.floatingStyle : 'theme';
     // v0.2.4 起该字段表示悬浮按钮背景透明度，不再控制悬浮面板整体。
     settings.appearance.floatingOpacity = clampNumber(settings.appearance.floatingOpacity, 0.1, 1, 0.94);
+    // v0.3.4：悬浮按钮大小可在 34px 到原始 50px 之间自由调整。
+    settings.appearance.floatingButtonSize = clampNumber(settings.appearance.floatingButtonSize, 34, 50, 50);
     settings.appearance.floatingWidth = clampNumber(settings.appearance.floatingWidth, 300, 680, 420);
     settings.appearance.floatingHeight = clampNumber(settings.appearance.floatingHeight, 300, 820, 640);
     if (!settings.appearance.floatingPosition || typeof settings.appearance.floatingPosition !== 'object') {
@@ -733,18 +736,32 @@ function applyFloatingAppearance(settings = getUiSettings()) {
     const appearance = settings?.appearance || DEFAULT_SETTINGS.appearance;
     const style = ['theme', 'glass', 'solid', 'minimal'].includes(appearance.floatingStyle) ? appearance.floatingStyle : 'theme';
     const buttonOpacity = clampNumber(appearance.floatingOpacity, 0.1, 1, 0.94);
+    const buttonSize = clampNumber(appearance.floatingButtonSize, 34, 50, 50);
     const width = clampNumber(appearance.floatingWidth, 300, 680, 420);
     const height = clampNumber(appearance.floatingHeight, 300, 820, 640);
     const panel = document.getElementById('stsc_floating_panel');
+    const root = document.getElementById('stsc_floating_root');
     const button = document.getElementById('stsc_floating_button');
     if (!panel) return;
 
     panel.dataset.floatingStyle = style;
     panel.style.setProperty('--stsc-floating-preferred-width', `${Math.round(width)}px`);
     panel.style.setProperty('--stsc-floating-preferred-height', `${Math.round(height)}px`);
+    const iconPadding = Math.round(clampNumber(buttonSize * 0.16, 5, 8, 8));
+    const badgeSize = Math.round(clampNumber(buttonSize * 0.38, 15, 19, 19));
+    const badgeFontSize = Math.round(clampNumber(buttonSize * 0.24, 9, 12, 12));
+    const badgeTop = Math.round(clampNumber(buttonSize * -0.08, -4, -3, -4));
+    const badgeRight = Math.round(clampNumber(buttonSize * -0.06, -3, -2, -3));
+    root?.style?.setProperty('--stsc-floating-button-size', `${Math.round(buttonSize)}px`);
+    root?.style?.setProperty('--stsc-floating-icon-padding', `${iconPadding}px`);
+    root?.style?.setProperty('--stsc-floating-badge-size', `${badgeSize}px`);
+    root?.style?.setProperty('--stsc-floating-badge-font-size', `${badgeFontSize}px`);
+    root?.style?.setProperty('--stsc-floating-badge-top', `${badgeTop}px`);
+    root?.style?.setProperty('--stsc-floating-badge-right', `${badgeRight}px`);
     button?.style?.setProperty('--stsc-floating-button-opacity-percent', `${Math.round(buttonOpacity * 100)}%`);
 
     $('#stsc_floating_opacity_value').text(`${Math.round(buttonOpacity * 100)}%`);
+    $('#stsc_floating_button_size_value').text(`${Math.round(buttonSize)}px`);
     $('#stsc_floating_width_value').text(`${Math.round(width)}px`);
     $('#stsc_floating_height_value').text(`${Math.round(height)}px`);
 }
@@ -2202,6 +2219,7 @@ function renderSettingsTab() {
                     <option value="minimal" ${settings.appearance.floatingStyle === 'minimal' ? 'selected' : ''}>轻量极简</option>
                 </select></div>
                 <div class="stsc-field stsc-range-field"><label>悬浮按钮透明度 <span id="stsc_floating_opacity_value">${Math.round(settings.appearance.floatingOpacity * 100)}%</span></label><input id="stsc_floating_opacity" type="range" min="10" max="100" step="1" value="${Math.round(settings.appearance.floatingOpacity * 100)}"><div class="stsc-muted">只调整圆形悬浮按钮的背景透明度，不影响打开后的悬浮窗内容。</div></div>
+                <div class="stsc-field stsc-range-field"><label>悬浮按钮大小 <span id="stsc_floating_button_size_value">${Math.round(settings.appearance.floatingButtonSize)}px</span></label><input id="stsc_floating_button_size" type="range" min="34" max="50" step="2" value="${Math.round(settings.appearance.floatingButtonSize)}"><div class="stsc-muted">最大为原来的按钮大小，向左可缩小两档以上；图标、红点和拖动范围会同步适配。</div></div>
                 <div class="stsc-field stsc-range-field"><label>悬浮窗宽度 <span id="stsc_floating_width_value">${Math.round(settings.appearance.floatingWidth)}px</span></label><input id="stsc_floating_width" type="range" min="300" max="680" step="10" value="${Math.round(settings.appearance.floatingWidth)}"></div>
                 <div class="stsc-field stsc-range-field"><label>悬浮窗高度 <span id="stsc_floating_height_value">${Math.round(settings.appearance.floatingHeight)}px</span></label><input id="stsc_floating_height" type="range" min="300" max="820" step="10" value="${Math.round(settings.appearance.floatingHeight)}"></div>
             </div>
@@ -3269,6 +3287,14 @@ function bindUiEvents() {
         $('#stsc_floating_opacity_value').text(`${Math.round(getUiSettings().appearance.floatingOpacity * 100)}%`);
         markDirty();
         applyFloatingAppearance(getUiSettings());
+    });
+    $('#stsc_manager_overlay').on('input change', '#stsc_floating_button_size', function () {
+        getUiSettings().appearance.floatingButtonSize = clampNumber(this.value, 34, 50, 50);
+        $('#stsc_floating_button_size_value').text(`${Math.round(getUiSettings().appearance.floatingButtonSize)}px`);
+        markDirty();
+        applyFloatingAppearance(getUiSettings());
+        applyFloatingPosition(getUiSettings());
+        if (!$('#stsc_floating_panel').hasClass('stsc-hidden')) layoutFloatingPanel();
     });
     $('#stsc_manager_overlay').on('input change', '#stsc_floating_width', function () {
         getUiSettings().appearance.floatingWidth = clampNumber(this.value, 300, 680, 420);

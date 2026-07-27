@@ -2240,3 +2240,29 @@ body.stsc-modal-open {
     flex: 0 0 auto !important;
   }
 }
+/* v0.3.4：悬浮按钮尺寸可调，50px 为原始最大尺寸，最小 34px。 */
+#stsc_floating_root {
+  width: var(--stsc-floating-button-size, 50px) !important;
+  height: var(--stsc-floating-button-size, 50px) !important;
+}
+
+#stsc_floating_button {
+  width: var(--stsc-floating-button-size, 50px) !important;
+  height: var(--stsc-floating-button-size, 50px) !important;
+  min-width: var(--stsc-floating-button-size, 50px) !important;
+  min-height: var(--stsc-floating-button-size, 50px) !important;
+}
+
+#stsc_floating_button .stsc-floating-icon {
+  padding: var(--stsc-floating-icon-padding, 8px) !important;
+}
+
+#stsc_floating_button .stsc-floating-badge {
+  top: var(--stsc-floating-badge-top, -4px) !important;
+  right: var(--stsc-floating-badge-right, -3px) !important;
+  min-width: var(--stsc-floating-badge-size, 19px) !important;
+  height: var(--stsc-floating-badge-size, 19px) !important;
+  padding-inline: 4px !important;
+  font-size: var(--stsc-floating-badge-font-size, 12px) !important;
+  line-height: var(--stsc-floating-badge-size, 19px) !important;
+}
