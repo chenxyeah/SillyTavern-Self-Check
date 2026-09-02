@@ -872,13 +872,26 @@ body.stsc-modal-open {
 
 .stsc-floating-root {
   position: fixed;
-  z-index: 2147482500;
+  z-index: 2500;
   width: 48px;
   height: 48px;
   color: var(--stsc-text);
   user-select: none;
   -webkit-user-select: none;
   -webkit-tap-highlight-color: transparent;
+  transition: transform 180ms ease;
+}
+
+.stsc-floating-root.stsc-mobile-edge-docked[data-edge-dock="left"]:not(.stsc-floating-dragging) {
+  transform: translateX(calc(-1 * var(--stsc-edge-tuck-offset, 33px)));
+}
+
+.stsc-floating-root.stsc-mobile-edge-docked[data-edge-dock="right"]:not(.stsc-floating-dragging) {
+  transform: translateX(var(--stsc-edge-tuck-offset, 33px));
+}
+
+.stsc-floating-root.stsc-floating-dragging {
+  transition: none;
 }
 
 .stsc-floating-button {
@@ -1147,7 +1160,7 @@ body.stsc-modal-open {
 }
 
 .stsc-floating-panel {
-  z-index: 2147482600;
+  z-index: 2850;
   width: min(420px, calc(100vw - 24px));
   max-height: min(640px, 72dvh);
   display: flex;
@@ -1243,7 +1256,7 @@ body.stsc-modal-open {
     padding-inline: 8px !important;
   }
 
-  /* 五个菜单在小屏固定排成两行，不再横向截断。 */
+  /* 六个菜单在小屏固定排成两排三列，不再横向截断。 */
   .stsc-tabs {
     display: grid !important;
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -1352,7 +1365,7 @@ body.stsc-modal-open {
 /* v0.1.7：移动端悬浮问答面板彻底脱离按钮容器，并由 JS 按 visualViewport 设置明确像素尺寸。 */
 #stsc_floating_panel {
   position: fixed !important;
-  z-index: 2147483600 !important;
+  z-index: 2850 !important;
   display: flex;
   flex-direction: column;
   min-width: 0 !important;
@@ -1810,7 +1823,7 @@ body.stsc-modal-open {
 .stsc-floating-tabs {
   flex: 0 0 auto;
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 5px;
   padding: 7px 9px;
   border-bottom: 1px solid var(--stsc-border);
@@ -2104,7 +2117,36 @@ body.stsc-modal-open {
   line-height: 1.2;
   color: var(--stsc-accent);
   vertical-align: middle;
+  position: relative;
+  cursor: pointer;
+  background: transparent;
 }
+
+.stsc-review-list { display: flex; flex-direction: column; gap: 9px; margin-top: 9px; }
+.stsc-review-card { padding: 11px; border: 1px solid var(--stsc-border); border-left: 4px solid #dca642; border-radius: 10px; background: color-mix(in srgb, var(--stsc-panel) 90%, transparent); }
+.stsc-review-type { color: #e8b64f; font-weight: 700; margin-bottom: 6px; }
+.stsc-review-description { line-height: 1.55; }
+.stsc-review-detail { margin-top: 7px; color: var(--stsc-muted-text); line-height: 1.5; }
+.stsc-review-select { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--stsc-border); }
+.stsc-review-note { padding: 9px; border-radius: 8px; background: var(--stsc-soft); }
+.stsc-review-ok { color: #55c985; }
+
+.stsc-header-log-button { position: relative; white-space: nowrap; }
+.stsc-header-dot { display: none; position: absolute; right: -3px; top: -3px; width: 9px; height: 9px; border: 2px solid var(--stsc-panel); border-radius: 50%; background: #ef4444; box-sizing: content-box; }
+.has-notice > .stsc-header-dot { display: block; }
+.stsc-status-lights, .stsc-status-switch-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; margin-top: 8px; }
+.stsc-status-lights > span { display: flex; align-items: center; gap: 7px; padding: 8px 10px; border: 1px solid var(--stsc-border); border-radius: 9px; }
+.stsc-signal { display: inline-block; flex: 0 0 9px; width: 9px; height: 9px; border-radius: 50%; background: #8b8b8b; box-shadow: 0 0 0 3px color-mix(in srgb, #8b8b8b 16%, transparent); }
+.stsc-signal.is-on { background: #35b96f; box-shadow: 0 0 0 3px color-mix(in srgb, #35b96f 18%, transparent); }
+.stsc-signal.is-off { background: #df5353; box-shadow: 0 0 0 3px color-mix(in srgb, #df5353 18%, transparent); }
+.stsc-signal.is-na { background: #858585; }
+.stsc-log-summary { margin-bottom: 10px; color: var(--stsc-muted); }
+.stsc-log-list { display: flex; flex-direction: column; gap: 9px; max-height: min(58vh, 580px); overflow: auto; }
+.stsc-log-item { padding: 11px; border: 1px solid var(--stsc-border); border-left: 4px solid #888; border-radius: 10px; }
+.stsc-log-item.is-error { border-left-color: #df5353; }
+.stsc-log-item.is-warning { border-left-color: #e2a93b; }
+.stsc-log-head { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 7px; }
+.stsc-log-head time { color: var(--stsc-muted); font-size: 12px; }
 
 .stsc-batch-reference-tools {
   display: flex;
@@ -2239,6 +2281,8 @@ body.stsc-modal-open {
     min-width: 0 !important;
     flex: 0 0 auto !important;
   }
+  .stsc-status-lights, .stsc-status-switch-grid { grid-template-columns: 1fr; }
+  .stsc-header-log-button { padding-inline: 7px !important; min-width: 0 !important; }
 }
 /* v0.3.4：悬浮按钮尺寸可调，50px 为原始最大尺寸，最小 34px。 */
 #stsc_floating_root {
@@ -2265,4 +2309,148 @@ body.stsc-modal-open {
   padding-inline: 4px !important;
   font-size: var(--stsc-floating-badge-font-size, 12px) !important;
   line-height: var(--stsc-floating-badge-size, 19px) !important;
+}
+
+
+/* DEV v0.4.0-beta.2：双API调用设置界面 */
+.stsc-mode-help {
+    margin-top: 7px;
+    padding: 8px 10px;
+    border-radius: 9px;
+    border: 1px solid color-mix(in srgb, var(--SmartThemeBorderColor, #888) 45%, transparent);
+    background: color-mix(in srgb, var(--SmartThemeBlurTintColor, #222) 18%, transparent);
+    font-size: 0.9em;
+    line-height: 1.55;
+}
+
+.stsc-section-title-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.stsc-dev-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 3px 8px;
+    border-radius: 999px;
+    font-size: 0.76em;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    border: 1px solid currentColor;
+    opacity: 0.9;
+}
+
+.stsc-dev-notice {
+    padding: 10px 12px;
+    border-radius: 10px;
+    border: 1px dashed color-mix(in srgb, currentColor 42%, transparent);
+    background: color-mix(in srgb, var(--SmartThemeQuoteColor, #a67c52) 12%, transparent);
+    line-height: 1.6;
+}
+
+.stsc-secret-row,
+.stsc-model-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+    align-items: center;
+}
+
+.stsc-model-row .menu_button {
+    white-space: nowrap;
+}
+
+.stsc-model-status {
+    min-height: 1.35em;
+    margin-top: 5px;
+}
+
+.stsc-model-status-success {
+    color: color-mix(in srgb, #74d99f 78%, currentColor);
+}
+
+.stsc-model-status-error {
+    color: #ff8585;
+}
+
+.stsc-field-disabled {
+    opacity: 0.48;
+}
+
+.stsc-dual-branch-card,
+.stsc-dual-library-note,
+.stsc-dual-regex-note {
+    border: 1px solid color-mix(in srgb, var(--SmartThemeBorderColor, #888) 52%, transparent);
+    border-radius: 12px;
+    padding: 11px 12px;
+    background: color-mix(in srgb, var(--SmartThemeBlurTintColor, #222) 14%, transparent);
+}
+
+.stsc-strong-checkbox {
+    font-weight: 700;
+}
+
+.stsc-dual-branch-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    margin-top: 9px;
+}
+
+.stsc-dual-branch {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    min-width: 0;
+    padding: 9px 10px;
+    border-radius: 9px;
+    border: 1px solid color-mix(in srgb, var(--SmartThemeBorderColor, #888) 35%, transparent);
+    opacity: 0.68;
+    line-height: 1.5;
+}
+
+.stsc-dual-branch.is-active {
+    opacity: 1;
+    border-color: color-mix(in srgb, currentColor 62%, transparent);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, currentColor 12%, transparent);
+}
+
+.stsc-dual-library-note,
+.stsc-dual-regex-note {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    line-height: 1.55;
+}
+
+.stsc-dual-regex-note {
+    border-style: dashed;
+    background: color-mix(in srgb, var(--SmartThemeQuoteColor, #a67c52) 9%, transparent);
+}
+
+.stsc-dual-api-section code {
+    padding: 1px 4px;
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--SmartThemeBlurTintColor, #222) 35%, transparent);
+}
+
+@media (max-width: 700px) {
+    .stsc-dual-branch-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .stsc-model-row {
+        grid-template-columns: 1fr;
+    }
+
+    .stsc-model-row .menu_button {
+        width: 100%;
+    }
+
+    .stsc-section-title-row {
+        align-items: flex-start;
+        flex-direction: column;
+    }
 }

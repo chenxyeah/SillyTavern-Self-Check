@@ -1,11 +1,16 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.3.4';
+const STSC_VERSION = '0.4.0';
+const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
+const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
+const STSC_LOG_LIMIT = 500;
 const STSC_CHECK_TAG = 'stsc_self_check';
 const STSC_RESPONSE_TAG = 'stsc_response';
 const STSC_CHECK_OPEN_RE = /<stsc_self_check\b[^>]*>/i;
 const STSC_CHECK_CLOSE_RE = /<\/stsc_self_check>/i;
+const STSC_REVIEW_OPEN_RE = /<stsc_previous_review\b[^>]*>/i;
+const STSC_REVIEW_CLOSE_RE = /<\/stsc_previous_review>/i;
 const STSC_RESPONSE_OPEN_RE = /<stsc_response\b[^>]*>/i;
 const STSC_RESPONSE_CLOSE_RE = /<\/stsc_response>/i;
 const STSC_PRESET_EXPORT_FORMAT = 'sillytavern-self-check-preset';
@@ -19,18 +24,29 @@ const STSC_REFERENCE_IMPORT_MAX_BYTES = 16 * 1024 * 1024;
 const STSC_BUILTIN_GENERAL_KEY = 'default-general-core-v1';
 const STSC_BUILTIN_GENERAL_NAME = '默认通用自检';
 const STSC_UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000;
-const STSC_REMOTE_MANIFEST_URL = 'https://raw.githubusercontent.com/chenxyeah/SillyTavern-Self-Check/main/manifest.json';
-const STSC_REMOTE_RELEASE_URL = 'https://raw.githubusercontent.com/chenxyeah/SillyTavern-Self-Check/main/version.json';
+const STSC_REMOTE_MANIFEST_URLS = Object.freeze([
+    'https://raw.githubusercontent.com/chenxyeah/SillyTavern-Self-Check/main/manifest.json',
+    'https://cdn.jsdelivr.net/gh/chenxyeah/SillyTavern-Self-Check@main/manifest.json',
+    'https://api.github.com/repos/chenxyeah/SillyTavern-Self-Check/contents/manifest.json?ref=main',
+]);
+const STSC_REMOTE_RELEASE_URLS = Object.freeze([
+    'https://raw.githubusercontent.com/chenxyeah/SillyTavern-Self-Check/main/version.json',
+    'https://cdn.jsdelivr.net/gh/chenxyeah/SillyTavern-Self-Check@main/version.json',
+    'https://api.github.com/repos/chenxyeah/SillyTavern-Self-Check/contents/version.json?ref=main',
+]);
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-07-25',
-    title: '支持插件内直接更新并修复误报提醒',
+    releasedAt: '2026-09-03',
+    title: 'DEV 功能正式迁入：双API、复盘与可靠性升级',
     changes: Object.freeze([
-        '版本更新页发现新版本后，可直接点击“立即更新”，无需跳转到 SillyTavern 扩展管理器。',
-        '更新完成后会提示并自动刷新页面，使新版本立即生效。',
-        '更新提醒只以远程版本号高于当前版本为准，不再因普通 Git 提交或检查状态异常误报。',
-        '取消进入酒馆时的“已安装／已更新”弹窗；没有真正的新版本时不再弹出更新提示。',
+        '正式整合 beta.22 已验证功能：双API自检、上一轮复盘、强力YAML规范、运行日志与插件内更新。',
+        '沿用正式版预设和角色绑定；可在插件设置中从同一酒馆的DEV迁入配置，并恢复迁入前的正式版设置。',
+        '单API提示词新增严格输出边界：原有思维链必须先完整闭合，自检和最终正文必须位于思维链标签之外。',
+        '双API普通注入与强力YAML规范同步加入正文边界要求，避免执行规范诱发正文顺序错乱。',
+        '当模型把思维链标签错误地跨过插件自检区并包住正文时，插件会只修复这一处边界，不删除正常思维链。',
+        '运行日志会明确记录“正文误入思维链但已自动分开”，方便判断是已修复的小格式问题还是仍需排查接口。',
+        '若双API正文仍被完整包在思维链中且无法安全自动拆分，日志会明确报警并保留原文，避免误删正文或泄露隐藏推理。',
     ]),
 });
 
@@ -88,6 +104,21 @@ const DEFAULT_SETTINGS = Object.freeze({
         depth: 0,
         role: 'system',
     },
+    dualApi: {
+        endpoint: '',
+        apiKey: '',
+        model: '',
+        maxTokens: 4096,
+        timeoutSeconds: 150,
+        retryTransient: true,
+        contextMode: 'recent5',
+        customTurns: 5,
+        transformFormat: false,
+        failureMode: 'fallback_single',
+        previousReview: false,
+    },
+    logs: [],
+    logLastViewedAt: 0,
     presets: [],
     references: [],
     temporaryInstructions: [],
@@ -104,6 +135,7 @@ const DEFAULT_SETTINGS = Object.freeze({
         floatingPosition: {
             leftRatio: 0.82,
             topRatio: 0.68,
+            edgeDock: '',
         },
     },
     migrations: {
@@ -111,6 +143,7 @@ const DEFAULT_SETTINGS = Object.freeze({
         defaultGeneralCoreV2: false,
         defaultGeneralCoreV3: false,
         defaultGeneralCoreV4: false,
+        dualApiReliabilityV1: false,
     },
     updateNotice: {
         lastCheckedAt: 0,
@@ -128,7 +161,7 @@ const DEFAULT_SETTINGS = Object.freeze({
 });
 
 let pendingRun = null;
-let strictBusy = false;
+let dualApiBusy = false;
 let testBusy = false;
 let lastTestResult = '';
 let internalQuietActive = false;
@@ -149,10 +182,122 @@ let updateCheckInFlight = false;
 let updatePollTimer = null;
 let updateToast = null;
 let updateAvailableVersion = '';
+let gitUpdateAvailable = false;
 let latestRemoteReleaseInfo = null;
 let updateCheckState = 'idle';
 let updateCheckError = '';
+let updateCheckDiagnostics = [];
+let installedExtensionGitState = 'unknown';
 let lastRuntimeUpdateCheckAt = 0;
+let dualApiModels = [];
+let dualApiModelsLoading = false;
+let dualApiModelsError = '';
+let dualApiModelsSignature = '';
+let dualApiModelFetchTimer = null;
+
+function sanitizeLogText(value) {
+    return String(value ?? '')
+        .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [已隐藏]')
+        .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/gi, '[API密钥已隐藏]')
+        .slice(0, 6000);
+}
+
+function compactRuntimeLogMessage(level, stage, message, handling = '') {
+    const stageText = String(stage || '运行');
+    const source = String(message || '');
+    const handlingText = String(handling || '');
+    if (stageText === '自检解析') {
+        if (/^角色卡“/.test(source)) return source.length > 500 ? `${source.slice(0, 500)}…` : source;
+        const countMatch = handlingText.match(/(\d+)\s*\/\s*(\d+)/);
+        if (countMatch && countMatch[1] !== countMatch[2]) return `自检回答不完整：识别到 ${countMatch[1]}/${countMatch[2]} 题。`;
+        if (/结束标签缺失|没有正确闭合|自动补全/.test(source)) return '自检标签不完整，插件已自动修复。';
+        if (/没有输出|未输出|完全没有/.test(source)) return '本轮没有检测到完整的自检输出。';
+        return '自检输出格式不完整。';
+    }
+    if (stageText === '自检API') {
+        if (/^角色卡“/.test(source)) return source.length > 600 ? `${source.slice(0, 600)}…` : source;
+        if (/超时|超过\s*\d+\s*秒/.test(source)) return `自检API等了很久仍没有回答。${source}`.slice(0, 600);
+        if (/401|403|密钥|认证|授权/.test(source)) return `自检API拒绝了请求，请检查API密钥和账号权限。${source}`.slice(0, 600);
+        if (/429|限流|请求过多|额度/.test(source)) return `自检API当前太忙、请求次数过多或额度不足。${source}`.slice(0, 600);
+        return `没有成功调用自检API：${source || '没有收到具体原因。'}`.slice(0, 600);
+    }
+    return source.length > 600 ? `${source.slice(0, 600)}…` : source;
+}
+
+function addRuntimeLog(level, stage, message, handling = '') {
+    const settings = normalizeSettings();
+    if (!settings) return;
+    const compactMessage = compactRuntimeLogMessage(level, stage, message, handling);
+    settings.logs.unshift({ id: uid('log'), timestamp: Date.now(), level, stage: sanitizeLogText(stage), message: sanitizeLogText(compactMessage), handling: sanitizeLogText(handling).slice(0, 240) });
+    settings.logs = settings.logs.slice(0, STSC_LOG_LIMIT);
+    saveSettings();
+    renderLogBadge();
+}
+
+function plainSelfCheckIssue(issue) {
+    const text = String(issue || '');
+    if (/整段可见回复.*思维链|最终正文.*推理标签/.test(text)) return '正文AI把整段可见回复都放进了思维链，插件无法安全猜出里面哪一段才是正文，所以没有强行删除内容。';
+    if (/酒馆主API.*重复输出|意外重复输出/.test(text)) return '正文AI把插件内部自检也写进了正文，插件已经自动删掉。';
+    if (/结束标签缺失|没有正确闭合|自动补全/.test(text)) return '自检内容的结尾格式没有写完整，插件已经自动补齐。';
+    if (/没有按要求输出.*stsc_self_check|没有检测到|没有输出|未输出|完全没有/.test(text)) return 'AI没有输出插件能够识别的自检内容。';
+    if (/缺少回答|必要依据|回答不完整|格式不完整/.test(text)) return 'AI返回了自检内容，但有题目漏答或缺少必须提供的依据。';
+    return text.replace(/<\/?stsc_[^>]+>/gi, '自检格式标记').replace(/<\/?(?:item|answer|evidence)[^>]*>/gi, '');
+}
+
+function runtimeCharacterLabel(latest) {
+    const name = String(latest?.characterName || '').trim() || '未识别角色';
+    return `角色卡“${name}”`;
+}
+
+function addGenerationResultLog(latest, visibleBody = '') {
+    if (!latest) return;
+    const character = runtimeCharacterLabel(latest);
+    const mode = latest.mode === 'dual_api' ? '双API' : '单API';
+    const answered = Math.max(0, Number(latest.answeredCount) || 0);
+    const expected = Math.max(0, Number(latest.expectedCount) || 0);
+    const countText = expected ? `${answered}/${expected} 题` : `${answered} 题`;
+    const hasBody = Boolean(String(visibleBody || '').trim());
+    const formatDetails = (latest.formatIssues || []).map(plainSelfCheckIssue).filter(Boolean);
+    const repairedReasoningBoundary = (latest.recoveryNotes || []).some(note => /正文.*思维链|推理标签.*正文/.test(String(note)));
+    const handlingParts = [`本轮使用${mode}模式。`];
+    let level = 'info';
+    let message = '';
+
+    if (!hasBody) {
+        level = 'error';
+        message = `${character}：AI这次没有生成可显示的正文。自检识别到 ${countText}。`;
+        handlingParts.push('请重新生成；如果反复出现，请检查主API连接和模型是否正常。');
+    } else if (latest.status === 'missing' || answered === 0) {
+        level = 'warning';
+        message = `${character}：正文已经输出，但没有找到插件要求的自检回答。`;
+        handlingParts.push('正文已保留；本轮没有可用的自检结论。请检查当前模式、提示词是否被其他预设覆盖，或查看前后的API记录。');
+    } else if (latest.status === 'format_error' || (expected && answered < expected)) {
+        level = 'warning';
+        message = `${character}：收到了自检内容，但只完整识别到 ${countText}；正文已经输出。`;
+        handlingParts.push('插件已保留能够识别的答案。');
+        if (formatDetails.length) handlingParts.push(`具体情况：${formatDetails.join('；')}`);
+    } else if (latest.status === 'recovered') {
+        message = `${character}：自检输出完成，共完成 ${countText}，正文也已正常输出。`;
+        handlingParts.push(repairedReasoningBoundary
+            ? 'AI原本把自检和正文一起包进了思维链，插件已经自动把正文分到思维链外，无需手动处理。'
+            : 'AI最初的格式有小问题，插件已经自动修好，无需手动处理。');
+    } else {
+        message = `${character}：自检输出完成，共完成 ${countText}，正文也已正常输出。`;
+        handlingParts.push('本轮运行正常，无需处理。');
+    }
+
+    const review = latest.previousReview;
+    if (review?.status === 'missing') {
+        if (level === 'info') level = 'warning';
+        handlingParts.push('本轮自检正常，但AI漏掉了上一轮复盘；插件下一轮还会继续尝试。');
+    } else if (review?.issues?.length) {
+        handlingParts.push(`上一轮复盘发现 ${review.issues.length} 条疑似问题，可到“复盘线索”中查看和选择。`);
+    } else if (review?.status === 'ok') {
+        handlingParts.push('上一轮复盘也已完成，没有发现明显问题。');
+    }
+
+    addRuntimeLog(level, '本轮结果', message, handlingParts.join(' '));
+}
 
 function ctx() {
     return globalThis.SillyTavern?.getContext?.();
@@ -176,8 +321,35 @@ function escapeHtml(value) {
         .replaceAll("'", '&#039;');
 }
 
+function decodeXmlEntities(value) {
+    let text = String(value ?? '');
+    // 独立自检API有时会提前把 <status_top> 等标签转成 &lt;...&gt;，
+    // 若这里再次直接转义，就会得到 &amp;lt;...&amp;gt;。最多解码三轮，
+    // 先还原已有实体，再由 escapeXml 统一只转义一次。
+    for (let pass = 0; pass < 3; pass++) {
+        const decoded = text
+            .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCodePoint(Number.parseInt(hex, 16)))
+            .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(Number.parseInt(dec, 10)))
+            .replace(/&lt;/gi, '<')
+            .replace(/&gt;/gi, '>')
+            .replace(/&quot;/gi, '"')
+            .replace(/&apos;|&#039;/gi, "'")
+            .replace(/&amp;/gi, '&');
+        if (decoded === text) break;
+        text = decoded;
+    }
+    return text;
+}
+
 function escapeXml(value) {
     return escapeHtml(value);
+}
+
+function wrapXmlCdata(value) {
+    const text = decodeXmlEntities(value);
+    // CDATA 内可直接保留 <status_top> 等原始尖括号标签。
+    // 若内容本身包含 CDATA 结束标记，则拆分为相邻的 CDATA 段，避免破坏外层协议结构。
+    return `<![CDATA[${text.replaceAll(']]>', ']]]]><![CDATA[>')}]]>`;
 }
 
 function normalizeSettings() {
@@ -191,6 +363,41 @@ function normalizeSettings() {
 
     const settings = all[STSC_MODULE];
     mergeDefaults(settings, DEFAULT_SETTINGS);
+    // 正式版优先：同时关闭 DEV 的消息处理，避免两套解析器改写同一条回复。
+    const devSettings = all[STSC_DEV_MODULE];
+    if (settings.enabled && devSettings?.enabled) {
+        devSettings.enabled = false;
+        context.saveSettingsDebounced?.();
+    }
+
+    // beta.7：双阶段严格模式已移除。旧设置自动迁移为单API调用，避免保留不可执行的模式值。
+    if (settings.mode === 'strict') settings.mode = 'single';
+    settings.mode = ['single', 'dual_api'].includes(settings.mode) ? settings.mode : 'single';
+    if (!settings.dualApi || typeof settings.dualApi !== 'object') settings.dualApi = clone(DEFAULT_SETTINGS.dualApi);
+    settings.dualApi.endpoint = String(settings.dualApi.endpoint || '');
+    settings.dualApi.apiKey = String(settings.dualApi.apiKey || '');
+    settings.dualApi.model = String(settings.dualApi.model || '');
+    settings.dualApi.maxTokens = clampNumber(settings.dualApi.maxTokens, 256, 12000, 4096);
+    settings.dualApi.timeoutSeconds = clampNumber(settings.dualApi.timeoutSeconds, 60, 300, 150);
+    settings.dualApi.retryTransient = Boolean(settings.dualApi.retryTransient);
+    // beta.3：聊天范围只保留“默认最近5轮 / 自定义 / 全部”。旧界面的跟随、10轮、20轮统一迁移为最近5轮。
+    settings.dualApi.contextMode = ['recent5', 'custom', 'all'].includes(settings.dualApi.contextMode) ? settings.dualApi.contextMode : 'recent5';
+    settings.dualApi.customTurns = clampNumber(settings.dualApi.customTurns, 1, 100, 5);
+    settings.dualApi.transformFormat = Boolean(settings.dualApi.transformFormat);
+    settings.dualApi.failureMode = ['fallback_single', 'stop'].includes(settings.dualApi.failureMode) ? settings.dualApi.failureMode : 'fallback_single';
+    settings.dualApi.previousReview = Boolean(settings.dualApi.previousReview);
+    let compactedLegacyLogs = false;
+    if (!Array.isArray(settings.logs)) settings.logs = [];
+    settings.logs = settings.logs.filter(item => item && typeof item === 'object').slice(0, STSC_LOG_LIMIT);
+    for (const item of settings.logs) {
+        const alreadyCompact = /^(?:自检回答不完整|自检标签不完整|自检输出格式不完整|本轮没有检测到完整的自检输出)/.test(String(item.message || ''));
+        if (item.stage === '自检解析' && !alreadyCompact) {
+            item.message = compactRuntimeLogMessage(item.level, item.stage, item.message, item.handling);
+            item.handling = sanitizeLogText(item.handling).slice(0, 240);
+            compactedLegacyLogs = true;
+        }
+    }
+    settings.logLastViewedAt = Math.max(0, Number(settings.logLastViewedAt) || 0);
 
     if (!Array.isArray(settings.presets)) settings.presets = [];
     if (!Array.isArray(settings.references)) settings.references = [];
@@ -222,9 +429,18 @@ function normalizeSettings() {
     }
     settings.appearance.floatingPosition.leftRatio = clampNumber(settings.appearance.floatingPosition.leftRatio, 0, 1, 0.82);
     settings.appearance.floatingPosition.topRatio = clampNumber(settings.appearance.floatingPosition.topRatio, 0, 1, 0.68);
+    settings.appearance.floatingPosition.edgeDock = ['left', 'right'].includes(settings.appearance.floatingPosition.edgeDock)
+        ? settings.appearance.floatingPosition.edgeDock
+        : '';
     delete settings.appearance.floatingPosition.side;
 
-    let settingsMigrated = false;
+    let settingsMigrated = compactedLegacyLogs;
+    if (!settings.migrations.dualApiReliabilityV1) {
+        // beta.17：旧版默认 2000 Token 容易在 6～8 题时截断；只迁移旧默认值，保留用户主动设置的其他数值。
+        if (Math.round(settings.dualApi.maxTokens) === 2000) settings.dualApi.maxTokens = 4096;
+        settings.migrations.dualApiReliabilityV1 = true;
+        settingsMigrated = true;
+    }
     if (settings.presets.length === 0) {
         const general = createBuiltInGeneralPreset();
         settings.presets.push(general);
@@ -296,6 +512,7 @@ function normalizeSettings() {
     if (initialGeneral?.name === '通用自检预设') initialGeneral.name = '默认（初始默认）';
 
     settings.ui.presetSection = settings.ui.presetSection === 'character' ? 'character' : 'general';
+    settings.ui.activeTab = ['status', 'presets', 'references', 'temporary', 'settings', 'appearance'].includes(settings.ui.activeTab) ? settings.ui.activeTab : 'status';
     const oldEditing = settings.presets.find(x => x.id === settings.ui.editingPresetId);
     if (!settings.ui.editingGeneralPresetId && oldEditing?.kind === 'general') settings.ui.editingGeneralPresetId = oldEditing.id;
     if (!settings.ui.editingCharacterPresetId && oldEditing?.kind === 'character') settings.ui.editingCharacterPresetId = oldEditing.id;
@@ -567,7 +784,6 @@ function normalizeReference(reference) {
     reference.depth = clampNumber(reference.depth, 0, 20, defaults.depth);
     reference.addToCheck = Boolean(reference.addToCheck);
     reference.autoQuestion = String(reference.autoQuestion || defaults.autoQuestion);
-    if (!reference.enabled) reference.addToCheck = false;
 }
 
 function applyReferenceTypeDefaults(reference, nextType, { preserveCustomQuestion = true } = {}) {
@@ -628,7 +844,7 @@ function setInstructionActivation(id, mode) {
     const instruction = actual.temporaryInstructions.find(item => item.id === id);
     if (!instruction) return false;
     if (mode !== 'off' && !String(instruction.content || '').trim()) {
-        toastr.warning('这条指令还没有填写内容，请先在完整管理器中编辑并保存。', '写作前置自检');
+        toastr.warning('这条指令还没有填写内容，请先在完整管理器中编辑并保存。', '墨提斯之镜');
         return false;
     }
 
@@ -649,8 +865,295 @@ function clampNumber(value, min, max, fallback) {
     return Math.min(max, Math.max(min, number));
 }
 
+function normalizeDualApiBaseUrl(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+
+    try {
+        const url = new URL(raw);
+        url.hash = '';
+        url.search = '';
+        let path = url.pathname.replace(/\/+$/g, '');
+        path = path
+            .replace(/\/chat\/completions$/i, '')
+            .replace(/\/responses$/i, '')
+            .replace(/\/models$/i, '');
+        url.pathname = path || '/';
+        return url.toString().replace(/\/+$/g, '');
+    } catch {
+        return '';
+    }
+}
+
+function dualApiConnectionSignature(dual = getUiSettings()?.dualApi) {
+    if (!dual) return '';
+    return `${normalizeDualApiBaseUrl(dual.endpoint)}\n${String(dual.apiKey || '')}`;
+}
+
+function extractDualApiModelIds(payload) {
+    const candidates = [
+        payload?.data,
+        payload?.data?.data,
+        payload?.models,
+        payload?.result,
+    ];
+    const list = candidates.find(value => Array.isArray(value)) || [];
+    const ids = list
+        .map(item => {
+            if (typeof item === 'string') return item;
+            if (!item || typeof item !== 'object') return '';
+            return item.id || item.name || item.model || '';
+        })
+        .map(value => String(value || '').trim())
+        .filter(Boolean);
+    return [...new Set(ids)].sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+}
+
+function dualApiModelOptionsHtml(dual) {
+    const endpoint = normalizeDualApiBaseUrl(dual.endpoint);
+    const savedModel = String(dual.model || '');
+
+    if (dualApiModelsLoading) {
+        return '<option value="">正在获取模型列表……</option>';
+    }
+
+    if (dualApiModels.length) {
+        return dualApiModels.map(model => `<option value="${escapeHtml(model)}" ${model === savedModel ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('');
+    }
+
+    if (!endpoint) {
+        return '<option value="">请先填写自检API地址</option>';
+    }
+
+    if (dualApiModelsError) {
+        const saved = savedModel ? `<option value="${escapeHtml(savedModel)}" selected>${escapeHtml(savedModel)}（上次选择）</option>` : '';
+        return `${saved}<option value="" ${saved ? '' : 'selected'}>模型获取失败，请检查接口</option>`;
+    }
+
+    if (savedModel) {
+        return `<option value="${escapeHtml(savedModel)}" selected>${escapeHtml(savedModel)}（等待刷新）</option>`;
+    }
+
+    return '<option value="">模型将自动获取</option>';
+}
+
+function dualApiModelStatusText(dual) {
+    const endpoint = normalizeDualApiBaseUrl(dual.endpoint);
+    if (!endpoint) return '填写接口地址后，插件会自动读取该接口提供的模型列表。';
+    if (dualApiModelsLoading) return '正在连接接口并读取模型列表……';
+    if (dualApiModelsError) return dualApiModelsError;
+    if (dualApiModels.length) return `已获取 ${dualApiModels.length} 个可用模型。`;
+    return '等待自动获取模型列表。';
+}
+
+function updateDualApiModelControl() {
+    const settings = getUiSettings();
+    const dual = settings?.dualApi;
+    if (!dual) return;
+
+    const select = document.getElementById('stsc_dual_model');
+    const button = document.getElementById('stsc_refresh_models');
+    const status = document.getElementById('stsc_dual_model_status');
+    if (!select) return;
+
+    select.innerHTML = dualApiModelOptionsHtml(dual);
+    const endpoint = normalizeDualApiBaseUrl(dual.endpoint);
+    select.disabled = !endpoint || dualApiModelsLoading || !dualApiModels.length;
+
+    if (dualApiModels.length) {
+        const selected = dualApiModels.includes(dual.model) ? dual.model : dualApiModels[0];
+        if (dual.model !== selected) {
+            dual.model = selected;
+            markDirty();
+        }
+        select.value = selected;
+    }
+
+    if (button) {
+        button.disabled = !endpoint || dualApiModelsLoading;
+        button.textContent = dualApiModelsLoading ? '获取中…' : '刷新模型';
+    }
+
+    if (status) {
+        status.textContent = dualApiModelStatusText(dual);
+        status.classList.toggle('stsc-model-status-error', Boolean(dualApiModelsError));
+        status.classList.toggle('stsc-model-status-success', Boolean(dualApiModels.length && !dualApiModelsError));
+    }
+}
+
+function resetDualApiModelState() {
+    dualApiModels = [];
+    dualApiModelsLoading = false;
+    dualApiModelsError = '';
+    dualApiModelsSignature = '';
+    if (dualApiModelFetchTimer) {
+        clearTimeout(dualApiModelFetchTimer);
+        dualApiModelFetchTimer = null;
+    }
+    updateDualApiModelControl();
+}
+
+function scheduleDualApiModelFetch(delay = 650, { force = false, showToast = false } = {}) {
+    if (dualApiModelFetchTimer) clearTimeout(dualApiModelFetchTimer);
+    dualApiModelFetchTimer = setTimeout(() => {
+        dualApiModelFetchTimer = null;
+        fetchDualApiModels({ force, showToast });
+    }, Math.max(0, Number(delay) || 0));
+}
+
+async function fetchDualApiModels({ force = false, showToast = false } = {}) {
+    const settings = getUiSettings();
+    const dual = settings?.dualApi;
+    if (!dual) return [];
+
+    const endpoint = normalizeDualApiBaseUrl(dual.endpoint);
+    if (!endpoint) {
+        dualApiModels = [];
+        dualApiModelsError = '';
+        dualApiModelsSignature = '';
+        updateDualApiModelControl();
+        return [];
+    }
+
+    const signature = dualApiConnectionSignature(dual);
+    if (!force && signature === dualApiModelsSignature && (dualApiModelsLoading || dualApiModels.length || dualApiModelsError)) {
+        updateDualApiModelControl();
+        return dualApiModels;
+    }
+
+    dualApiModelsLoading = true;
+    dualApiModelsError = '';
+    dualApiModelsSignature = signature;
+    updateDualApiModelControl();
+
+    try {
+        const context = ctx();
+        const headers = {
+            'Content-Type': 'application/json',
+            ...(context?.getRequestHeaders?.() || {}),
+        };
+        const response = await fetch('/api/backends/chat-completions/status', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                chat_completion_source: 'openai',
+                reverse_proxy: endpoint,
+                proxy_password: String(dual.apiKey || ''),
+            }),
+        });
+
+        let payload = {};
+        try {
+            payload = await response.json();
+        } catch {
+            payload = {};
+        }
+
+        if (dualApiConnectionSignature(getUiSettings()?.dualApi) !== signature) {
+            return [];
+        }
+
+        const models = extractDualApiModelIds(payload);
+        if (!response.ok || payload?.error || !models.length) {
+            const message = String(payload?.message || payload?.error?.message || '').trim();
+            throw new Error(message || '没有读取到模型列表。请确认填写的是以 /v1 结尾的 OpenAI 兼容接口，并且该接口支持 /models。');
+        }
+
+        dualApiModels = models;
+        dualApiModelsError = '';
+        const liveDual = getUiSettings().dualApi;
+        if (!models.includes(liveDual.model)) {
+            liveDual.model = models[0];
+            markDirty();
+        }
+        if (showToast) toastr.success(`已获取 ${models.length} 个模型。`, '墨提斯之镜');
+        return models;
+    } catch (error) {
+        if (dualApiConnectionSignature(getUiSettings()?.dualApi) !== signature) {
+            return [];
+        }
+        dualApiModels = [];
+        dualApiModelsError = `模型获取失败：${String(error?.message || error || '未知错误')}`;
+        if (showToast) toastr.error(dualApiModelsError, '墨提斯之镜');
+        return [];
+    } finally {
+        if (dualApiConnectionSignature(getUiSettings()?.dualApi) === signature) {
+            dualApiModelsLoading = false;
+            updateDualApiModelControl();
+        }
+    }
+}
+
 function saveSettings() {
     ctx()?.saveSettingsDebounced?.();
+}
+
+function getDevSettingsForMigration() {
+    const settings = ctx()?.extensionSettings?.[STSC_DEV_MODULE];
+    return settings && typeof settings === 'object' && !Array.isArray(settings)
+        && Array.isArray(settings.presets) ? settings : null;
+}
+
+function applyDevSettingsMigration({ restore = false } = {}) {
+    if (pendingRun || dualApiBusy || testBusy) throw new Error('请等本轮生成或测试结束后再迁移设置。');
+    if (editDirty) throw new Error('请先保存或放弃当前未保存的更改。');
+    const all = ctx()?.extensionSettings;
+    if (!all) throw new Error('当前酒馆设置尚未就绪。');
+    const source = restore ? all[STSC_DEV_MIGRATION_BACKUP] : getDevSettingsForMigration();
+    if (!source) throw new Error(restore ? '没有可恢复的迁移前设置。' : '当前酒馆未找到 DEV 设置。');
+    const previous = clone(normalizeSettings());
+    const devEnabledBefore = all[STSC_DEV_MODULE]?.enabled;
+    const next = clone(source);
+    // 迁入的是配置，不搬动聊天记录或另一版的自检结果。
+    if (!restore) {
+        next.enabled = true;
+        next.updateNotice = clone(DEFAULT_SETTINGS.updateNotice);
+    }
+    all[STSC_MODULE] = next;
+    try {
+        normalizeSettings();
+    } catch (error) {
+        all[STSC_MODULE] = previous;
+        if (all[STSC_DEV_MODULE]) all[STSC_DEV_MODULE].enabled = devEnabledBefore;
+        saveSettings();
+        throw error;
+    }
+    // 重复迁入仍保留最初的正式版配置，直到用户恢复它。
+    if (!restore && !all[STSC_DEV_MIGRATION_BACKUP]) all[STSC_DEV_MIGRATION_BACKUP] = previous;
+    if (restore) delete all[STSC_DEV_MIGRATION_BACKUP];
+    editDraft = clone(all[STSC_MODULE]);
+    editDirty = false;
+    dualApiModels = [];
+    dualApiModelsError = '';
+    clearRuntimePrompts();
+    saveSettings();
+    return all[STSC_MODULE];
+}
+
+function openDevMigrationDialog(restore = false) {
+    if (editDirty || pendingRun || dualApiBusy || testBusy) {
+        toastr.warning('请先等生成结束，并保存或放弃未保存的更改，再操作。', '墨提斯之镜');
+        return;
+    }
+    openDialog(restore ? '恢复迁入前的正式版设置' : '从 DEV 迁入设置',
+        `<div class="stsc-muted">${restore
+            ? '将用迁入前自动备份的正式版设置替换当前配置。DEV 设置和聊天记录保持原样。'
+            : '将用同一酒馆保存的 DEV 预设、角色绑定、资料库、快捷指令、API配置及界面设置替换当前正式版配置。迁入前会自动备份，之后可恢复。正式版会启用，DEV 插件开关会关闭。请在两版生成均已结束后操作。'}</div>`,
+        `<button class="menu_button" type="button" data-dialog-action="cancel">取消</button><button class="menu_button" type="button" data-dialog-action="${restore ? 'confirm-restore-dev-migration' : 'confirm-import-dev-settings'}">${restore ? '恢复设置' : '迁入并保存'}</button>`);
+}
+
+function devMigrationSettingsHtml() {
+    const hasDev = Boolean(getDevSettingsForMigration());
+    const hasBackup = Boolean(ctx()?.extensionSettings?.[STSC_DEV_MIGRATION_BACKUP]);
+    if (!hasDev && !hasBackup) return '';
+    return `<div class="stsc-section">
+        <div class="stsc-section-title">DEV 设置迁移</div>
+        <div class="stsc-muted">升级默认沿用正式版设置。如果希望继续使用测试时的配置，可从同一酒馆的 DEV 迁入。迁入前自动备份，API密钥只保存在酒馆设置中。</div>
+        <div class="stsc-toolbar" style="margin-top:9px">
+            ${hasDev ? '<button class="menu_button" type="button" data-action="import-dev-settings">从 DEV 迁入设置</button>' : ''}
+            ${hasBackup ? '<button class="menu_button" type="button" data-action="restore-dev-migration">恢复迁入前的设置</button>' : ''}
+        </div>
+    </div>`;
 }
 
 function getUiSettings() {
@@ -679,7 +1182,7 @@ function commitEditDraft({ notify = true } = {}) {
     if (!savedSettings?.enabled) {
         // 用户关闭插件后立刻终止尚未完成的本轮检测，避免回复完成时被误判为“未输出自检”。
         pendingRun = null;
-        strictBusy = false;
+        dualApiBusy = false;
         clearRuntimePrompts();
     }
     saveSettings();
@@ -687,7 +1190,7 @@ function commitEditDraft({ notify = true } = {}) {
     editDirty = false;
     applyTheme(editDraft);
     renderAll();
-    if (notify) toastr.success('更改已保存。', '写作前置自检');
+    if (notify) toastr.success('更改已保存。', '墨提斯之镜');
 }
 
 function discardEditDraft({ notify = false } = {}) {
@@ -695,7 +1198,7 @@ function discardEditDraft({ notify = false } = {}) {
     editDirty = false;
     applyTheme(editDraft);
     renderAll();
-    if (notify) toastr.info('已放弃未保存的更改。', '写作前置自检');
+    if (notify) toastr.info('已放弃未保存的更改。', '墨提斯之镜');
 }
 
 function updateSaveState() {
@@ -778,7 +1281,7 @@ function visibleRect(selector) {
 
 function floatingViewportMetrics() {
     const button = document.getElementById('stsc_floating_button');
-    const size = Math.max(46, button?.getBoundingClientRect?.().width || 50);
+    const size = Math.max(34, button?.getBoundingClientRect?.().width || 50);
     const compact = window.matchMedia?.('(max-width: 700px)')?.matches;
     const margin = compact ? 8 : 14;
     const viewportHeight = window.visualViewport?.height || window.innerHeight || document.documentElement.clientHeight || 800;
@@ -811,27 +1314,53 @@ function floatingViewportMetrics() {
     return { size, margin, viewportHeight, viewportWidth, minLeft, maxLeft, minTop, maxTop, topSafe, bottomSafe };
 }
 
+function isMobileFloatingLayout(metrics = floatingViewportMetrics()) {
+    const narrowViewport = window.matchMedia?.('(max-width: 700px)')?.matches;
+    const coarsePointer = window.matchMedia?.('(pointer: coarse)')?.matches;
+    const phoneLikeViewport = Math.min(metrics.viewportWidth, metrics.viewportHeight) <= 700
+        && Math.max(metrics.viewportWidth, metrics.viewportHeight) <= 1000;
+    return Boolean(narrowViewport || (coarsePointer && phoneLikeViewport));
+}
+
+function resolveFloatingEdgeDock(left, metrics = floatingViewportMetrics()) {
+    if (!isMobileFloatingLayout(metrics)) return '';
+    const threshold = Math.max(28, metrics.size * 0.7);
+    if (left <= metrics.minLeft + threshold) return 'left';
+    if (left >= metrics.maxLeft - threshold) return 'right';
+    return '';
+}
+
 function applyFloatingPosition(settings = getUiSettings()) {
     const root = document.getElementById('stsc_floating_root');
     if (!root) return;
     const position = settings?.appearance?.floatingPosition || DEFAULT_SETTINGS.appearance.floatingPosition;
-    const { minLeft, maxLeft, minTop, maxTop, viewportWidth, viewportHeight, topSafe, bottomSafe } = floatingViewportMetrics();
+    const metrics = floatingViewportMetrics();
+    const { size, margin, minLeft, maxLeft, minTop, maxTop, viewportWidth, viewportHeight, topSafe, bottomSafe } = metrics;
     const leftRatio = clampNumber(position.leftRatio, 0, 1, 0.82);
     const topRatio = clampNumber(position.topRatio, 0, 1, 0.68);
-    const left = minLeft + (maxLeft - minLeft) * leftRatio;
+    const requestedDock = ['left', 'right'].includes(position.edgeDock) ? position.edgeDock : '';
+    const edgeDock = isMobileFloatingLayout(metrics) ? requestedDock : '';
+    const left = edgeDock === 'left'
+        ? minLeft
+        : edgeDock === 'right'
+            ? maxLeft
+            : minLeft + (maxLeft - minLeft) * leftRatio;
     const top = minTop + (maxTop - minTop) * topRatio;
 
     root.style.setProperty('--stsc-safe-top', `${Math.round(topSafe)}px`);
     root.style.setProperty('--stsc-safe-bottom', `${Math.round(bottomSafe)}px`);
+    root.style.setProperty('--stsc-edge-tuck-offset', `${Math.round(size / 2 + margin)}px`);
     root.style.left = `${Math.round(left)}px`;
     root.style.right = 'auto';
     root.style.top = `${Math.round(top)}px`;
     root.style.bottom = 'auto';
-    root.dataset.horizontal = left + 25 > viewportWidth / 2 ? 'right' : 'left';
-    root.dataset.vertical = top + 25 > viewportHeight / 2 ? 'bottom' : 'top';
+    root.dataset.edgeDock = edgeDock;
+    root.classList.toggle('stsc-mobile-edge-docked', Boolean(edgeDock));
+    root.dataset.horizontal = left + size / 2 > viewportWidth / 2 ? 'right' : 'left';
+    root.dataset.vertical = top + size / 2 > viewportHeight / 2 ? 'bottom' : 'top';
 }
 
-function persistFloatingPosition(left, top) {
+function persistFloatingPosition(left, top, edgeDock = '') {
     const actual = normalizeSettings();
     if (!actual) return;
     const { minLeft, maxLeft, minTop, maxTop } = floatingViewportMetrics();
@@ -840,6 +1369,7 @@ function persistFloatingPosition(left, top) {
     const next = {
         leftRatio: clampNumber((safeLeft - minLeft) / Math.max(1, maxLeft - minLeft), 0, 1, 0.82),
         topRatio: clampNumber((safeTop - minTop) / Math.max(1, maxTop - minTop), 0, 1, 0.68),
+        edgeDock: ['left', 'right'].includes(edgeDock) ? edgeDock : '',
     };
     actual.appearance.floatingPosition = next;
     if (editDraft?.appearance) editDraft.appearance.floatingPosition = clone(next);
@@ -977,6 +1507,7 @@ function beginFloatingDrag(event) {
     const root = document.getElementById('stsc_floating_root');
     const button = document.getElementById('stsc_floating_button');
     if (!root || !button) return;
+    root.classList.add('stsc-floating-dragging');
     const rect = root.getBoundingClientRect();
     floatingDragState = {
         pointerId: event.pointerId,
@@ -987,7 +1518,6 @@ function beginFloatingDrag(event) {
         moved: false,
     };
     button.setPointerCapture?.(event.pointerId);
-    root.classList.add('stsc-floating-dragging');
 }
 
 function moveFloatingDrag(event) {
@@ -1019,16 +1549,23 @@ function endFloatingDrag(event) {
     if (!state || !root || (state.pointerId !== undefined && event.pointerId !== state.pointerId)) return;
     floatingDragState = null;
     button?.releasePointerCapture?.(event.pointerId);
-    root.classList.remove('stsc-floating-dragging');
 
-    if (event.type === 'pointercancel') return;
+    if (event.type === 'pointercancel') {
+        root.classList.remove('stsc-floating-dragging');
+        return;
+    }
 
     if (state.moved) {
         const rect = root.getBoundingClientRect();
-        persistFloatingPosition(rect.left, rect.top);
+        const edgeDock = resolveFloatingEdgeDock(rect.left);
+        persistFloatingPosition(rect.left, rect.top, edgeDock);
+        root.classList.remove('stsc-floating-dragging');
         suppressFloatingClickUntil = Date.now() + 450;
         event.preventDefault();
+        return;
     }
+
+    root.classList.remove('stsc-floating-dragging');
 }
 
 function characterEntityFrom(character, index = '') {
@@ -1125,6 +1662,36 @@ function makeReferenceQuestion(reference) {
     };
 }
 
+function makeDualApiReferenceQuestion(reference) {
+    const config = referenceTypeConfig(reference.type);
+    const name = reference.name || '未命名资料';
+    const textByType = {
+        style: `请根据【${name}】文风资料，完整说明本轮正文具体应如何输出，包括语言风格、句式节奏、描写重点、台词特点以及必须避免的表达。答案必须复述本轮真正需要执行的具体规则，使没有读取该资料的写作模型仅凭答案也能准确执行；不得只回答“遵照资料”“按上述要求”或使用其他模糊指代。`,
+        restriction: `请根据【${name}】限制资料，完整列出本轮必须遵守的限制、禁止出现的内容、允许保留的表现，以及正文应如何具体规避违规。答案必须复述实际限制，使没有读取该资料的写作模型也能独立执行；不得只回答“会遵守”“没有违反”或使用其他模糊指代。`,
+        other: `请根据【${name}】资料，提取与本轮剧情有关的具体信息，并完整说明这些信息将如何影响角色判断、行动、台词、剧情发展或输出格式。答案必须包含正文生成所需的实际内容，使没有读取该资料的写作模型也能独立执行；不得只引用资料名称或使用“按资料处理”等模糊指代。`,
+    };
+
+    return {
+        id: `ref_${reference.id}`,
+        text: textByType[reference.type] || textByType.other,
+        type: 'open',
+        length: 'detailed',
+        requireEvidence: true,
+        enabled: true,
+        source: `参考资料库-${config.label}-${name}`,
+        referenceId: reference.id,
+    };
+}
+
+function getDualApiQuestions(settings = normalizeSettings()) {
+    const questions = getActiveQuestions(settings).map(question => clone(question));
+    const referenceMap = new Map(getActiveReferences(settings).map(reference => [`ref_${reference.id}`, reference]));
+    return questions.map(question => {
+        const reference = referenceMap.get(question.id);
+        return reference ? makeDualApiReferenceQuestion(reference) : question;
+    });
+}
+
 function getActiveQuestions(settings = normalizeSettings()) {
     const result = [];
     const general = settings.presets.find(x => x.id === settings.generalPresetId);
@@ -1181,22 +1748,23 @@ function positionLabel(position) {
 function lengthInstruction(length) {
     return {
         brief: '简短：一句话或非常精炼的结论',
-        standard: '标准：一至三句话，说明结论和必要依据',
-        detailed: '详细：充分说明结论、依据、风险与修正方向',
+        standard: '标准：一至两句话，说明结论和必要依据',
+        detailed: '详细：二至四句话，说明结论、依据、风险与修正方向',
     }[length] || '标准回答';
 }
 
 function buildQuestionXml(questions) {
     return questions.map((question, index) => {
+        const requestId = `q${index + 1}`;
         const typeRule = question.type === 'boolean'
-            ? '判断题：<answer>必须以“是”或“否”开头，再补充具体说明。'
-            : '开放问答题：<answer>必须给出具体结论，不得只写“已注意”“会遵守”。';
+            ? '判断题：answer字段必须以“是”或“否”开头，再补充具体说明。'
+            : '开放问答题：answer字段必须给出具体结论，不得只写“已注意”“会遵守”。';
         const evidenceRule = question.requireEvidence
-            ? '必须另外输出非空的<evidence>，写明可核对的剧情依据、角色设定依据或世界观依据；不得把依据只混写在<answer>里。'
-            : '无需强制输出<evidence>；回答必须明确。';
+            ? '必须另外输出非空的evidence字段，用一句话写明可核对的剧情、角色设定或世界观依据；不得把依据只混写在answer字段里。'
+            : '无需强制输出evidence字段；回答必须明确。';
         const requiredFields = question.requireEvidence ? 'answer,evidence' : 'answer';
         return [
-            `<question id="${escapeXml(question.id)}" index="${index + 1}" evidence_required="${question.requireEvidence ? 'true' : 'false'}">`,
+            `<question id="${requestId}" index="${index + 1}" evidence_required="${question.requireEvidence ? 'true' : 'false'}">`,
             `<text>${escapeXml(question.text)}</text>`,
             `<source>${escapeXml(question.source || '')}</source>`,
             `<type>${typeRule}</type>`,
@@ -1210,30 +1778,31 @@ function buildQuestionXml(questions) {
 
 function buildSinglePrompt(questions) {
     return `
-[写作前置自检插件｜强制执行]
+[墨提斯之镜 插件｜强制执行]
 你必须在输出任何角色扮演正文、对白、动作描写、状态栏、HTML、XML或其他正常正文格式之前，完成下面全部自检问题。
 
-兼容规则：
-- 本插件不得压制、替换、改写或省略用户预设、模型接口或 SillyTavern 原本要求的 thinking / reasoning 内容。
-- 如果原预设要求先输出 <thinking>、<think>、<reasoning> 或其他推理块，请先按原规则完整输出该推理块；随后输出插件自检；最后再输出正文。
-- <stsc_self_check> 只需位于正文之前，不要求位于原生思维链或推理块之前。
+输出边界（必须严格遵守）：
+- 本插件不要求你新增、展示或改写任何模型内部推理。
+- 仅当当前接口或预设原本明确要求输出可见推理区时，才按其原规则输出；必须在插件自检开始前完整关闭全部推理标签。
+- <stsc_self_check> 和最终可见正文必须位于 <think>、<thinking>、<reasoning>、<analysis> 及同类推理标签之外，绝不能被这些标签包裹。
+- 固定顺序只能是：原规则要求的可见推理区（如有且已闭合）→ 插件自检 → 最终可见正文。
 
 执行规则：
 1. 先依据当前角色卡、世界观、聊天记录和用户最后一条消息，逐题形成最终写作结论。
 2. 检查你准备输出的正文是否与任一答案冲突；如有冲突，先修正写作方案，再重新核对。
-3. 自检区只输出最终可供核对的简洁答案，不得把插件问答混入原生 thinking / reasoning 区域。
+3. 自检区只输出最终可供核对的简洁答案，不得把插件问答放入任何推理区。
 4. 不得漏题、合并题目或改变题目编号。
-5. 自检完成前不得开始角色扮演正文；原预设要求的思维链或推理块不属于正文，可正常位于自检之前。
+5. 自检完成前不得开始角色扮演正文；自检结束后直接开始可见正文，不得再用推理标签包住正文。
 6. 对标记 evidence_required="true" 的问题，必须在同一个<item>中同时输出非空的<answer>与<evidence>；缺少<evidence>即视为格式错误。
 7. <answer>只写最终结论与本轮演绎方案；<evidence>单独写支撑该结论的具体剧情、角色设定或世界观依据。
 
 你必须严格输出以下结构：
-（如原预设要求，先正常输出其 thinking / reasoning 内容）
+（仅当原规则明确要求时：先输出并完整闭合其可见推理区；否则不要新增）
 <stsc_self_check>
-无需依据：<item id="题目ID"><answer>最终回答</answer></item>
-需要依据：<item id="题目ID"><answer>最终回答</answer><evidence>具体依据</evidence></item>
+无需依据：<item id="q1"><answer>最终回答</answer></item>
+需要依据：<item id="q2"><answer>最终回答</answer><evidence>具体依据</evidence></item>
 </stsc_self_check>
-紧接着直接输出正文、状态栏以及用户要求的全部正常输出格式。
+紧接着在全部推理标签之外直接输出正文、状态栏以及用户要求的全部正常输出格式。
 正文不得再包裹在任何由本插件添加的标签中。
 
 本轮问题：
@@ -1241,46 +1810,10 @@ ${buildQuestionXml(questions)}
 `.trim();
 }
 
-function buildStrictCheckPrompt(questions) {
-    return `
-这是“双阶段严格模式”的第一阶段。请只完成写作前置自检，不得输出角色扮演正文、对白、动作描写或状态栏。
-
-请结合当前角色卡、世界观、聊天记录和用户最后一条消息，逐题给出最终写作结论。发现潜在冲突时，先调整本轮写作计划，再给出最终答案。本阶段只规定插件自检的输出格式，不修改用户原预设的思维链规则。
-
-严格输出：
-<stsc_self_check>
-无需依据：<item id="题目ID"><answer>最终回答</answer></item>
-需要依据：<item id="题目ID"><answer>最终回答</answer><evidence>具体剧情、角色设定或世界观依据</evidence></item>
-</stsc_self_check>
-
-凡问题标记 evidence_required="true"，<evidence>不得省略、不得为空，也不得只把依据混写在<answer>中。
-
-本轮问题：
-${buildQuestionXml(questions)}
-`.trim();
-}
-
-function buildStrictMainPrompt(questions, checkText) {
-    return `
-[写作前置自检插件｜双阶段严格模式第二阶段]
-下面是本轮已经完成的写作前置自检。你必须严格依据这些结论生成正文，不得与其冲突，也不得重新输出自检内容。
-
-<stsc_completed_self_check>
-${checkText}
-</stsc_completed_self_check>
-
-对应问题：
-${buildQuestionXml(questions)}
-
-按照用户原预设正常输出其要求的 thinking / reasoning 内容、正文、状态栏以及全部正常输出格式。
-不要重复输出 <stsc_self_check>，也不要给正文或原生思维链添加任何由本插件定义的包裹标签。
-`.trim();
-}
-
 function buildReferencePrompt(reference) {
     const config = referenceTypeConfig(reference.type);
     return `
-[写作前置自检插件｜参考资料库｜${config.promptTitle}：${reference.name}]
+[墨提斯之镜 插件｜参考资料库｜${config.promptTitle}：${reference.name}]
 ${config.promptLead}
 
 ${reference.content.trim()}
@@ -1293,7 +1826,7 @@ function buildTemporaryPrompt(instructions) {
         return `${index + 1}. 【${instruction.name}｜${modeLabel}】${instruction.content.trim()}`;
     }).join('\n');
     return `
-[写作前置自检插件｜本轮启用的快捷指令]
+[墨提斯之镜 插件｜本轮启用的快捷指令]
 以下指令必须落实到本次回复中，不得在正文中复述、解释或暴露这些指令：
 ${items}
 `.trim();
@@ -1309,17 +1842,19 @@ function setRuntimePrompt(key, text, config) {
     runtimePromptKeys.add(key);
 }
 
-function clearRuntimePrompts() {
+function clearRuntimePrompt(key) {
     const context = ctx();
     if (!context?.setExtensionPrompt) return;
-    for (const key of runtimePromptKeys) {
-        try {
-            context.setExtensionPrompt(key, '', -1, 0, false, 0);
-        } catch (error) {
-            console.warn('[STSC] 清理注入失败：', key, error);
-        }
+    try {
+        context.setExtensionPrompt(key, '', -1, 0, false, 0);
+    } catch (error) {
+        console.warn('[STSC] 清理注入失败：', key, error);
     }
-    runtimePromptKeys.clear();
+    runtimePromptKeys.delete(key);
+}
+
+function clearRuntimePrompts() {
+    for (const key of [...runtimePromptKeys]) clearRuntimePrompt(key);
 }
 
 function applyReferencePrompts(references) {
@@ -1331,6 +1866,538 @@ function applyReferencePrompts(references) {
 function applyTemporaryPrompt(instructions, injection) {
     if (!instructions.length) return;
     setRuntimePrompt('stsc_one_shot', buildTemporaryPrompt(instructions), injection);
+}
+
+function compactPromptText(value) {
+    return String(value ?? '').replace(/\r\n/g, '\n').trim();
+}
+
+function getCharacterField(character, field) {
+    const direct = character?.[field];
+    const nested = character?.data?.[field];
+    return compactPromptText(direct ?? nested ?? '');
+}
+
+function compactDualApiRetryText(value, limit) {
+    const text = compactPromptText(value);
+    if (text.length <= limit) return text;
+    const half = Math.max(1, Math.floor((limit - 40) / 2));
+    return `${text.slice(0, half)}\n…（精简重试已省略中段）…\n${text.slice(-half)}`;
+}
+
+function formatCharacterCardForDualApi(character, { compact = false } = {}) {
+    if (!character) return '';
+    const fields = [
+        ['角色名称', getCharacterField(character, 'name')],
+        ['角色描述', getCharacterField(character, 'description')],
+        ['性格', getCharacterField(character, 'personality')],
+        ['场景', getCharacterField(character, 'scenario')],
+        ['角色系统提示', getCharacterField(character, 'system_prompt')],
+        ...(!compact ? [
+            ['历史后置指令', getCharacterField(character, 'post_history_instructions')],
+            ['示例对话', getCharacterField(character, 'mes_example')],
+            ['首条消息', getCharacterField(character, 'first_mes')],
+        ] : []),
+    ].filter(([, value]) => value);
+    if (!fields.length) return '';
+    const text = fields.map(([label, value]) => `【${label}】\n${value}`).join('\n\n');
+    return compact ? compactDualApiRetryText(text, 12000) : text;
+}
+
+function getDualApiCharacterContext({ compact = false } = {}) {
+    const context = ctx();
+    if (!context) return '';
+
+    if (!context.groupId) {
+        const character = context.characters?.[Number(context.characterId)];
+        return formatCharacterCardForDualApi(character, { compact });
+    }
+
+    const group = context.groups?.find?.(item => String(item.id) === String(context.groupId));
+    const memberKeys = new Set((group?.members || []).map(value => String(value)));
+    const cards = (context.characters || [])
+        .filter(character => {
+            const avatar = String(character?.avatar || character?.data?.avatar || '');
+            const name = String(character?.name || character?.data?.name || '');
+            return memberKeys.has(avatar) || memberKeys.has(name);
+        })
+        .map(character => formatCharacterCardForDualApi(character, { compact }))
+        .filter(Boolean);
+    const title = group?.name ? `【当前群聊】\n${group.name}` : '【当前群聊】';
+    return [title, ...cards].join('\n\n---\n\n');
+}
+
+function dualApiChatRole(message) {
+    const explicit = String(message?.role || '').toLowerCase();
+    if (['system', 'user', 'assistant'].includes(explicit)) return explicit;
+    if (message?.is_system) return 'system';
+    return message?.is_user ? 'user' : 'assistant';
+}
+
+function dualApiChatContent(message) {
+    const content = message?.mes ?? message?.content ?? '';
+    if (Array.isArray(content)) {
+        return content.map(part => {
+            if (typeof part === 'string') return part;
+            return part?.text || part?.content || '';
+        }).join('\n').trim();
+    }
+    return compactPromptText(content);
+}
+
+function selectDualApiChat(chat, dual) {
+    const source = (Array.isArray(chat) ? clone(chat) : [])
+        .map(message => ({ role: dualApiChatRole(message), content: dualApiChatContent(message) }))
+        .filter(message => message.content);
+    if (!source.length || dual.contextMode === 'all') return source;
+
+    const turns = dual.contextMode === 'custom'
+        ? clampNumber(dual.customTurns, 1, 100, 5)
+        : 5;
+    let currentUserIndex = -1;
+    for (let index = source.length - 1; index >= 0; index--) {
+        if (source[index].role === 'user') {
+            currentUserIndex = index;
+            break;
+        }
+    }
+
+    if (currentUserIndex < 0) {
+        return source.slice(-Math.max(1, turns * 2 + 1));
+    }
+
+    const previous = source.slice(0, currentUserIndex);
+    const previousUserIndices = [];
+    previous.forEach((message, index) => {
+        if (message.role === 'user') previousUserIndices.push(index);
+    });
+    const startIndex = previousUserIndices.length > turns
+        ? previousUserIndices[previousUserIndices.length - turns]
+        : 0;
+    return previous.slice(startIndex).concat(source.slice(currentUserIndex));
+}
+
+function buildDualApiReferenceContext(references, { compact = false } = {}) {
+    if (!references.length) return '（本轮未启用插件参考资料库）';
+    return references.map((reference, index) => {
+        const config = referenceTypeConfig(reference.type);
+        return [
+            `<reference index="${index + 1}" id="${escapeXml(reference.id)}" type="${escapeXml(reference.type)}">`,
+            `<name>${escapeXml(reference.name || '未命名资料')}</name>`,
+            `<category>${escapeXml(config.label)}</category>`,
+            `<content>${escapeXml(compact ? compactDualApiRetryText(reference.content, 6000) : reference.content.trim())}</content>`,
+            `</reference>`,
+        ].join('\n');
+    }).join('\n');
+}
+
+function buildDualApiTemporaryContext(instructions) {
+    if (!instructions.length) return '（本轮未启用快捷指令）';
+    return instructions.map((instruction, index) => `${index + 1}. 【${instruction.name}】${instruction.content.trim()}`).join('\n');
+}
+
+function getReviewSource(settings = normalizeSettings()) {
+    if (!settings?.dualApi?.previousReview) return null;
+    const latest = getLatestResult();
+    if (!latest || latest.mode !== 'dual_api' || latest.chatId !== getCurrentChatId()) return null;
+    const message = ctx()?.chat?.[Number(latest.messageId)];
+    if (!message || message.is_user || message.is_system) return null;
+    return { latest, output: String(message.mes || '').trim() };
+}
+
+function buildPreviousReviewRequest(settings, { compact = false } = {}) {
+    const source = getReviewSource(settings);
+    if (!source) return '';
+    const answers = (source.latest.answers || []).map((item, index) => [
+        `Q${index + 1}：${item.question || ''}`,
+        `A${index + 1}：${compactDualApiRetryText(item.answer || '', compact ? 1200 : 3000)}`,
+        item.evidence ? `依据：${compactDualApiRetryText(item.evidence, compact ? 800 : 2000)}` : '',
+    ].filter(Boolean).join('\n')).join('\n\n');
+    return `
+在回答本轮自检前，必须先复盘上一轮。只报告有明确文本依据的疑似问题；不要为了填满格式而虚构问题。
+
+【上一轮自检】
+${answers || '（没有可读取的上一轮自检问答）'}
+
+【上一轮实际正文】
+${compactDualApiRetryText(source.output || '（没有可读取的上一轮正文）', compact ? 6000 : 18000)}
+`.trim();
+}
+
+function parsePreviousReview(text) {
+    const source = normalizeModelXmlText(text).source;
+    const open = STSC_REVIEW_OPEN_RE.exec(source);
+    if (!open) return null;
+    const afterOpen = open.index + open[0].length;
+    const tail = source.slice(afterOpen);
+    const close = STSC_REVIEW_CLOSE_RE.exec(tail);
+    const selfCheck = STSC_CHECK_OPEN_RE.exec(source);
+    const innerEnd = close ? afterOpen + close.index : (selfCheck?.index || source.length);
+    const inner = source.slice(afterOpen, innerEnd);
+    const status = decodeXmlEntities(inner.match(/<status[^>]*>([\s\S]*?)<\/status>/i)?.[1] || '').trim().toLowerCase();
+    const issues = [];
+    const issueRegex = /<issue\b[^>]*>([\s\S]*?)<\/issue>/gi;
+    let match;
+    while ((match = issueRegex.exec(inner)) !== null && issues.length < 3) {
+        const body = match[1];
+        const field = tag => decodeXmlEntities(body.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'i'))?.[1] || '').trim();
+        const description = field('description');
+        if (description) issues.push({ id: uid('review'), type: field('type') || '疑似问题', description, evidence: field('evidence'), suggestion: field('suggestion'), selected: false });
+    }
+    return { timestamp: Date.now(), status: issues.length || status === 'warning' ? 'warning' : 'ok', issues };
+}
+
+function selectedRepairDirectives() {
+    const issues = getLatestResult()?.previousReview?.issues || [];
+    return issues.filter(item => item.selected).map(item => item.suggestion || item.description).filter(Boolean);
+}
+
+function buildDualApiMessages(chat, questions, references, temporaryInstructions, settings, { compact = false } = {}) {
+    const characterContext = getDualApiCharacterContext({ compact }) || '（没有读取到当前角色卡文本，请主要依据聊天记录、问题与参考资料判断。）';
+    const dualForChat = compact
+        ? { ...settings.dualApi, contextMode: 'custom', customTurns: Math.min(2, settings.dualApi.customTurns || 2) }
+        : settings.dualApi;
+    const selectedChat = selectDualApiChat(chat, dualForChat).map(message => compact
+        ? { ...message, content: compactDualApiRetryText(message.content, 6000) }
+        : message);
+    const reviewRequest = buildPreviousReviewRequest(settings, { compact });
+    const reviewEnabledForThisRun = Boolean(reviewRequest);
+    const requiredOutputSchema = reviewEnabledForThisRun
+        ? `<stsc_previous_review>\n<status>ok或warning</status>\n<!-- status为warning时最多输出3个issue；ok时不要输出issue -->\n<issue><type>简短类型</type><description>疑似问题</description><evidence>上一轮正文中的具体依据</evidence><suggestion>下一轮自然修复建议</suggestion></issue>\n</stsc_previous_review>\n<stsc_self_check>\n<item id="q1"><answer>可独立执行的最终回答</answer></item>\n<item id="q2"><answer>可独立执行的最终回答</answer><evidence>具体依据</evidence></item>\n</stsc_self_check>`
+        : `<stsc_self_check>\n<item id="q1"><answer>可独立执行的最终回答</answer></item>\n<item id="q2"><answer>可独立执行的最终回答</answer><evidence>具体依据</evidence></item>\n</stsc_self_check>`;
+    const repairDirectives = selectedRepairDirectives();
+    const systemPrompt = `
+[墨提斯之镜｜独立自检API]
+你是写作前置自检模型。你的唯一任务是为下一步“酒馆主API”完成本轮自检，不得写角色扮演正文、对白、动作描写、状态栏或续写剧情。
+${compact ? '这是一次自动精简重试：只读取必要角色信息和最近2轮聊天，请优先快速、完整地输出全部题目。' : ''}
+
+工作要求：
+1. 结合角色资料、经过酒馆出站正则处理后的聊天记录、插件参考资料、快捷指令和本轮问题，逐题形成最终写作结论。
+2. 每个答案都必须能直接交给另一个没有看到题目背景或资料原文的写作模型执行。
+3. 尤其是参考资料库问题，必须明确复述本轮具体该怎样写、必须遵守什么、禁止什么，不得只写“遵照资料”“符合要求”“按上述内容执行”等模糊结论。
+4. 不得漏题、合并题目或改变 q1、q2 这类短题号。
+5. 对 evidence_required="true" 的问题，必须输出非空的 <evidence>，写明可核对的角色设定、剧情上下文、资料规则或世界观依据。
+6. 每个答案只写最终结论，控制在1—3句；依据通常只写1句。不要展开思考过程，避免输出过长而截断。
+7. ${reviewEnabledForThisRun ? '必须先完整输出 <stsc_previous_review>，随后输出 <stsc_self_check>；两段都不得省略。' : '只输出 <stsc_self_check>，不得额外输出复盘标签。'}
+8. 除下方指定的XML外，不要输出“无需依据／需要依据”等说明文字、Markdown代码围栏或正文。
+
+严格输出格式：
+${requiredOutputSchema}
+
+【当前角色资料】
+${characterContext}
+
+【本轮启用的插件参考资料库】
+${buildDualApiReferenceContext(references, { compact })}
+
+【本轮启用的快捷指令】
+${buildDualApiTemporaryContext(temporaryInstructions)}
+
+${repairDirectives.length ? `【用户确认的本轮修复方向】\n${repairDirectives.map((item, index) => `${index + 1}. ${item}`).join('\n')}\n修复必须承认上一轮已经发生，不得生硬重置剧情。` : ''}
+
+${reviewEnabledForThisRun ? `【必须完成的上一轮复盘任务】\n${reviewRequest}` : ''}
+`.trim();
+
+    const answerStyleInstruction = settings.dualApi.transformFormat
+        ? `回答将被转换为强力执行规范。每个 <answer> 只写可直接执行的结论：不要重复问题、资料库名称或分析过程；优先使用“必须／不得／应当”等明确措辞，控制在 1—3 条完整规则内。<evidence> 只保留最关键依据，通常 1 句，且不要重复答案。`
+        : `每个 <answer> 必须完整、明确、自包含，不得只回答“是／否”“会遵照”或使用依赖原文才能理解的模糊指代。`;
+
+    const questionPrompt = `
+请现在${reviewEnabledForThisRun ? '先完成上一轮复盘，再完成' : '只完成'}本轮全部自检。回答必须自包含：即使下一步写作模型看不到问题、参考资料原文和你的分析过程，也能仅凭每个 <answer> 准确执行。不得输出正文。
+${answerStyleInstruction}
+
+本轮问题：
+${buildQuestionXml(questions)}
+`.trim();
+
+    return [
+        { role: 'system', content: systemPrompt },
+        ...selectedChat,
+        { role: 'user', content: questionPrompt },
+    ];
+}
+
+function extractDualApiText(payload) {
+    const choices = Array.isArray(payload?.choices) ? payload.choices : [];
+    const first = choices[0] || {};
+    const candidates = [
+        first?.message?.content,
+        first?.message?.reasoning_content,
+        first?.text,
+        payload?.content,
+        payload?.text,
+        payload?.response,
+        payload?.output_text,
+    ];
+    for (const candidate of candidates) {
+        if (Array.isArray(candidate)) {
+            const joined = candidate.map(part => {
+                if (typeof part === 'string') return part;
+                return part?.text || part?.content || part?.value || '';
+            }).join('\n').trim();
+            if (joined) return joined;
+        }
+        const text = compactPromptText(candidate);
+        if (text && text !== '[object Object]') return text;
+    }
+    return '';
+}
+
+function isTransientDualApiFailure(error) {
+    if (error?.transient === true) return true;
+    if (error?.name === 'TypeError') return true;
+    return /(?:429|5\d\d|rate.?limit|too many requests|temporar|overload|network|fetch failed|socket|timeout|超时|限流|繁忙|网络)/i.test(String(error?.message || error || ''));
+}
+
+function dualApiProviderErrorText(payload, responseText = '') {
+    const candidate = payload?.error?.message ?? payload?.message ?? payload?.error ?? responseText;
+    if (candidate && typeof candidate === 'object') {
+        try {
+            return compactPromptText(JSON.stringify(candidate));
+        } catch {
+            return compactPromptText(String(candidate));
+        }
+    }
+    return compactPromptText(candidate);
+}
+
+function waitForDualApiRetry(milliseconds) {
+    return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+async function callDualApiSelfCheck(
+    { chat, questions, references, temporaryInstructions, settings },
+    { compact = false, allowTransientRetry = true, timeoutSecondsOverride = 0 } = {},
+) {
+    const dual = settings.dualApi;
+    const endpoint = normalizeDualApiBaseUrl(dual.endpoint);
+    const model = String(dual.model || '').trim();
+    if (!endpoint) throw new Error('尚未填写有效的自检API接口地址。');
+    if (!model) throw new Error('尚未选择自检模型。请先在设置页获取并选择模型，然后保存。');
+
+    const context = ctx();
+    const configuredTimeout = clampNumber(timeoutSecondsOverride || dual.timeoutSeconds, 60, 300, 150);
+    const maxAttempts = allowTransientRetry && dual.retryTransient ? 2 : 1;
+    let lastError = null;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        const retrying = attempt > 0;
+        const attemptCompact = compact || retrying;
+        const attemptTimeoutSeconds = retrying ? Math.min(configuredTimeout, 60) : configuredTimeout;
+        const controller = new AbortController();
+        const startedAt = Date.now();
+        const timeout = setTimeout(() => controller.abort(), attemptTimeoutSeconds * 1000);
+
+        try {
+            const headers = {
+                'Content-Type': 'application/json',
+                ...(context?.getRequestHeaders?.() || {}),
+            };
+            const response = await fetch('/api/backends/chat-completions/generate', {
+                method: 'POST',
+                headers,
+                signal: controller.signal,
+                body: JSON.stringify({
+                    type: 'quiet',
+                    messages: buildDualApiMessages(chat, questions, references, temporaryInstructions, settings, { compact: attemptCompact }),
+                    model,
+                    temperature: 0.15,
+                    frequency_penalty: 0,
+                    presence_penalty: 0,
+                    top_p: 1,
+                    max_tokens: clampNumber(dual.maxTokens, 256, 12000, 4096),
+                    stream: false,
+                    chat_completion_source: 'openai',
+                    reverse_proxy: endpoint,
+                    proxy_password: String(dual.apiKey || ''),
+                    include_reasoning: false,
+                }),
+            });
+
+            const responseText = await response.text();
+            let payload = {};
+            try {
+                payload = responseText ? JSON.parse(responseText) : {};
+            } catch {
+                payload = { text: responseText };
+            }
+
+            if (!response.ok || payload?.error) {
+                const providerMessage = dualApiProviderErrorText(payload, responseText);
+                const error = new Error(`${response.status ? `HTTP ${response.status}：` : ''}${providerMessage || '自检API返回错误。'}`);
+                error.httpStatus = response.status;
+                error.transient = [408, 425, 429].includes(response.status) || response.status >= 500;
+                throw error;
+            }
+
+            const text = extractDualApiText(payload);
+            if (!text) {
+                const error = new Error('自检API返回成功，但没有读取到任何文本。');
+                error.transient = true;
+                throw error;
+            }
+            return { text, attempts: attempt + 1, compact: attemptCompact };
+        } catch (caught) {
+            let error = caught instanceof Error ? caught : new Error(String(caught || '未知错误'));
+            if (error.name === 'AbortError') {
+                error = new Error(`自检API等待超过${attemptTimeoutSeconds}秒，已超时。`);
+                error.code = 'timeout';
+                error.transient = true;
+            } else if (error.name === 'TypeError') {
+                error.transient = true;
+            }
+            error.elapsedMs = Date.now() - startedAt;
+            error.attempts = attempt + 1;
+            lastError = error;
+
+            if (attempt + 1 >= maxAttempts || !isTransientDualApiFailure(error)) break;
+            await waitForDualApiRetry(error.httpStatus === 429 ? 1500 : 800);
+        } finally {
+            clearTimeout(timeout);
+        }
+    }
+
+    if (lastError && maxAttempts > 1 && lastError.attempts > 1) {
+        lastError.message = `${lastError.message}（已自动精简重试1次，仍未成功）`;
+    }
+    throw lastError || new Error('自检API调用失败。');
+}
+
+function dualApiAnswerRows(questions, parsed) {
+    const answerMap = new Map((parsed?.answers || []).map(answer => [answer.id, answer]));
+    return questions.map((question, index) => {
+        const answer = answerMap.get(question.id) || {};
+        return {
+            index: index + 1,
+            id: question.id,
+            question: question.text,
+            source: question.source || '',
+            answer: compactPromptText(answer.answer),
+            evidence: compactPromptText(answer.evidence),
+        };
+    });
+}
+
+function buildDualApiRawInjection(questions, parsed) {
+    const rows = dualApiAnswerRows(questions, parsed).filter(row => row.answer);
+    if (!rows.length) return '';
+
+    const content = rows.map(row => [
+        `Q${row.index}：${row.question}`,
+        `A${row.index}：${row.answer}`,
+        row.evidence ? `A${row.index}依据：${row.evidence}` : '',
+    ].filter(Boolean).join('\n')).join('\n\n');
+
+    return `
+[墨提斯之镜｜本轮已完成独立自检]
+以下内容是我在生成正文前已经完成的本轮自检结论。接下来必须依据这些结论继续写作，不得忽略、否定或绕过；不要在最终回复中重复、解释或展示自检内容。
+
+输出边界：本插件不要求新增或展示思维链。若当前接口或预设原本要求可见推理区，必须先完整关闭推理标签；最终可见正文必须位于 <think>、<thinking>、<reasoning>、<analysis> 及同类推理标签之外。
+
+${content}
+
+现在依据以上结论，按照当前角色卡、酒馆预设、世界观和用户最后一条消息生成最终正文。
+`.trim();
+}
+
+function yamlQuoted(value) {
+    return JSON.stringify(compactPromptText(value));
+}
+
+function buildDualApiContractInjection(questions, parsed) {
+    const rows = dualApiAnswerRows(questions, parsed).filter(row => row.answer);
+    if (!rows.length) return '';
+
+    const rules = rows.map(row => [
+        `    - instruction: ${yamlQuoted(row.answer)}`,
+        row.evidence ? `      basis: ${yamlQuoted(row.evidence)}` : '',
+    ].filter(Boolean).join('\n')).join('\n');
+
+    return `
+[墨提斯之镜｜本轮写作执行规范]
+以下YAML是本轮正文必须执行的内部规范。不得冲突、弱化或绕过；不得在最终回复中复述、解释或暴露这份规范。
+STSC_EXECUTION_CONTRACT:
+  priority: mandatory
+  disclosure: forbidden
+  output_boundary:
+    require_new_reasoning: false
+    close_visible_reasoning_before_final: true
+    final_visible_response_outside_reasoning: true
+  rules:
+${rules}
+`.trim();
+}
+
+function applyDualApiMainPrompt(questions, parsed, rawCheck, settings) {
+    const transform = Boolean(settings.dualApi.transformFormat);
+    let text = transform
+        ? buildDualApiContractInjection(questions, parsed)
+        : buildDualApiRawInjection(questions, parsed);
+    const repairs = selectedRepairDirectives();
+    if (repairs.length) {
+        text += `\n\n<stsc_repair_directives>\n以下是用户确认需要在本轮自然修复的问题。必须承认已经发生的剧情，不得重写或生硬重置上一轮。\n${repairs.map(item => `<repair>${wrapXmlCdata(item)}</repair>`).join('\n')}\n</stsc_repair_directives>`;
+    }
+
+    if (!text) {
+        clearRuntimePrompt('stsc_dual_main');
+        return;
+    }
+
+    setRuntimePrompt('stsc_dual_main', text, {
+        position: 'chat',
+        depth: 0,
+        role: transform ? 'system' : 'assistant',
+    });
+}
+
+function dualApiFailureMessage(error) {
+    const raw = compactPromptText(error?.message || error || '没有收到具体原因');
+    const status = Number(error?.httpStatus) || Number(raw.match(/HTTP\s*(\d{3})/i)?.[1]) || 0;
+    const seconds = Number.isFinite(error?.elapsedMs) ? Math.max(1, Math.round(error.elapsedMs / 1000)) : 0;
+    const retried = Number(error?.attempts) > 1 || /重试/.test(raw);
+    let message = '';
+
+    if (/格式不完整|识别到\s*\d+\/\d+|缺少回答|必要依据/.test(raw)) {
+        message = '自检API有返回内容，但题目没有答全，或缺少必须提供的依据。';
+    } else if (/超时|timeout|timed out|AbortError|超过\s*\d+\s*秒/i.test(raw)) {
+        message = `等待自检API${seconds ? `约 ${seconds} 秒` : '很久'}仍没有收到回答，通常是接口太慢或网络不稳定。`;
+    } else if (status === 401 || status === 403 || /密钥|认证|授权|unauthori|forbidden/i.test(raw)) {
+        message = `自检API拒绝了请求${status ? `（返回 ${status}）` : ''}，通常是API密钥错误、已经失效，或账号没有使用该模型的权限。`;
+    } else if (status === 404) {
+        message = '没有找到自检API地址（返回 404），请检查接口地址是否填对，以及地址末尾是否需要 /v1。';
+    } else if (status === 429 || /限流|请求过多|rate.?limit|quota|额度/i.test(raw)) {
+        message = '自检API暂时拒绝了请求（返回 429），通常是请求太频繁、并发过高或账号额度不足。';
+    } else if (status >= 500 || /bad gateway|service unavailable|gateway timeout/i.test(raw)) {
+        message = `自检API服务端出错${status ? `（返回 ${status}）` : ''}，不是插件格式问题；可以稍后重试或更换接口线路。`;
+    } else if (/Failed to fetch|NetworkError|fetch failed|network|ECONN|ENOTFOUND|连接失败/i.test(raw)) {
+        message = '没有连接上自检API，请检查网络、接口地址以及反向代理是否可用。';
+    } else if (/model|模型/i.test(raw)) {
+        message = `自检API没有接受当前模型设置。请重新获取模型列表并确认所选模型仍然可用。原始提示：${raw}`;
+    } else {
+        message = `自检API没有成功完成请求。接口给出的提示是：${raw}`;
+    }
+
+    if (retried) message += ' 插件已经自动精简内容并重试过一次，仍然没有成功。';
+    return message;
+}
+
+function dualParsedMissingRequirements(parsed, questions) {
+    const answerMap = new Map((parsed?.answers || []).map(answer => [answer.id, answer]));
+    return questions.filter(question => {
+        const answer = answerMap.get(question.id);
+        if (!answer?.answer?.trim()) return true;
+        return Boolean(question.requireEvidence && !answer.evidence?.trim());
+    });
+}
+
+function dualParsedIsComplete(parsed, questions) {
+    return Boolean(questions.length && dualParsedMissingRequirements(parsed, questions).length === 0);
+}
+
+function dualIncompleteMessage(parsed, questions) {
+    const answered = (parsed?.answers || []).filter(answer => answer.answer?.trim()).length;
+    const missing = dualParsedMissingRequirements(parsed, questions).length;
+    return `自检API返回格式不完整：识别到 ${answered}/${questions.length} 题，仍有 ${missing} 题缺少回答或必要依据。`;
 }
 
 async function saveLatestResult(result) {
@@ -1360,18 +2427,38 @@ async function markLatestIssueViewed() {
     await saveLatestResult(latest);
 }
 
+function normalizeModelXmlText(text) {
+    let source = String(text ?? '')
+        .replace(/^\s*```(?:xml)?\s*/i, '')
+        .replace(/\s*```\s*$/i, '')
+        .trim();
+    let decodedOuterXml = false;
+    if (!STSC_CHECK_OPEN_RE.test(source) && /&lt;\s*stsc_self_check\b/i.test(source)) {
+        source = decodeXmlEntities(source).trim();
+        decodedOuterXml = true;
+    }
+    return { source, decodedOuterXml };
+}
+
+function readItemAttribute(attributes, name) {
+    const match = String(attributes || '').match(new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'=<>]+))`, 'i'));
+    return decodeXmlEntities(match?.[1] ?? match?.[2] ?? match?.[3] ?? '').trim();
+}
+
 function parseItems(checkInner) {
     const items = [];
-    const itemRegex = /<item\s+[^>]*id=["']([^"']+)["'][^>]*>([\s\S]*?)<\/item>/gi;
+    const itemRegex = /<item\b([^>]*)>([\s\S]*?)<\/item>/gi;
     let match;
     while ((match = itemRegex.exec(checkInner)) !== null) {
-        const id = match[1].trim();
+        const attributes = match[1];
+        const id = readItemAttribute(attributes, 'id');
+        const index = Number.parseInt(readItemAttribute(attributes, 'index'), 10) || 0;
         const itemBody = match[2];
-        const answerMatch = itemBody.match(/<answer[^>]*>([\s\S]*?)<\/answer>/i);
-        const evidenceMatch = itemBody.match(/<evidence[^>]*>([\s\S]*?)<\/evidence>/i);
-        const answer = (answerMatch?.[1] ?? '').trim();
-        const evidence = (evidenceMatch?.[1] ?? '').trim();
-        items.push({ id, answer, evidence });
+        const answerMatch = itemBody.match(/<answer\b[^>]*>([\s\S]*?)<\/answer>/i);
+        const evidenceMatch = itemBody.match(/<evidence\b[^>]*>([\s\S]*?)<\/evidence>/i);
+        const answer = decodeXmlEntities(answerMatch?.[1] ?? '').trim();
+        const evidence = decodeXmlEntities(evidenceMatch?.[1] ?? '').trim();
+        items.push({ id, index, answer, evidence });
     }
     return items;
 }
@@ -1399,22 +2486,109 @@ function removeSelfCheckBlocks(text) {
         .trim();
 }
 
+function unmatchedVisibleReasoningTags(text) {
+    const stack = [];
+    const tagPattern = /<\/?(think|thinking|reasoning|analysis)\b[^>]*>/gi;
+    for (const match of String(text ?? '').matchAll(tagPattern)) {
+        const rawTag = match[0];
+        const tag = match[1].toLowerCase();
+        if (/^<\//.test(rawTag)) {
+            const matchingOpen = stack.lastIndexOf(tag);
+            if (matchingOpen >= 0) stack.splice(matchingOpen, 1);
+        } else if (!/\/\s*>$/.test(rawTag)) {
+            stack.push(tag);
+        }
+    }
+    return stack;
+}
+
+function removeFirstOrphanReasoningClose(text, tag) {
+    const source = String(text ?? '');
+    const tagPattern = new RegExp(`<\\/?${tag}\\b[^>]*>`, 'gi');
+    let nestedDepth = 0;
+    let match;
+    while ((match = tagPattern.exec(source)) !== null) {
+        const rawTag = match[0];
+        if (/^<\//.test(rawTag)) {
+            if (nestedDepth === 0) {
+                return `${source.slice(0, match.index)}${source.slice(match.index + rawTag.length)}`;
+            }
+            nestedDepth -= 1;
+        } else if (!/\/\s*>$/.test(rawTag)) {
+            nestedDepth += 1;
+        }
+    }
+    return source;
+}
+
+function repairReasoningBoundaryAroundSelfCheck(text) {
+    const source = String(text ?? '');
+    const openMatch = STSC_CHECK_OPEN_RE.exec(source);
+    if (!openMatch) return { text: source, repairedTags: [] };
+
+    const afterOpenStart = openMatch.index + openMatch[0].length;
+    const afterOpen = source.slice(afterOpenStart);
+    const closeMatch = STSC_CHECK_CLOSE_RE.exec(afterOpen);
+    if (!closeMatch) return { text: source, repairedTags: [] };
+
+    const closeEnd = afterOpenStart + closeMatch.index + closeMatch[0].length;
+    const prefix = source.slice(0, openMatch.index);
+    const selfCheckBlock = source.slice(openMatch.index, closeEnd);
+    let suffix = source.slice(closeEnd);
+    const activeTags = unmatchedVisibleReasoningTags(prefix);
+    if (!activeTags.length) return { text: source, repairedTags: [] };
+
+    const closingOrder = activeTags.slice().reverse();
+    for (const tag of closingOrder) suffix = removeFirstOrphanReasoningClose(suffix, tag);
+    const boundary = `${prefix && !/\s$/.test(prefix) ? '\n' : ''}${closingOrder.map(tag => `</${tag}>`).join('\n')}\n`;
+    return {
+        text: `${prefix}${boundary}${selfCheckBlock}${suffix}`,
+        repairedTags: [...new Set(closingOrder)],
+    };
+}
+
+function visibleResponseReasoningWrapper(text) {
+    const source = String(text ?? '').trim();
+    const openMatch = /^<(think|thinking|reasoning|analysis)\b[^>]*>/i.exec(source);
+    if (!openMatch) return '';
+
+    const tag = openMatch[1].toLowerCase();
+    const tagPattern = new RegExp(`<\\/?${tag}\\b[^>]*>`, 'ig');
+    let depth = 0;
+    let match;
+    while ((match = tagPattern.exec(source)) !== null) {
+        if (/^<\//.test(match[0])) {
+            depth -= 1;
+            if (depth === 0) {
+                return source.slice(match.index + match[0].length).trim() ? '' : tag;
+            }
+        } else if (!/\/\s*>$/.test(match[0])) {
+            depth += 1;
+        }
+    }
+    return tag;
+}
+
 function extractVisibleBody(text) {
     // 自检标签未闭合时不做破坏性裁切，避免误吞原生思维链或后续正文。
     return removeSelfCheckBlocks(text);
 }
 
 function parseModelOutput(text, expectedQuestions = []) {
-    const source = String(text ?? '');
+    const normalized = normalizeModelXmlText(text);
+    const reasoningBoundaryRepair = repairReasoningBoundaryAroundSelfCheck(normalized.source);
+    const source = reasoningBoundaryRepair.text;
     const openMatch = STSC_CHECK_OPEN_RE.exec(source);
     const closeMatch = STSC_CHECK_CLOSE_RE.exec(source);
     const result = {
         status: 'missing',
         formatIssues: [],
+        recoveryNotes: [],
         rawCheck: '',
         body: extractVisibleBody(source),
         items: [],
         answers: [],
+        repaired: false,
     };
 
     if (!openMatch) {
@@ -1422,22 +2596,41 @@ function parseModelOutput(text, expectedQuestions = []) {
         return result;
     }
 
-    if (!closeMatch || closeMatch.index < openMatch.index) {
-        result.status = 'format_error';
-        result.formatIssues.push('自检标签没有正确闭合。');
-        return result;
-    }
-
     const innerStart = openMatch.index + openMatch[0].length;
-    const inner = source.slice(innerStart, closeMatch.index).trim();
+    const hasUsableClose = Boolean(closeMatch && closeMatch.index >= openMatch.index);
+    const innerEnd = hasUsableClose ? closeMatch.index : source.length;
+    const inner = source.slice(innerStart, innerEnd).trim();
+    if (!hasUsableClose) {
+        result.repaired = true;
+        result.recoveryNotes.push('自检结束标签缺失，插件已按返回文本末尾自动补全并继续解析。');
+    }
+    if (normalized.decodedOuterXml) {
+        result.repaired = true;
+        result.recoveryNotes.push('自检XML被转义，插件已自动还原后解析。');
+    }
+    if (reasoningBoundaryRepair.repairedTags.length) {
+        result.repaired = true;
+        result.recoveryNotes.push('AI把正文错误包在思维链标签内，插件已在自检开始前闭合推理区，并把正文保留在思维链外。');
+    }
     result.rawCheck = inner;
     result.items = parseItems(inner);
     // 仅精准移除 <stsc_self_check>…</stsc_self_check>，保留它之前的原生 thinking / reasoning 与之后的正文。
     result.body = extractVisibleBody(source);
 
-    const itemMap = new Map(result.items.map(item => [item.id, item]));
-    result.answers = expectedQuestions.map(question => {
-        const item = itemMap.get(question.id) || {};
+    const usedItems = new Set();
+    let usedOrderFallback = false;
+    result.answers = expectedQuestions.map((question, questionIndex) => {
+        const aliases = new Set([String(question.id || '').toLowerCase(), `q${questionIndex + 1}`, String(questionIndex + 1)]);
+        let itemIndex = result.items.findIndex((item, index) => !usedItems.has(index) && item.id && aliases.has(item.id.toLowerCase()));
+        if (itemIndex < 0) {
+            itemIndex = result.items.findIndex((item, index) => !usedItems.has(index) && item.index === questionIndex + 1);
+        }
+        if (itemIndex < 0 && result.items[questionIndex] && !usedItems.has(questionIndex)) {
+            itemIndex = questionIndex;
+            usedOrderFallback = true;
+        }
+        const item = itemIndex >= 0 ? result.items[itemIndex] : {};
+        if (itemIndex >= 0) usedItems.add(itemIndex);
         return {
             id: question.id,
             question: question.text,
@@ -1448,6 +2641,10 @@ function parseModelOutput(text, expectedQuestions = []) {
             evidence: item.evidence || '',
         };
     });
+    if (usedOrderFallback) {
+        result.repaired = true;
+        result.recoveryNotes.push('部分题号与预期不一致，插件已按输出顺序恢复对应关系。');
+    }
 
     for (const answer of result.answers) {
         if (!answer.answer.trim()) {
@@ -1465,7 +2662,12 @@ function parseModelOutput(text, expectedQuestions = []) {
         result.formatIssues.push(`应回答 ${expectedQuestions.length} 题，实际识别到 ${result.items.length} 题。`);
     }
 
-    result.status = result.formatIssues.length ? 'format_error' : 'ok';
+    const reasoningWrapper = visibleResponseReasoningWrapper(result.body);
+    if (reasoningWrapper) {
+        result.formatIssues.push(`最终正文仍被 <${reasoningWrapper}> 推理标签包裹；插件无法安全判断标签内部的正文起点，因此没有强行删除内容。`);
+    }
+
+    result.status = result.formatIssues.length ? 'format_error' : (result.repaired ? 'recovered' : 'ok');
     return result;
 }
 
@@ -1498,12 +2700,12 @@ function refreshMessageDom(messageId, message) {
     }
 }
 
-function makeLatestResult({ parsed, questions, mode, messageId, strictRaw = '', strictStatus = '' }) {
+function makeLatestResult({ parsed, questions, mode, messageId, rawOverride = '', statusOverride = '' }) {
     const entity = getCurrentEntity();
     const boundPreset = getBoundPreset();
     const settings = normalizeSettings();
 
-    const status = strictStatus || parsed.status;
+    const status = statusOverride || parsed.status;
     return {
         version: STSC_VERSION,
         timestamp: Date.now(),
@@ -1515,7 +2717,8 @@ function makeLatestResult({ parsed, questions, mode, messageId, strictRaw = '', 
         status,
         issueViewed: !['missing', 'format_error'].includes(status),
         formatIssues: parsed.formatIssues || [],
-        rawCheck: strictRaw || parsed.rawCheck || '',
+        recoveryNotes: parsed.recoveryNotes || [],
+        rawCheck: rawOverride || parsed.rawCheck || '',
         answers: parsed.answers || [],
         expectedCount: questions.length,
         answeredCount: (parsed.answers || []).filter(x => x.answer?.trim()).length,
@@ -1530,6 +2733,8 @@ function statusText(status) {
         format_error: '本轮自检格式有误',
         missing: '本轮AI未输出自检问答',
         strict_ok: '双阶段自检已完成',
+        dual_ok: '双API自检已完成',
+        recovered: '自检格式已自动修复',
     }[status] || '暂无状态';
 }
 
@@ -1537,13 +2742,15 @@ function statusIcon(status) {
     return {
         ok: '✓',
         strict_ok: '✓',
+        dual_ok: '✓',
+        recovered: '✓',
         format_error: '⚠',
         missing: '!',
     }[status] || '○';
 }
 
 function statusClass(status) {
-    if (status === 'ok' || status === 'strict_ok') return 'stsc-status-ok';
+    if (status === 'ok' || status === 'strict_ok' || status === 'dual_ok' || status === 'recovered') return 'stsc-status-ok';
     if (status === 'format_error') return 'stsc-status-warning';
     if (status === 'missing') return 'stsc-status-error';
     return '';
@@ -1556,7 +2763,6 @@ async function handleMessageReceived(data) {
     if (!settings?.enabled) {
         // 插件关闭时不读取、不解析、不改写任何AI回复，也不生成缺失/格式错误提示。
         pendingRun = null;
-        strictBusy = false;
         clearRuntimePrompts();
         return;
     }
@@ -1575,24 +2781,32 @@ async function handleMessageReceived(data) {
     let parsed;
     let latest;
 
-    if (mode === 'strict' && run?.strictCheck) {
+    if (mode === 'dual_api' && run?.dualCheck) {
         const mainParsed = parseModelOutput(rawText, []);
         const body = mainParsed.status === 'missing' ? String(rawText ?? '').trim() : mainParsed.body;
         updateMessageText(message, body);
 
-        const checkParsed = run.strictParsed || parseModelOutput(run.strictCheck, questions);
-        const strictStatus = checkParsed.status === 'ok' ? 'strict_ok' : 'format_error';
+        const checkParsed = run.dualParsed || parseModelOutput(run.dualCheck, questions);
+        const dualStatus = checkParsed.status === 'ok' ? 'dual_ok' : checkParsed.status;
         latest = makeLatestResult({
             parsed: checkParsed,
             questions,
             mode,
             messageId,
-            strictRaw: checkParsed.rawCheck || run.strictCheck,
-            strictStatus,
+            rawOverride: checkParsed.rawCheck || run.dualCheck,
+            statusOverride: dualStatus,
         });
+        latest.previousReview = run.previousReview || null;
+        const mainReasoningWrapper = visibleResponseReasoningWrapper(body);
+        if (mainReasoningWrapper) {
+            latest.formatIssues.push(`酒馆主API把整段可见回复放进了 <${mainReasoningWrapper}> 思维链标签；插件无法安全判断正文起点，因此没有强行删除内容。`);
+            latest.status = 'format_error';
+            latest.issueViewed = false;
+        }
         if (mainParsed.status !== 'missing') {
-            latest.formatIssues.push('第二阶段意外重复输出了自检内容，插件已自动移除。');
-            if (latest.status === 'strict_ok') latest.status = 'format_error';
+            latest.formatIssues.push('酒馆主API意外重复输出了自检内容，插件已自动移除。');
+            if (latest.status === 'dual_ok') latest.status = 'format_error';
+            latest.issueViewed = false;
         }
     } else {
         parsed = parseModelOutput(rawText, questions);
@@ -1602,6 +2816,7 @@ async function handleMessageReceived(data) {
 
     refreshMessageDom(messageId, message);
     await saveLatestResult(latest);
+    addGenerationResultLog(latest, message.mes || '');
 
     try {
         await context.saveChat?.();
@@ -1624,6 +2839,9 @@ function onGenerationEnded() {
     // 极端情况下没有收到最终消息事件，避免运行状态永久残留。
     setTimeout(() => {
         if (pendingRun && Date.now() - pendingRun.startedAt > 4500) {
+            const character = runtimeCharacterLabel({ characterName: pendingRun.characterName || '' });
+            const mode = pendingRun.mode === 'dual_api' ? '双API' : '单API';
+            addRuntimeLog('error', '本轮结果', `${character}：本轮生成已经结束，但插件没有收到可保存的AI正文。`, `本轮原本使用${mode}模式。请重新生成；如果连续发生，请检查主API连接和酒馆控制台。`);
             pendingRun = null;
         }
     }, 5000);
@@ -1631,8 +2849,12 @@ function onGenerationEnded() {
 
 function onGenerationStopped() {
     clearRuntimePrompts();
+    if (pendingRun) {
+        const character = runtimeCharacterLabel({ characterName: pendingRun.characterName || '' });
+        addRuntimeLog('warning', '本轮结果', `${character}：本轮生成在完成前被停止，没有形成完整结果。`, '如果这是你手动停止的，可以忽略；如果不是，请检查主API连接是否中断。');
+    }
     pendingRun = null;
-    strictBusy = false;
+    dualApiBusy = false;
 }
 
 function skipGenerationType(type) {
@@ -1668,46 +2890,127 @@ globalThis.sillyTavernSelfCheckInterceptor = async function (_chat, _contextSize
     pendingRun = {
         mode: settings.mode,
         questions: clone(questions),
+        characterName: getCurrentEntity()?.name || '',
         startedAt: Date.now(),
         generationType: type,
-        strictCheck: '',
-        strictParsed: null,
+        dualCheck: '',
+        dualParsed: null,
+        previousReview: null,
         targetMessageFloor,
     };
 
-    if (settings.mode === 'strict') {
-        if (strictBusy) return;
-        strictBusy = true;
-        try {
-            const prompt = buildStrictCheckPrompt(questions);
-            internalQuietActive = true;
-            const raw = await context.generateQuietPrompt({ quietPrompt: prompt });
-            internalQuietActive = false;
-            const strictCheck = String(raw || '').trim();
-            if (!strictCheck) {
-                abort?.(true);
-                pendingRun = null;
-                toastr.error('第一阶段没有得到自检结果，已取消正文生成。', '写作前置自检');
-                return;
-            }
-            const strictParsed = parseModelOutput(strictCheck, questions);
-            pendingRun.strictCheck = strictCheck;
-            pendingRun.strictParsed = strictParsed;
-
-            // The internal quiet generation emits its own generation-ended event,
-            // so restore all prompts needed by the real second-stage generation.
-            clearRuntimePrompts();
-            applyReferencePrompts(references);
-            applyTemporaryPrompt(temporaryInstructions, settings.injection);
-            setRuntimePrompt('stsc_main', buildStrictMainPrompt(questions, strictParsed.rawCheck || strictCheck), settings.injection);
-        } catch (error) {
-            internalQuietActive = false;
-            console.error('[STSC] 双阶段第一阶段失败：', error);
+    if (settings.mode === 'dual_api') {
+        if (dualApiBusy) {
             abort?.(true);
             pendingRun = null;
-            toastr.error('双阶段自检调用失败，已取消正文生成。', '写作前置自检');
+            toastr.warning('上一轮独立自检仍在处理中，请稍后再试。', '墨提斯之镜');
+            return;
+        }
+        dualApiBusy = true;
+        try {
+            const dualQuestions = getDualApiQuestions(settings);
+            const reviewExpected = Boolean(getReviewSource(settings));
+            pendingRun.questions = clone(dualQuestions);
+            const initialResponse = await callDualApiSelfCheck({
+                chat: _chat,
+                questions: dualQuestions,
+                references,
+                temporaryInstructions,
+                settings,
+            });
+            let rawCheck = initialResponse.text;
+            let dualParsed = parseModelOutput(rawCheck, dualQuestions);
+            let previousReview = parsePreviousReview(rawCheck);
+            const initialSelfCheckComplete = dualParsedIsComplete(dualParsed, dualQuestions);
+            const initialReviewMissing = reviewExpected && !previousReview;
+
+            if ((!initialSelfCheckComplete || initialReviewMissing) && settings.dualApi.retryTransient && initialResponse.attempts === 1) {
+                const firstIncomplete = initialSelfCheckComplete ? '' : dualIncompleteMessage(dualParsed, dualQuestions);
+                try {
+                    const retryResponse = await callDualApiSelfCheck({
+                        chat: _chat,
+                        questions: dualQuestions,
+                        references,
+                        temporaryInstructions,
+                        settings,
+                    }, { compact: true, allowTransientRetry: false, timeoutSecondsOverride: 60 });
+                    const retryRawCheck = retryResponse.text;
+                    const retryParsed = parseModelOutput(retryRawCheck, dualQuestions);
+                    const retryReview = parsePreviousReview(retryRawCheck);
+                    const retrySelfCheckComplete = dualParsedIsComplete(retryParsed, dualQuestions);
+                    if (retrySelfCheckComplete && (!initialSelfCheckComplete || retryReview)) {
+                        rawCheck = retryRawCheck;
+                        dualParsed = retryParsed;
+                        previousReview = retryReview || previousReview;
+                        dualParsed.repaired = true;
+                        dualParsed.recoveryNotes ||= [];
+                        dualParsed.recoveryNotes.push(initialSelfCheckComplete
+                            ? '首次返回漏掉上一轮复盘，插件已通过精简上下文重试取得复盘结果。'
+                            : '首次返回不完整，插件已通过精简上下文重试并取得完整自检结果。');
+                        if (dualParsed.status === 'ok') dualParsed.status = 'recovered';
+                    } else if (initialSelfCheckComplete && retryReview) {
+                        previousReview = retryReview;
+                        dualParsed.recoveryNotes ||= [];
+                        dualParsed.recoveryNotes.push('插件已从精简重试中恢复上一轮复盘，并保留首次返回的完整本轮自检。');
+                    } else if (!initialSelfCheckComplete) {
+                        throw new Error(`${firstIncomplete} 精简重试后仍然不完整：${dualIncompleteMessage(retryParsed, dualQuestions)}`);
+                    } else {
+                        dualParsed.recoveryNotes ||= [];
+                        dualParsed.recoveryNotes.push('插件已重试上一轮复盘，但模型仍未返回复盘标签。');
+                    }
+                } catch (retryError) {
+                    if (!initialSelfCheckComplete) {
+                        if (String(retryError?.message || '').startsWith(firstIncomplete)) throw retryError;
+                        throw new Error(`${firstIncomplete} 精简重试失败：${dualApiFailureMessage(retryError)}`);
+                    }
+                    dualParsed.recoveryNotes ||= [];
+                    dualParsed.recoveryNotes.push(`上一轮复盘重试失败：${dualApiFailureMessage(retryError)}`);
+                }
+            }
+
+            if (!dualParsedIsComplete(dualParsed, dualQuestions)) {
+                throw new Error(dualIncompleteMessage(dualParsed, dualQuestions));
+            }
+            if (dualParsed.status === 'missing') {
+                dualParsed.status = 'format_error';
+                dualParsed.formatIssues.push('独立自检API返回了文本，但没有按要求输出 <stsc_self_check> 结构。');
+            }
+            if (reviewExpected && !previousReview) {
+                previousReview = {
+                    timestamp: Date.now(),
+                    status: 'missing',
+                    issues: [],
+                    reason: '自检API没有按要求返回 <stsc_previous_review> 复盘标签；本轮自检与正文仍正常完成。',
+                };
+            }
+            pendingRun.dualCheck = rawCheck;
+            pendingRun.dualParsed = dualParsed;
+            pendingRun.previousReview = previousReview;
+            pendingRun.mode = 'dual_api';
+            applyDualApiMainPrompt(dualQuestions, dualParsed, rawCheck, settings);
+            if (dualParsed.status === 'format_error') {
+                toastr.warning('独立自检API已经返回结果，但格式不完整。本轮仍会把结果交给酒馆主API，并在自检记录中标记格式问题。', '墨提斯之镜', { timeOut: 7000 });
+            }
+        } catch (error) {
+            console.error('[STSC] 双API自检调用失败：', error);
+            const reason = dualApiFailureMessage(error);
+            const character = runtimeCharacterLabel({ characterName: getCurrentEntity()?.name || '' });
+            if (settings.dualApi.failureMode === 'fallback_single') {
+                addRuntimeLog('warning', '自检API', `${character}：${reason}`, '插件已经自动改用单API继续生成，本轮不会直接中断。');
+                pendingRun.mode = 'single';
+                pendingRun.questions = clone(questions);
+                setRuntimePrompt('stsc_main', buildSinglePrompt(questions), settings.injection);
+                toastr.warning(`独立自检API调用失败，已自动退回单API模式。原因：${reason}`, '墨提斯之镜', { timeOut: 9000 });
+            } else {
+                addRuntimeLog('error', '自检API', `${character}：${reason}`, '当前设置要求双API失败时停止，因此本轮生成已经停止。');
+                abort?.(true);
+                pendingRun = null;
+                clearRuntimePrompts();
+                toastr.error(`独立自检API调用失败，本轮生成已停止。原因：${reason}`, '墨提斯之镜', { timeOut: 9000 });
+                return;
+            }
         } finally {
-            strictBusy = false;
+            dualApiBusy = false;
         }
     } else {
         setRuntimePrompt('stsc_main', buildSinglePrompt(questions), settings.injection);
@@ -1734,6 +3037,16 @@ function activeSummary(settings = getUiSettings()) {
         temps,
         presetText: parts.join(' ＋ '),
     };
+}
+
+function generationModeLabel(mode, detailed = false) {
+    const labels = {
+        single: detailed ? '单API调用（一次调用）' : '单API调用',
+        dual_api: detailed ? '双API调用（插件API自检＋酒馆主API正文）' : '双API调用',
+        // 仅用于兼容旧聊天中已经保存的历史模式名称，不再作为可选或可执行模式。
+        strict: detailed ? '旧双阶段模式（已移除）' : '旧双阶段模式',
+    };
+    return labels[mode] || labels.single;
 }
 
 function renderCompact() {
@@ -1804,7 +3117,7 @@ function renderStatusTab() {
         latestHtml = `
             <div class="stsc-meta-row">
                 <span class="stsc-status-pill ${statusClass(latest.status)}">${statusIcon(latest.status)} ${escapeHtml(statusText(latest.status))}</span>
-                <span class="stsc-status-pill">${latest.mode === 'strict' ? '双阶段严格模式' : '单次模式'}</span>
+                <span class="stsc-status-pill">${escapeHtml(generationModeLabel(latest.mode))}</span>
                 <span class="stsc-status-pill">${latest.answeredCount}/${latest.expectedCount} 题</span>
                 <span class="stsc-status-pill">${new Date(latest.timestamp).toLocaleString()}</span>
             </div>
@@ -1823,7 +3136,7 @@ function renderStatusTab() {
             <div><b>角色：</b>${escapeHtml(summary.entity.name)}</div>
             <div><b>预设：</b>${escapeHtml(summary.presetText)}</div>
             <div><b>参考资料：</b>${summary.refs.length ? summary.refs.map(x => escapeHtml(x.name)).join('、') : '无'}</div>
-            <div><b>模式：</b>${settings.mode === 'strict' ? '双阶段严格模式（两次调用）' : '单次模式（一次调用）'}</div>
+            <div><b>模式：</b>${escapeHtml(generationModeLabel(settings.mode, true))}</div>
             <div class="stsc-section-title" style="margin-top:12px">当前启用的快捷指令</div>
             ${tempPills}
         </div>
@@ -1952,6 +3265,14 @@ function renderPresetsTab() {
     }
 
     $('#stsc_tab_presets').html(`
+        <div class="stsc-section stsc-preset-master-switches">
+            <div class="stsc-section-title">自检启用状态</div>
+            <div class="stsc-status-switch-grid">
+                <label class="checkbox_label"><span class="stsc-signal ${settings.generalEnabled ? 'is-on' : 'is-off'}"></span><input id="stsc_general_enabled" type="checkbox" ${settings.generalEnabled ? 'checked' : ''}> 通用自检${settings.generalEnabled ? '已启用' : '未启用'}</label>
+                <label class="checkbox_label"><span class="stsc-signal ${settings.characterEnabled ? 'is-on' : 'is-off'}"></span><input id="stsc_character_enabled" type="checkbox" ${settings.characterEnabled ? 'checked' : ''}> 角色自检${settings.characterEnabled ? '已启用' : '未启用'}</label>
+            </div>
+            <div class="stsc-muted">通用与角色自检只在这里启用；插件总开关位于“插件设置”。</div>
+        </div>
         <div class="stsc-preset-subtabs" role="tablist" aria-label="预设类型">
             <button type="button" class="stsc-preset-subtab ${kind === 'general' ? 'active' : ''}" data-preset-section="general">通用预设</button>
             <button type="button" class="stsc-preset-subtab ${kind === 'character' ? 'active' : ''}" data-preset-section="character">角色预设</button>
@@ -2163,21 +3484,167 @@ function renderTemporaryTab() {
 
 function renderSettingsTab() {
     const settings = getUiSettings();
+    const dual = settings.dualApi || DEFAULT_SETTINGS.dualApi;
+    const dualVisible = settings.mode === 'dual_api';
+    const customTurnsVisible = dual.contextMode === 'custom';
+    const modelOptions = dualApiModelOptionsHtml(dual);
     $('#stsc_tab_settings').html(`
+        ${devMigrationSettingsHtml()}
+        <div class="stsc-section">
+            <div class="stsc-section-title">运行状态</div>
+            <div class="stsc-status-lights">
+                <span><i class="stsc-signal ${settings.enabled ? 'is-on' : 'is-off'}"></i>插件${settings.enabled ? '已启用' : '未启用'}</span>
+                <span><i class="stsc-signal ${settings.generalEnabled ? 'is-on' : 'is-off'}"></i>通用自检${settings.generalEnabled ? '已启用' : '未启用'}</span>
+                <span><i class="stsc-signal ${settings.characterEnabled ? 'is-on' : 'is-off'}"></i>角色自检${settings.characterEnabled ? '已启用' : '未启用'}</span>
+                <span><i class="stsc-signal ${settings.mode === 'dual_api' ? (dualApiModelsError ? 'is-off' : 'is-on') : 'is-na'}"></i>${settings.mode === 'dual_api' ? '双API模式' : '单API模式'}</span>
+                <span><i class="stsc-signal ${settings.mode === 'dual_api' ? (dual.transformFormat ? 'is-on' : 'is-off') : 'is-na'}"></i>强力规范转化</span>
+                <span><i class="stsc-signal ${settings.mode === 'dual_api' ? (dual.previousReview ? 'is-on' : 'is-off') : 'is-na'}"></i>上一轮复盘</span>
+            </div>
+        </div>
         <div class="stsc-section">
             <div class="stsc-section-title">运行方式</div>
             <label class="checkbox_label"><input id="stsc_setting_enabled" type="checkbox" ${settings.enabled ? 'checked' : ''}> 启用插件</label>
-            <div class="stsc-grid-2" style="margin-top:10px">
+            <div style="margin-top:10px">
                 <div class="stsc-field"><label>生成模式</label><select id="stsc_setting_mode" class="text_pole">
-                    <option value="single" ${settings.mode === 'single' ? 'selected' : ''}>单次模式：自检与正文一次生成</option>
-                    <option value="strict" ${settings.mode === 'strict' ? 'selected' : ''}>双阶段严格模式：先自检，再调用一次生成正文</option>
-                </select></div>
-                <div class="stsc-field"><label>预设叠加</label>
-                    <label class="checkbox_label"><input id="stsc_general_enabled" type="checkbox" ${settings.generalEnabled ? 'checked' : ''}> 启用通用预设</label>
-                    <label class="checkbox_label"><input id="stsc_character_enabled" type="checkbox" ${settings.characterEnabled ? 'checked' : ''}> 启用角色专属预设</label>
+                    <option value="single" ${settings.mode === 'single' ? 'selected' : ''}>单API调用：自检与正文一次生成（现有模式）</option>
+                    <option value="dual_api" ${settings.mode === 'dual_api' ? 'selected' : ''}>双API调用：插件API自检，酒馆主API写正文</option>
+                </select>
+                <div class="stsc-mode-help">
+                    ${settings.mode === 'single' ? '当前模式不变：由酒馆主API在同一次回复中完成自检和正文。' : ''}
+                    ${settings.mode === 'dual_api' ? '插件API只负责回答自检；结果会在下一阶段交给酒馆主API生成正文。' : ''}
+                </div></div>
+            </div>
+            <div class="stsc-dual-branch-card" style="margin-top:12px">
+                <div class="stsc-dual-branch-grid">
+                    <div class="stsc-dual-branch ${settings.mode === 'single' ? 'is-active' : ''}">
+                        <b>单API调用（默认）</b>
+                        <span><b>优点：</b>速度快、省额度，同一模型连续完成自检和正文，角色与文风通常更自然。</span>
+                        <span><b>不足：</b>问题较多时可能漏答或分心，复杂格式与硬性限制的执行稳定性稍弱。</span>
+                    </div>
+                    <div class="stsc-dual-branch ${settings.mode === 'dual_api' ? 'is-active' : ''}">
+                        <b>双API调用</b>
+                        <span><b>优点：</b>自检与正文分工，复杂规则、关系阶段和固定格式通常更稳定，也更方便查看与排查。</span>
+                        <span><b>不足：</b>会增加一次调用与等待；自检模型判断错误时，也可能把错误规则传给正文模型。</span>
+                    </div>
+                </div>
+                <div class="stsc-muted" style="margin-top:8px">日常聊天或更重视自然演绎时可用单API；规则较多、经常漏格式或关系跳级时可用双API。</div>
+            </div>
+        </div>
+
+        <div id="stsc_dual_api_section" class="stsc-section stsc-dual-api-section ${dualVisible ? '' : 'stsc-hidden'}">
+            <div class="stsc-section-title stsc-section-title-row">
+                <span>双API调用设置</span>
+                <span class="stsc-dev-pill">独立自检</span>
+            </div>
+            <div class="stsc-dev-notice">
+                双API核心流程已启用：每次生成会先消耗一次自检API调用，再把自检结果临时交给酒馆主API生成正文。可选择开启上一轮复盘和强力规范。
+            </div>
+
+            <div class="stsc-grid-2" style="margin-top:12px">
+                <div class="stsc-field">
+                    <label>自检API接口地址</label>
+                    <input id="stsc_dual_endpoint" class="text_pole" type="text" autocomplete="off" placeholder="例如：https://example.com/v1" value="${escapeHtml(dual.endpoint)}">
+                    <div class="stsc-muted">填写 OpenAI 兼容接口的基础地址，通常以 <code>/v1</code> 结尾；不要填写 <code>/chat/completions</code>。</div>
+                </div>
+                <div class="stsc-field">
+                    <label>自检模型</label>
+                    <div class="stsc-model-row">
+                        <select id="stsc_dual_model" class="text_pole" ${dualApiModels.length && !dualApiModelsLoading ? '' : 'disabled'}>
+                            ${modelOptions}
+                        </select>
+                        <button id="stsc_refresh_models" class="menu_button stsc-small-button" type="button" ${normalizeDualApiBaseUrl(dual.endpoint) && !dualApiModelsLoading ? '' : 'disabled'}>${dualApiModelsLoading ? '获取中…' : '刷新模型'}</button>
+                    </div>
+                    <div id="stsc_dual_model_status" class="stsc-muted stsc-model-status ${dualApiModelsError ? 'stsc-model-status-error' : ''} ${dualApiModels.length && !dualApiModelsError ? 'stsc-model-status-success' : ''}">${escapeHtml(dualApiModelStatusText(dual))}</div>
+                    <div class="stsc-muted">模型列表会根据接口自动拉取，不需要手动输入模型名称。</div>
+                </div>
+            </div>
+
+            <div class="stsc-field" style="margin-top:10px">
+                <label>API密钥</label>
+                <div class="stsc-secret-row">
+                    <input id="stsc_dual_api_key" class="text_pole" type="password" autocomplete="new-password" placeholder="sk-…" value="${escapeHtml(dual.apiKey)}">
+                    <button id="stsc_toggle_api_key" class="menu_button stsc-small-button" type="button">显示</button>
+                </div>
+                <div class="stsc-muted">密钥保存在当前酒馆的插件设置中，不会写入导出的预设或资料库文件。</div>
+            </div>
+
+            <div class="stsc-grid-3" style="margin-top:10px">
+                <div class="stsc-field">
+                    <label>自检最大回复长度</label>
+                    <input id="stsc_dual_max_tokens" class="text_pole" type="number" min="256" max="12000" step="128" value="${Math.round(dual.maxTokens)}">
+                    <div class="stsc-muted">单位：Token</div>
+                </div>
+                <div class="stsc-field">
+                    <label>自检API读取聊天范围</label>
+                    <select id="stsc_dual_context_mode" class="text_pole">
+                        <option value="recent5" ${dual.contextMode === 'recent5' ? 'selected' : ''}>最近5轮（默认）</option>
+                        <option value="custom" ${dual.contextMode === 'custom' ? 'selected' : ''}>自定义轮数</option>
+                        <option value="all" ${dual.contextMode === 'all' ? 'selected' : ''}>全部聊天</option>
+                    </select>
+                    <div class="stsc-muted">“一轮”指一组用户消息与AI回复；当前用户刚发送的消息会额外加入。</div>
+                </div>
+                <div id="stsc_dual_custom_turns_wrap" class="stsc-field ${customTurnsVisible ? '' : 'stsc-field-disabled'}">
+                    <label>自定义轮数</label>
+                    <input id="stsc_dual_custom_turns" class="text_pole" type="number" min="1" max="100" value="${Math.round(dual.customTurns)}" ${customTurnsVisible ? '' : 'disabled'}>
+                </div>
+            </div>
+
+            <div class="stsc-grid-2" style="margin-top:10px">
+                <div class="stsc-field">
+                    <label>单次请求超时</label>
+                    <input id="stsc_dual_timeout_seconds" class="text_pole" type="number" min="60" max="300" step="10" value="${Math.round(dual.timeoutSeconds)}">
+                    <div class="stsc-muted">单位：秒，默认150秒。自动重试会改用精简上下文，并最多再等待60秒。</div>
+                </div>
+                <div class="stsc-field">
+                    <label>瞬时错误补救</label>
+                    <label class="checkbox_label"><input id="stsc_dual_retry_transient" type="checkbox" ${dual.retryTransient ? 'checked' : ''}> 自动精简重试一次</label>
+                    <div class="stsc-muted">仅用于超时、限流、服务器异常、网络中断及不完整回答；认证失败不会重试。</div>
+                </div>
+            </div>
+
+            <div class="stsc-dual-regex-note" style="margin-top:10px">
+                <b>聊天正文读取说明</b>
+                <span>自检API读取的是经过酒馆当前全局正则与角色局部出站正则处理后的聊天内容，与酒馆主API看到的正文保持一致。</span>
+            </div>
+
+            <div class="stsc-dual-branch-card" style="margin-top:12px">
+                <label class="checkbox_label stsc-strong-checkbox">
+                    <input id="stsc_dual_transform_format" type="checkbox" ${dual.transformFormat ? 'checked' : ''}>
+                    将自检格式转化为强力规范
+                </label>
+                <div class="stsc-dual-branch-grid">
+                    <div class="stsc-dual-branch ${!dual.transformFormat ? 'is-active' : ''}">
+                        <b>不勾选</b>
+                        <span>把问题、答案与依据原样作为 <code>Assistant role</code> 临时交给酒馆主API。</span>
+                    </div>
+                    <div class="stsc-dual-branch ${dual.transformFormat ? 'is-active' : ''}">
+                        <b>勾选后</b>
+                        <span>插件把自检答案包装成更明确的执行规范，再作为 <code>System role</code> 临时交给酒馆主API。</span>
+                    </div>
+                </div>
+                <div class="stsc-muted" style="margin-top:8px">无论选择哪一种，自检与规范都只用于本轮，不写入正式聊天记录。</div>
+                <label class="checkbox_label stsc-strong-checkbox" style="margin-top:12px">
+                    <input id="stsc_previous_review" type="checkbox" ${dual.previousReview ? 'checked' : ''}>
+                    开启上一轮复盘
+                </label>
+                <div class="stsc-muted">仅双API支持；检查上一轮自检与正文的疑似偏差。复盘结果只作为线索，不会自动修改剧情。</div>
+            </div>
+
+            <div class="stsc-grid-2" style="margin-top:12px">
+                <div class="stsc-field">
+                    <label>自检API失败时</label>
+                    <select id="stsc_dual_failure_mode" class="text_pole">
+                        <option value="fallback_single" ${dual.failureMode === 'fallback_single' ? 'selected' : ''}>自动退回单API调用，继续生成正文</option>
+                        <option value="stop" ${dual.failureMode === 'stop' ? 'selected' : ''}>停止本轮生成并提示错误</option>
+                    </select>
+                </div>
+                <div class="stsc-dual-library-note">
+                    <b>资料库在双API模式下</b>
+                    <span>资料库自动问题会改成“自包含规则型问题”，要求自检API说清楚正文具体该怎么写、怎么遵照；酒馆主API即使没有直接读取资料原文，也能看懂答案。</span>
                 </div>
             </div>
         </div>
+
         <div class="stsc-section">
             <div class="stsc-section-title">自检与快捷指令默认注入位置</div>
             <div class="stsc-muted">默认使用“系统最前”，优先级最高；只有熟悉提示词结构时才建议调整。</div>
@@ -2196,43 +3663,53 @@ function renderSettingsTab() {
             </div>
         </div>
         <div class="stsc-section">
-            <div class="stsc-section-title">界面显示</div>
-            <div class="stsc-grid-2">
-                <div class="stsc-field"><label>插件配色</label><select id="stsc_theme" class="text_pole">
-                    <option value="default" ${settings.appearance.theme === 'default' ? 'selected' : ''}>默认：跟随 SillyTavern 美化</option>
-                    <option value="rose" ${settings.appearance.theme === 'rose' ? 'selected' : ''}>樱雾粉</option>
-                    <option value="blue" ${settings.appearance.theme === 'blue' ? 'selected' : ''}>月光蓝</option>
-                    <option value="mint" ${settings.appearance.theme === 'mint' ? 'selected' : ''}>青瓷绿</option>
-                    <option value="violet" ${settings.appearance.theme === 'violet' ? 'selected' : ''}>暮藤紫</option>
-                    <option value="gold" ${settings.appearance.theme === 'gold' ? 'selected' : ''}>奶杏金</option>
-                </select></div>
-                <div class="stsc-field"><label>悬浮窗</label>
-                    <label class="checkbox_label"><input id="stsc_floating_enabled" type="checkbox" ${settings.appearance.floatingEnabled ? 'checked' : ''}> 开启悬浮按钮，查看自检问答并快速启用指令</label>
-                    <div class="stsc-muted">悬浮按钮支持鼠标或手指拖动，并会记住位置；悬浮窗包含“自检问答”和“快捷指令”两个页面。</div>
-                </div>
-            </div>
-            <div class="stsc-floating-customizer">
-                <div class="stsc-field"><label>悬浮窗样式</label><select id="stsc_floating_style" class="text_pole">
-                    <option value="theme" ${settings.appearance.floatingStyle === 'theme' ? 'selected' : ''}>跟随插件主题</option>
-                    <option value="glass" ${settings.appearance.floatingStyle === 'glass' ? 'selected' : ''}>磨砂玻璃</option>
-                    <option value="solid" ${settings.appearance.floatingStyle === 'solid' ? 'selected' : ''}>纯色卡片</option>
-                    <option value="minimal" ${settings.appearance.floatingStyle === 'minimal' ? 'selected' : ''}>轻量极简</option>
-                </select></div>
-                <div class="stsc-field stsc-range-field"><label>悬浮按钮透明度 <span id="stsc_floating_opacity_value">${Math.round(settings.appearance.floatingOpacity * 100)}%</span></label><input id="stsc_floating_opacity" type="range" min="10" max="100" step="1" value="${Math.round(settings.appearance.floatingOpacity * 100)}"><div class="stsc-muted">只调整圆形悬浮按钮的背景透明度，不影响打开后的悬浮窗内容。</div></div>
-                <div class="stsc-field stsc-range-field"><label>悬浮按钮大小 <span id="stsc_floating_button_size_value">${Math.round(settings.appearance.floatingButtonSize)}px</span></label><input id="stsc_floating_button_size" type="range" min="34" max="50" step="2" value="${Math.round(settings.appearance.floatingButtonSize)}"><div class="stsc-muted">最大为原来的按钮大小，向左可缩小两档以上；图标、红点和拖动范围会同步适配。</div></div>
-                <div class="stsc-field stsc-range-field"><label>悬浮窗宽度 <span id="stsc_floating_width_value">${Math.round(settings.appearance.floatingWidth)}px</span></label><input id="stsc_floating_width" type="range" min="300" max="680" step="10" value="${Math.round(settings.appearance.floatingWidth)}"></div>
-                <div class="stsc-field stsc-range-field"><label>悬浮窗高度 <span id="stsc_floating_height_value">${Math.round(settings.appearance.floatingHeight)}px</span></label><input id="stsc_floating_height" type="range" min="300" max="820" step="10" value="${Math.round(settings.appearance.floatingHeight)}"></div>
-            </div>
-            <div class="stsc-muted" style="margin-top:8px">移动端会在安全区域内自动限制最大尺寸；调整设置时，已打开的悬浮窗会即时预览。</div>
-        </div>
-        <div class="stsc-section">
             <div class="stsc-section-title">上下文处理</div>
             <div>插件不会在流式生成期间添加整段遮罩。建议使用 README 中提供的正则，仅隐藏 &lt;stsc_self_check&gt; 标签内的自检内容。</div>
-            <div>生成完成后，插件会提取自检并从聊天正文中剥离；聊天记录只保留正文、状态栏和其他正常输出，下一轮AI读取不到上一轮自检。</div>
+            <div>生成完成后，插件会提取自检并从聊天正文中剥离。自检不会随聊天正文发给下一轮主API；开启双API复盘时，会将上一轮自检与正文提供给自检API。</div>
             <div class="stsc-code-note">&lt;stsc_self_check&gt;…&lt;/stsc_self_check&gt; → 正则隐藏并由插件保存
 结束标签之后 → 正常流式正文</div>
         </div>
     `);
+
+    if (dualVisible) {
+        const signature = dualApiConnectionSignature(dual);
+        setTimeout(() => {
+            updateDualApiModelControl();
+            if (normalizeDualApiBaseUrl(dual.endpoint) && signature !== dualApiModelsSignature) {
+                scheduleDualApiModelFetch(120);
+            }
+        }, 0);
+    }
+}
+
+function renderAppearanceTab() {
+    const settings = getUiSettings();
+    $('#stsc_tab_appearance').html(`
+        <div class="stsc-section">
+            <div class="stsc-section-title">主题与颜色</div>
+            <div class="stsc-field"><label>插件配色</label><select id="stsc_theme" class="text_pole">
+                <option value="default" ${settings.appearance.theme === 'default' ? 'selected' : ''}>默认：跟随 SillyTavern 美化</option>
+                <option value="rose" ${settings.appearance.theme === 'rose' ? 'selected' : ''}>樱雾粉</option><option value="blue" ${settings.appearance.theme === 'blue' ? 'selected' : ''}>月光蓝</option>
+                <option value="mint" ${settings.appearance.theme === 'mint' ? 'selected' : ''}>青瓷绿</option><option value="violet" ${settings.appearance.theme === 'violet' ? 'selected' : ''}>暮藤紫</option><option value="gold" ${settings.appearance.theme === 'gold' ? 'selected' : ''}>奶杏金</option>
+            </select></div>
+        </div>
+        <div class="stsc-section">
+            <div class="stsc-section-title">悬浮按钮</div>
+            <label class="checkbox_label"><span class="stsc-signal ${settings.appearance.floatingEnabled ? 'is-on' : 'is-off'}"></span><input id="stsc_floating_enabled" type="checkbox" ${settings.appearance.floatingEnabled ? 'checked' : ''}> 显示悬浮按钮</label>
+            <div class="stsc-floating-customizer">
+                <div class="stsc-field stsc-range-field"><label>透明度 <span id="stsc_floating_opacity_value">${Math.round(settings.appearance.floatingOpacity * 100)}%</span></label><input id="stsc_floating_opacity" type="range" min="10" max="100" step="1" value="${Math.round(settings.appearance.floatingOpacity * 100)}"></div>
+                <div class="stsc-field stsc-range-field"><label>按钮大小 <span id="stsc_floating_button_size_value">${Math.round(settings.appearance.floatingButtonSize)}px</span></label><input id="stsc_floating_button_size" type="range" min="34" max="50" step="2" value="${Math.round(settings.appearance.floatingButtonSize)}"></div>
+            </div>
+        </div>
+        <div class="stsc-section">
+            <div class="stsc-section-title">悬浮窗口</div>
+            <div class="stsc-floating-customizer">
+                <div class="stsc-field"><label>样式</label><select id="stsc_floating_style" class="text_pole"><option value="theme" ${settings.appearance.floatingStyle === 'theme' ? 'selected' : ''}>跟随插件主题</option><option value="glass" ${settings.appearance.floatingStyle === 'glass' ? 'selected' : ''}>磨砂玻璃</option><option value="solid" ${settings.appearance.floatingStyle === 'solid' ? 'selected' : ''}>纯色卡片</option><option value="minimal" ${settings.appearance.floatingStyle === 'minimal' ? 'selected' : ''}>轻量极简</option></select></div>
+                <div class="stsc-field stsc-range-field"><label>宽度 <span id="stsc_floating_width_value">${Math.round(settings.appearance.floatingWidth)}px</span></label><input id="stsc_floating_width" type="range" min="300" max="680" step="10" value="${Math.round(settings.appearance.floatingWidth)}"></div>
+                <div class="stsc-field stsc-range-field"><label>高度 <span id="stsc_floating_height_value">${Math.round(settings.appearance.floatingHeight)}px</span></label><input id="stsc_floating_height" type="range" min="300" max="820" step="10" value="${Math.round(settings.appearance.floatingHeight)}"></div>
+            </div>
+            <div class="stsc-muted">移动端会自动限制在安全区域内，拖到左右边缘后会收纳一半；悬浮按钮位置会持续保存。</div>
+        </div>`);
 }
 
 
@@ -2258,14 +3735,28 @@ function renderUpdatesTab() {
             <div class="stsc-update-card is-available">
                 <div class="stsc-update-card-head">
                     <div><div class="stsc-update-kicker">发现新版本</div><div class="stsc-update-version">${remoteVersionLabel}</div></div>
-                    <button class="menu_button stsc-primary-button" type="button" data-action="update-plugin-now"><i class="fa-solid fa-download"></i> 立即更新</button>
+                    <button class="menu_button stsc-primary-button" type="button" data-action="update-plugin-now" data-dialog-action="update-plugin-now"><i class="fa-solid fa-download"></i> 立即更新</button>
                 </div>
                 ${remote.title ? `<div class="stsc-release-title">${escapeHtml(remote.title)}</div>` : ''}
                 ${releaseChangesHtml(remote)}
                 <div class="stsc-muted" style="margin-top:8px">更新完成后页面会自动刷新。更新前请先保存当前未保存的插件设置。</div>
             </div>`;
     } else if (updateCheckState === 'error') {
-        remoteHtml = `<div class="stsc-update-card is-error"><b>暂时无法检查更新</b><div class="stsc-muted">${escapeHtml(updateCheckError || '网络或扩展更新接口不可用。')}</div></div>`;
+        const diagnosticHtml = updateCheckDiagnostics.length
+            ? `<ul class="stsc-release-change-list">${updateCheckDiagnostics.map(item => `<li>${escapeHtml(item)}</li>`).join('')}</ul>`
+            : '';
+        const directButton = installedExtensionGitState === 'non_git'
+            ? ''
+            : '<button class="menu_button stsc-primary-button" type="button" data-action="update-plugin-direct" data-dialog-action="update-plugin-direct"><i class="fa-solid fa-download"></i> 跳过检查，直接尝试更新</button>';
+        remoteHtml = `<div class="stsc-update-card is-error">
+            <b>这次没有查到远程版本</b>
+            <div style="margin-top:7px">${escapeHtml(updateCheckError || '插件没有从远程网络或酒馆自身接口拿到更新结果。')}</div>
+            ${diagnosticHtml}
+            <div class="stsc-toolbar" style="margin-top:10px">
+                ${directButton}
+                <button class="menu_button" type="button" data-action="open-sillytavern-extensions" data-dialog-action="open-sillytavern-extensions"><i class="fa-solid fa-puzzle-piece"></i> 打开酒馆扩展页面</button>
+            </div>
+        </div>`;
     } else {
         remoteHtml = '<div class="stsc-update-card is-latest"><b>当前已经是最新版本。</b><div class="stsc-muted">插件启动、打开管理器以及后台定时检查时都会自动检测新版本。</div></div>';
     }
@@ -2275,7 +3766,7 @@ function renderUpdatesTab() {
             <div class="stsc-section-title">当前版本</div>
             <div class="stsc-current-version-row">
                 <div><div class="stsc-update-kicker">已安装</div><div class="stsc-update-version">v${escapeHtml(STSC_RELEASE_INFO.version)}</div></div>
-                <button class="menu_button" type="button" data-action="check-plugin-update"><i class="fa-solid fa-rotate"></i> 立即检查更新</button>
+                <button class="menu_button" type="button" data-action="check-plugin-update" data-dialog-action="check-plugin-update"><i class="fa-solid fa-rotate"></i> 立即检查更新</button>
             </div>
             <div class="stsc-release-title">${escapeHtml(STSC_RELEASE_INFO.title)}</div>
             <div class="stsc-muted">发布日期：${escapeHtml(STSC_RELEASE_INFO.releasedAt)}</div>
@@ -2291,6 +3782,52 @@ function renderUpdatesTab() {
             <div class="stsc-muted" style="margin-top:6px">没有新版本时不会弹窗。发现更新后可直接在本页面完成更新，更新说明可随时回来查看。</div>
         </div>
     `);
+    const versionDialogOpen = !$('#stsc_dialog_overlay').hasClass('stsc-hidden')
+        && $('#stsc_dialog_title').text() === '版本更新';
+    if (versionDialogOpen) $('#stsc_dialog_body').html($('#stsc_tab_updates').html());
+}
+
+function renderHeaderUpdateBadge() {
+    const hasUpdate = updateCheckState === 'available' || gitUpdateAvailable || Boolean(updateAvailableVersion && compareVersions(updateAvailableVersion, STSC_VERSION) > 0);
+    $('#stsc_version_button').toggleClass('has-notice', hasUpdate);
+}
+
+function renderLogBadge() {
+    const settings = normalizeSettings();
+    const unread = settings?.logs?.some(item => Number(item.timestamp) > settings.logLastViewedAt && ['error', 'warning'].includes(item.level));
+    $('#stsc_log_button').toggleClass('has-notice', Boolean(unread));
+}
+
+function openVersionDialog() {
+    renderUpdatesTab();
+    openDialog('版本更新', $('#stsc_tab_updates').html(), '<button class="menu_button" type="button" data-dialog-action="cancel">关闭</button>');
+}
+
+function runtimeLogHtml(item) {
+    const labels = { error: '失败', warning: '需要留意', info: '正常' };
+    return `<article class="stsc-log-item is-${escapeHtml(item.level || 'info')}" data-log-id="${escapeHtml(item.id)}">
+        <div class="stsc-log-head"><b>${escapeHtml(labels[item.level] || '记录')}｜${escapeHtml(item.stage || '运行')}</b><time>${new Date(item.timestamp).toLocaleString()}</time></div>
+        <div>${escapeHtml(item.message || '')}</div>${item.handling ? `<div class="stsc-muted">处理：${escapeHtml(item.handling)}</div>` : ''}
+        <button class="menu_button stsc-small-button" type="button" data-dialog-action="delete-log" data-log-id="${escapeHtml(item.id)}">删除</button>
+    </article>`;
+}
+
+function openLogDialog() {
+    const settings = normalizeSettings();
+    settings.logLastViewedAt = Date.now();
+    saveSettings();
+    renderLogBadge();
+    const list = settings.logs.length ? settings.logs.map(runtimeLogHtml).join('') : '<div class="stsc-empty">还没有运行记录。完成一次角色回复或手动检查更新后，这里会显示结果。</div>';
+    openDialog('运行日志', `<div class="stsc-log-summary">成功、部分完成和失败都会记录。日志会写明时间、角色卡、运行模式、完成题数、正文与API情况；本地最多保留最近 ${STSC_LOG_LIMIT} 条，且不会记录API密钥。</div><div class="stsc-log-list">${list}</div>`,
+        '<button class="menu_button" type="button" data-dialog-action="clear-runtime-cache">清理缓存</button><button class="menu_button" type="button" data-dialog-action="export-logs">导出日志</button><button class="menu_button stsc-danger-button" type="button" data-dialog-action="ask-clear-logs">清除日志</button>');
+}
+
+function exportRuntimeLogs() {
+    const payload = JSON.stringify({ exportedAt: new Date().toISOString(), version: STSC_VERSION, logs: normalizeSettings().logs }, null, 2);
+    const url = URL.createObjectURL(new Blob([payload], { type: 'application/json;charset=utf-8' }));
+    const anchor = document.createElement('a');
+    anchor.href = url; anchor.download = `墨提斯之镜-运行日志-${new Date().toISOString().slice(0, 10)}.json`; anchor.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function renderFloatingInstructionPage() {
@@ -2358,6 +3895,46 @@ function renderFloatingCheckPage() {
     $('#stsc_floating_content').html(`${issues}${answers}`);
 }
 
+function renderFloatingReviewPage() {
+    const settings = normalizeSettings();
+    const latest = getLatestResult();
+    const review = latest?.previousReview || null;
+    $('#stsc_floating_title').text('复盘线索');
+    if (settings.mode !== 'dual_api' || !settings.dualApi.previousReview) {
+        $('#stsc_floating_subtitle').text('当前未启用');
+        $('#stsc_floating_content').html('<div class="stsc-empty"><b>上一轮复盘未开启</b><br><br>前往“插件设置 → 双API增强”开启。复盘仅在双API模式下运行。</div>');
+        return;
+    }
+    if (!review) {
+        if (latest && latest.mode !== 'dual_api') {
+            $('#stsc_floating_subtitle').text('上一轮未完成双API');
+            $('#stsc_floating_content').html('<div class="stsc-empty">上一轮实际使用了单API，通常是独立自检API失败后自动回退，因此没有生成复盘。请查看运行日志中的“自检API”记录。</div>');
+        } else {
+            $('#stsc_floating_subtitle').text('已记录首轮，等待下一轮复盘');
+            $('#stsc_floating_content').html('<div class="stsc-empty">当前已有一轮可作为复盘来源。请再完成一轮双API正文生成；下一轮自检会先复盘本轮，再进行新的自检。</div>');
+        }
+        return;
+    }
+    if (review.status === 'missing') {
+        $('#stsc_floating_subtitle').text('本轮复盘未按格式返回');
+        $('#stsc_floating_content').html(`<div class="stsc-empty"><b>本轮自检与正文已正常完成</b><br><br>${escapeHtml(review.reason || '自检API没有返回可识别的复盘标签。')}<br><br>插件会在下一轮继续尝试；详情可在运行日志中查看。</div>`);
+        return;
+    }
+    $('#stsc_floating_subtitle').text(new Date(review.timestamp).toLocaleString());
+    if (review.status === 'ok' || !review.issues?.length) {
+        $('#stsc_floating_content').html('<div class="stsc-empty stsc-review-ok"><b>✓ 上一轮未发现明显问题</b></div>');
+        return;
+    }
+    const cards = review.issues.map(issue => `<article class="stsc-review-card">
+        <div class="stsc-review-type">${escapeHtml(issue.type || '疑似问题')}</div>
+        <div class="stsc-review-description">${escapeHtml(issue.description || '')}</div>
+        ${issue.evidence ? `<div class="stsc-review-detail"><b>依据：</b>${escapeHtml(issue.evidence)}</div>` : ''}
+        ${issue.suggestion ? `<div class="stsc-review-detail"><b>修复建议：</b>${escapeHtml(issue.suggestion)}</div>` : ''}
+        <label class="checkbox_label stsc-review-select"><input type="checkbox" data-review-issue-id="${escapeHtml(issue.id)}" ${issue.selected ? 'checked' : ''}> 下轮修复</label>
+    </article>`).join('');
+    $('#stsc_floating_content').html(`<div class="stsc-muted stsc-review-note">复盘是AI判断的疑似问题。只有你勾选的线索才会影响下一轮，且只执行一次。</div><div class="stsc-review-list">${cards}</div>`);
+}
+
 function renderFloating() {
     const settings = getUiSettings();
     const $root = $('#stsc_floating_root');
@@ -2382,11 +3959,13 @@ function renderFloating() {
 
     if (floatingPanelPage === 'instructions') {
         renderFloatingInstructionPage();
+    } else if (floatingPanelPage === 'review') {
+        renderFloatingReviewPage();
     } else {
         renderFloatingCheckPage();
     }
 
-    $('#stsc_floating_open_manager').text(floatingPanelPage === 'instructions' ? '打开指令管理器' : '打开完整管理器');
+    $('#stsc_floating_open_manager').text(floatingPanelPage === 'instructions' ? '打开指令管理器' : floatingPanelPage === 'review' ? '打开插件设置' : '打开完整管理器');
     const panelOpen = !$('#stsc_floating_panel').hasClass('stsc-hidden');
     if (panelOpen) requestAnimationFrame(layoutFloatingPanel);
     if (panelOpen && floatingPanelPage === 'check') void markLatestIssueViewed();
@@ -2402,7 +3981,10 @@ function renderAll() {
     renderReferencesTab();
     renderTemporaryTab();
     renderSettingsTab();
+    renderAppearanceTab();
     renderUpdatesTab();
+    renderHeaderUpdateBadge();
+    renderLogBadge();
     renderFloating();
     applyTheme(getUiSettings());
     updateSaveState();
@@ -2568,7 +4150,7 @@ function makePresetExportPayload(preset) {
 
 function downloadPresetFile(preset) {
     if (!preset) {
-        toastr.warning('当前没有可以导出的自检预设。', '写作前置自检');
+        toastr.warning('当前没有可以导出的自检预设。', '墨提斯之镜');
         return;
     }
 
@@ -2583,7 +4165,7 @@ function downloadPresetFile(preset) {
     anchor.click();
     anchor.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-    toastr.success(`已导出“${preset.name}”。`, '写作前置自检');
+    toastr.success(`已导出“${preset.name}”。`, '墨提斯之镜');
 }
 
 function isPlainObject(value) {
@@ -2592,7 +4174,7 @@ function isPlainObject(value) {
 
 function validateImportedPresetPayload(payload) {
     if (!isPlainObject(payload)) throw new Error('文件内容不是有效的预设对象。');
-    if (payload.format !== STSC_PRESET_EXPORT_FORMAT) throw new Error('文件不是由写作前置自检插件导出的预设。');
+    if (payload.format !== STSC_PRESET_EXPORT_FORMAT) throw new Error('文件不是由墨提斯之镜 插件导出的预设。');
     if (payload.formatVersion !== STSC_PRESET_EXPORT_VERSION) throw new Error('该预设文件版本暂不受支持。');
     if (!isPlainObject(payload.preset)) throw new Error('文件中缺少自检预设内容。');
 
@@ -2631,7 +4213,7 @@ function validateImportedPresetPayload(payload) {
 async function importPresetFile(file) {
     if (!file) return;
     if (file.size > STSC_PRESET_IMPORT_MAX_BYTES) {
-        toastr.error('格式不匹配：文件过大，无法作为自检预设导入。', '写作前置自检');
+        toastr.error('格式不匹配：文件过大，无法作为自检预设导入。', '墨提斯之镜');
         return;
     }
 
@@ -2665,10 +4247,10 @@ async function importPresetFile(file) {
         renderAll();
         const renameNote = preset.name === imported.name ? '' : `；因名称重复，已改名为“${preset.name}”`;
         const bindingNote = preset.kind === 'character' ? '；角色绑定不会随文件导入，请手动绑定当前角色' : '';
-        toastr.success(`已导入${presetKindText(preset.kind)}“${preset.name}”，共 ${preset.questions.length} 个问题${renameNote}${bindingNote}。请点击“保存更改”正式保存。`, '写作前置自检');
+        toastr.success(`已导入${presetKindText(preset.kind)}“${preset.name}”，共 ${preset.questions.length} 个问题${renameNote}${bindingNote}。请点击“保存更改”正式保存。`, '墨提斯之镜');
     } catch (error) {
         console.warn('[STSC] 导入自检预设失败：', error);
-        toastr.error(`格式不匹配，文件错误或不是本插件导出的自检预设。${error?.message ? ` ${error.message}` : ''}`, '写作前置自检', { timeOut: 7000 });
+        toastr.error(`格式不匹配，文件错误或不是本插件导出的自检预设。${error?.message ? ` ${error.message}` : ''}`, '墨提斯之镜', { timeOut: 7000 });
     }
 }
 
@@ -2696,7 +4278,7 @@ function makeReferenceExportPayload(reference) {
 
 function downloadReferenceFile(reference) {
     if (!reference) {
-        toastr.warning('没有找到可以导出的参考资料库。', '写作前置自检');
+        toastr.warning('没有找到可以导出的参考资料库。', '墨提斯之镜');
         return;
     }
 
@@ -2711,7 +4293,7 @@ function downloadReferenceFile(reference) {
     anchor.click();
     anchor.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-    toastr.success(`已导出资料库“${reference.name}”。`, '写作前置自检');
+    toastr.success(`已导出资料库“${reference.name}”。`, '墨提斯之镜');
 }
 
 
@@ -2728,7 +4310,7 @@ function makeReferenceBundleExportPayload(references) {
 function downloadReferenceBundleFile(references) {
     const selected = Array.isArray(references) ? references.filter(Boolean) : [];
     if (!selected.length) {
-        toastr.warning('请至少选择一个要导出的资料库。', '写作前置自检');
+        toastr.warning('请至少选择一个要导出的资料库。', '墨提斯之镜');
         return false;
     }
     const payload = makeReferenceBundleExportPayload(selected);
@@ -2737,20 +4319,20 @@ function downloadReferenceBundleFile(references) {
     const anchor = document.createElement('a');
     const date = new Date().toISOString().slice(0, 10);
     anchor.href = url;
-    anchor.download = `写作前置自检-资料库合集-${date}.stsc-references.json`;
+    anchor.download = `墨提斯之镜-资料库合集-${date}.stsc-references.json`;
     anchor.style.display = 'none';
     document.body.appendChild(anchor);
     anchor.click();
     anchor.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-    toastr.success(`已将 ${selected.length} 个资料库批量导出为一个合集文件。`, '写作前置自检');
+    toastr.success(`已将 ${selected.length} 个资料库批量导出为一个合集文件。`, '墨提斯之镜');
     return true;
 }
 
 function openBatchReferenceExportDialog() {
     const references = getUiSettings().references;
     if (!references.length) {
-        toastr.warning('当前没有可以导出的参考资料库。', '写作前置自检');
+        toastr.warning('当前没有可以导出的参考资料库。', '墨提斯之镜');
         return;
     }
     const items = references.map(reference => `
@@ -2814,13 +4396,13 @@ function validateImportedReferencePayload(payload) {
         return { isBundle: true, references: payload.references.map(validateImportedReferenceRecord) };
     }
 
-    throw new Error('文件不是由写作前置自检插件导出的资料库或资料库合集。');
+    throw new Error('文件不是由墨提斯之镜 插件导出的资料库或资料库合集。');
 }
 
 async function importReferenceFile(file) {
     if (!file) return;
     if (file.size > STSC_REFERENCE_IMPORT_MAX_BYTES) {
-        toastr.error('格式不匹配：文件过大，无法作为参考资料库或资料库合集导入。', '写作前置自检');
+        toastr.error('格式不匹配：文件过大，无法作为参考资料库或资料库合集导入。', '墨提斯之镜');
         return;
     }
 
@@ -2865,10 +4447,10 @@ async function importReferenceFile(file) {
         const modeText = importedPayload.isBundle ? `已从资料库合集导入 ${created.length} 个资料库` : `已导入资料库“${created[0]?.name || ''}”`;
         const renameNote = renamed.length ? `；${renamed.length} 个重名条目已自动改名` : '';
         const bindingNote = containsCharacterScope ? '；角色专属绑定不会随文件导入，请手动绑定当前角色' : '';
-        toastr.success(`${modeText}${renameNote}${bindingNote}。为了安全，所有导入资料库均保持关闭，请检查后手动启用并保存。`, '写作前置自检', { timeOut: 8000 });
+        toastr.success(`${modeText}${renameNote}${bindingNote}。为了安全，所有导入资料库均保持关闭，请检查后手动启用并保存。`, '墨提斯之镜', { timeOut: 8000 });
     } catch (error) {
         console.warn('[STSC] 导入参考资料库失败：', error);
-        toastr.error(`格式不匹配，文件错误或不是本插件导出的参考资料库。${error?.message ? ` ${error.message}` : ''}`, '写作前置自检', { timeOut: 7000 });
+        toastr.error(`格式不匹配，文件错误或不是本插件导出的参考资料库。${error?.message ? ` ${error.message}` : ''}`, '墨提斯之镜', { timeOut: 7000 });
     }
 }
 
@@ -2977,14 +4559,14 @@ async function testCurrentPreset() {
     const questions = getActiveQuestions(settings);
     const references = getActiveReferences(settings);
     if (!questions.length) {
-        toastr.warning('当前没有生效的问题可以测试。', '写作前置自检');
+        toastr.warning('当前没有生效的问题可以测试。', '墨提斯之镜');
         return;
     }
 
     testBusy = true;
     const loader = context.loader?.show?.({
         message: '正在测试自检预设…',
-        title: '写作前置自检',
+        title: '墨提斯之镜',
         toastMode: 'stoppable',
     });
 
@@ -2993,7 +4575,7 @@ async function testCurrentPreset() {
         applyReferencePrompts(references);
         const questionText = questions.map((q, i) => `${i + 1}. [${q.type === 'boolean' ? '判断题' : '开放问答'}｜${q.length}｜${q.requireEvidence ? '需要依据' : '无需强制依据'}] ${q.text}`).join('\n');
         const prompt = `
-这是写作前置自检插件的“测试预设”功能。请读取当前角色设定、聊天上文、已注入的参考资料以及下面全部问题。
+这是墨提斯之镜 插件的“测试预设”功能。请读取当前角色设定、聊天上文、已注入的参考资料以及下面全部问题。
 
 任务：
 1. 逐题正常回答，但绝对不要输出角色扮演正文、对白、动作或状态栏。
@@ -3007,13 +4589,13 @@ ${questionText}
         const result = await context.generateQuietPrompt({ quietPrompt: prompt });
         internalQuietActive = false;
         lastTestResult = String(result || '').trim() || '测试没有返回内容。';
-        toastr.success('测试完成，没有生成正文。', '写作前置自检');
+        toastr.success('测试完成，没有生成正文。', '墨提斯之镜');
         switchTab('presets');
         renderAll();
     } catch (error) {
         internalQuietActive = false;
         console.error('[STSC] 测试预设失败：', error);
-        toastr.error('测试调用失败，请检查当前API连接。', '写作前置自检');
+        toastr.error('测试调用失败，请检查当前API连接。', '墨提斯之镜');
     } finally {
         clearRuntimePrompts();
         testBusy = false;
@@ -3023,6 +4605,8 @@ ${questionText}
 
 function bindUiEvents() {
     $('#stsc_close_manager').on('click', closeManager);
+    $('#stsc_version_button').on('click', openVersionDialog);
+    $('#stsc_log_button').on('click', openLogDialog);
     $('#stsc_save_changes').on('click', () => commitEditDraft());
     $('#stsc_floating_button').on('click', function (event) {
         event.preventDefault();
@@ -3046,11 +4630,12 @@ function bindUiEvents() {
         event.preventDefault();
         event.stopPropagation();
         toggleFloatingPanel(false);
-        openManager(floatingPanelPage === 'instructions' ? 'temporary' : 'status');
+        openManager(floatingPanelPage === 'instructions' ? 'temporary' : floatingPanelPage === 'review' ? 'settings' : 'status');
     });
     $('#stsc_floating_panel').on('click', '[data-floating-page]', function (event) {
         event.preventDefault();
-        const nextPage = $(this).data('floating-page') === 'instructions' ? 'instructions' : 'check';
+        const requestedPage = String($(this).data('floating-page') || 'check');
+        const nextPage = ['check', 'instructions', 'review'].includes(requestedPage) ? requestedPage : 'check';
         if (floatingPanelPage === nextPage) return;
         floatingPanelPage = nextPage;
         renderFloating();
@@ -3107,12 +4692,12 @@ function bindUiEvents() {
         if (!preset) return;
         const nextName = String(this.value || '').trim();
         if (!nextName) {
-            toastr.warning('预设名称不能为空。', '写作前置自检');
+            toastr.warning('预设名称不能为空。', '墨提斯之镜');
             renderPresetsTab();
             return;
         }
         if (presetNameExists(nextName, preset.id)) {
-            toastr.warning('已经存在同名预设，请换一个名称。', '写作前置自检');
+            toastr.warning('已经存在同名预设，请换一个名称。', '墨提斯之镜');
             renderPresetsTab();
             return;
         }
@@ -3158,7 +4743,7 @@ function bindUiEvents() {
                 if (event.type === 'change') {
                     this.value = reference.name;
                     $error.empty();
-                    toastr.warning('资料库名称不能为空。', '写作前置自检');
+                    toastr.warning('资料库名称不能为空。', '墨提斯之镜');
                 }
                 return;
             }
@@ -3167,7 +4752,7 @@ function bindUiEvents() {
                 if (event.type === 'change') {
                     this.value = reference.name;
                     $error.empty();
-                    toastr.warning('已经存在同名资料库，请换一个名称。', '写作前置自检');
+                    toastr.warning('已经存在同名资料库，请换一个名称。', '墨提斯之镜');
                 }
                 return;
             }
@@ -3182,7 +4767,6 @@ function bindUiEvents() {
 
         if (field === 'enabled') {
             reference.enabled = this.checked;
-            if (!reference.enabled) reference.addToCheck = false;
             markDirty();
             renderReferencesTab();
             renderCompact();
@@ -3196,7 +4780,7 @@ function bindUiEvents() {
             renderReferencesTab();
             renderCompact();
             renderManagerSubtitle();
-            toastr.info(`已切换为“${referenceTypeLabel(reference.type)}”，并应用推荐注入位置。`, '写作前置自检');
+            toastr.info(`已切换为“${referenceTypeLabel(reference.type)}”，并应用推荐注入位置。`, '墨提斯之镜');
             return;
         }
 
@@ -3204,7 +4788,7 @@ function bindUiEvents() {
             if (!reference.enabled) {
                 reference.addToCheck = false;
                 this.checked = false;
-                toastr.warning('请先启用这个资料库，才能启用对应的自检问题。', '写作前置自检');
+                toastr.warning('请先启用这个资料库，才能启用对应的自检问题。', '墨提斯之镜');
                 return;
             }
             reference.addToCheck = this.checked;
@@ -3236,9 +4820,95 @@ function bindUiEvents() {
         renderAll();
     });
     $('#stsc_manager_overlay').on('change', '#stsc_setting_mode', function () {
-        getUiSettings().mode = this.value;
+        getUiSettings().mode = ['single', 'dual_api'].includes(this.value) ? this.value : 'single';
         markDirty();
         renderAll();
+    });
+    $('#stsc_manager_overlay').on('input change', '#stsc_dual_endpoint', function (event) {
+        const dual = getUiSettings().dualApi;
+        dual.endpoint = this.value;
+        if (event.type === 'change') {
+            const normalized = normalizeDualApiBaseUrl(this.value);
+            if (normalized) {
+                dual.endpoint = normalized;
+                this.value = normalized;
+            }
+        }
+        markDirty();
+        resetDualApiModelState();
+        if (normalizeDualApiBaseUrl(dual.endpoint)) scheduleDualApiModelFetch(event.type === 'change' ? 0 : 800);
+    });
+    $('#stsc_manager_overlay').on('change', '#stsc_dual_model', function () {
+        if (!dualApiModels.includes(this.value)) return;
+        getUiSettings().dualApi.model = this.value;
+        markDirty();
+    });
+    $('#stsc_manager_overlay').on('input change', '#stsc_dual_api_key', function (event) {
+        getUiSettings().dualApi.apiKey = this.value;
+        markDirty();
+        resetDualApiModelState();
+        if (normalizeDualApiBaseUrl(getUiSettings().dualApi.endpoint)) {
+            scheduleDualApiModelFetch(event.type === 'change' ? 0 : 800);
+        }
+    });
+    $('#stsc_manager_overlay').on('click', '#stsc_refresh_models', function () {
+        scheduleDualApiModelFetch(0, { force: true, showToast: true });
+    });
+    $('#stsc_manager_overlay').on('click', '#stsc_toggle_api_key', function () {
+        const input = document.getElementById('stsc_dual_api_key');
+        if (!input) return;
+        const showing = input.type === 'text';
+        input.type = showing ? 'password' : 'text';
+        $(this).text(showing ? '显示' : '隐藏');
+    });
+    $('#stsc_manager_overlay').on('change', '#stsc_dual_max_tokens', function () {
+        getUiSettings().dualApi.maxTokens = clampNumber(this.value, 256, 12000, 4096);
+        this.value = Math.round(getUiSettings().dualApi.maxTokens);
+        markDirty();
+    });
+    $('#stsc_manager_overlay').on('change', '#stsc_dual_timeout_seconds', function () {
+        getUiSettings().dualApi.timeoutSeconds = clampNumber(this.value, 60, 300, 150);
+        this.value = Math.round(getUiSettings().dualApi.timeoutSeconds);
+        markDirty();
+    });
+    $('#stsc_manager_overlay').on('change', '#stsc_dual_retry_transient', function () {
+        getUiSettings().dualApi.retryTransient = this.checked;
+        markDirty();
+    });
+    $('#stsc_manager_overlay').on('change', '#stsc_dual_context_mode', function () {
+        getUiSettings().dualApi.contextMode = ['recent5', 'custom', 'all'].includes(this.value) ? this.value : 'recent5';
+        markDirty();
+        renderSettingsTab();
+        updateSaveState();
+    });
+    $('#stsc_manager_overlay').on('change', '#stsc_dual_custom_turns', function () {
+        getUiSettings().dualApi.customTurns = clampNumber(this.value, 1, 100, 5);
+        this.value = Math.round(getUiSettings().dualApi.customTurns);
+        markDirty();
+    });
+    $('#stsc_manager_overlay').on('change', '#stsc_dual_transform_format', function () {
+        getUiSettings().dualApi.transformFormat = this.checked;
+        markDirty();
+        renderSettingsTab();
+        updateSaveState();
+    });
+    $('#stsc_floating_panel').on('change', '[data-review-issue-id]', async function () {
+        const latest = getLatestResult();
+        const issue = latest?.previousReview?.issues?.find(item => item.id === String($(this).data('review-issue-id') || ''));
+        if (!issue) return;
+        issue.selected = this.checked;
+        await saveLatestResult(latest);
+        renderFloatingReviewPage();
+    });
+    $('#stsc_manager_overlay').on('change', '#stsc_previous_review', function () {
+        getUiSettings().dualApi.previousReview = this.checked;
+        markDirty();
+        renderSettingsTab();
+        updateSaveState();
+    });
+    $('#stsc_manager_overlay').on('change', '#stsc_dual_failure_mode', function () {
+        getUiSettings().dualApi.failureMode = ['fallback_single', 'stop'].includes(this.value) ? this.value : 'fallback_single';
+        markDirty();
     });
     $('#stsc_manager_overlay').on('change', '#stsc_general_enabled', function () {
         getUiSettings().generalEnabled = this.checked;
@@ -3316,7 +4986,10 @@ function bindUiEvents() {
         const settings = getUiSettings();
         const preset = getEditingPreset(null, settings);
 
-        if (action === 'open-create-preset') {
+        if (action === 'import-dev-settings' || action === 'restore-dev-migration') {
+            openDevMigrationDialog(action === 'restore-dev-migration');
+            return;
+        } else if (action === 'open-create-preset') {
             openCreatePresetDialog($(this).data('kind'));
             return;
         } else if (action === 'open-create-reference') {
@@ -3326,14 +4999,20 @@ function bindUiEvents() {
             openBatchReferenceExportDialog();
             return;
         } else if (action === 'check-plugin-update') {
-            await checkForPluginUpdate({ force: true });
+            await checkForPluginUpdate({ force: true, userInitiated: true });
             renderUpdatesTab();
             return;
         } else if (action === 'update-plugin-now') {
             await updatePluginFromManager();
             return;
+        } else if (action === 'update-plugin-direct') {
+            await updatePluginFromManager({ skipCheck: true });
+            return;
+        } else if (action === 'open-sillytavern-extensions') {
+            openExtensionManagerForUpdate();
+            return;
         } else if (action === 'open-extension-manager') {
-            openManager('updates');
+            openVersionDialog();
             return;
         } else if (action === 'import-reference') {
             const input = document.getElementById('stsc_reference_import_file');
@@ -3383,7 +5062,7 @@ function bindUiEvents() {
             else settings.ui.editingGeneralPresetId = copied.id;
         } else if (action === 'delete-preset' && preset) {
             if (preset.kind === 'general' && settings.presets.filter(x => x.kind === 'general').length <= 1) {
-                toastr.warning('至少要保留一个通用预设。', '写作前置自检');
+                toastr.warning('至少要保留一个通用预设。', '墨提斯之镜');
                 return;
             }
             openDeleteConfirmation({
@@ -3408,11 +5087,11 @@ function bindUiEvents() {
         } else if (action === 'set-general-preset' && preset?.kind === 'general') {
             settings.generalPresetId = preset.id;
             settings.generalEnabled = true;
-            toastr.success(`已将“${preset.name}”设为当前通用预设。`, '写作前置自检');
+            toastr.success(`已将“${preset.name}”设为当前通用预设。`, '墨提斯之镜');
         } else if (action === 'bind-current-character' && preset?.kind === 'character') {
             const character = getCurrentCharacterEntity();
             if (!character.key) {
-                toastr.warning('当前页面未找到角色卡，请先进入一个角色卡聊天页面。', '写作前置自检');
+                toastr.warning('当前页面未找到角色卡，请先进入一个角色卡聊天页面。', '墨提斯之镜');
                 return;
             }
             for (const other of settings.presets.filter(x => x.kind === 'character' && x.id !== preset.id && x.boundCharacterKey === character.key)) {
@@ -3422,7 +5101,7 @@ function bindUiEvents() {
             preset.boundCharacterKey = character.key;
             preset.boundCharacterName = character.name;
             settings.characterEnabled = true;
-            toastr.success(`已将“${preset.name}”绑定到 ${character.name}。`, '写作前置自检');
+            toastr.success(`已将“${preset.name}”绑定到 ${character.name}。`, '墨提斯之镜');
         } else if (action === 'unbind-preset' && preset?.kind === 'character') {
             preset.boundCharacterKey = '';
             preset.boundCharacterName = '';
@@ -3483,7 +5162,7 @@ function bindUiEvents() {
             const reference = settings.references.find(x => x.id === id);
             const character = getCurrentCharacterEntity();
             if (!reference || !character.key) {
-                toastr.warning('当前页面未找到角色卡，请先进入一个角色卡聊天页面。', '写作前置自检');
+                toastr.warning('当前页面未找到角色卡，请先进入一个角色卡聊天页面。', '墨提斯之镜');
                 return;
             }
             reference.scope = 'character';
@@ -3563,6 +5242,20 @@ function bindUiEvents() {
         const action = $(this).data('dialog-action');
         const settings = getUiSettings();
 
+        if (action === 'confirm-import-dev-settings' || action === 'confirm-restore-dev-migration') {
+            const restore = action === 'confirm-restore-dev-migration';
+            try {
+                const migrated = applyDevSettingsMigration({ restore });
+                closeDialog();
+                applyTheme(migrated);
+                renderAll();
+                toastr.success(restore ? '已恢复迁入前的正式版设置。' : 'DEV 设置已迁入并保存。请在酒馆扩展页停用 DEV 并刷新页面。', '墨提斯之镜');
+            } catch (error) {
+                toastr.warning(error.message, '墨提斯之镜');
+            }
+            return;
+        }
+
         if (action === 'unsaved-cancel') {
             pendingUnsavedAction = null;
             closeDialog();
@@ -3590,6 +5283,52 @@ function bindUiEvents() {
             closeDialog();
             return;
         }
+        if (action === 'check-plugin-update') {
+            void checkForPluginUpdate({ force: true, userInitiated: true }).then(openVersionDialog);
+            return;
+        }
+        if (action === 'update-plugin-now') {
+            void updatePluginFromManager();
+            return;
+        }
+        if (action === 'update-plugin-direct') {
+            void updatePluginFromManager({ skipCheck: true });
+            return;
+        }
+        if (action === 'open-sillytavern-extensions') {
+            closeDialog();
+            openExtensionManagerForUpdate();
+            return;
+        }
+        if (action === 'export-logs') {
+            exportRuntimeLogs();
+            return;
+        }
+        if (action === 'clear-runtime-cache') {
+            dualApiModels = [];
+            dualApiModelsError = '';
+            dualApiModelsSignature = '';
+            latestRemoteReleaseInfo = null;
+            toastr.success('模型列表与更新检查缓存已清理；预设、资料库和日志未受影响。', '墨提斯之镜');
+            return;
+        }
+        if (action === 'delete-log') {
+            const id = String($(this).data('log-id') || '');
+            normalizeSettings().logs = normalizeSettings().logs.filter(item => item.id !== id);
+            saveSettings(); openLogDialog();
+            return;
+        }
+        if (action === 'ask-clear-logs') {
+            openDialog('清除运行日志', '<div class="stsc-delete-warning"><b>确定清除全部运行日志吗？</b><div class="stsc-muted">该操作无法撤销。</div></div>', '<button class="menu_button" type="button" data-dialog-action="cancel">取消</button><button class="menu_button stsc-danger-button" type="button" data-dialog-action="confirm-clear-logs">确认清除</button>');
+            return;
+        }
+        if (action === 'confirm-clear-logs') {
+            normalizeSettings().logs = [];
+            normalizeSettings().logLastViewedAt = Date.now();
+            saveSettings(); closeDialog(); renderLogBadge();
+            toastr.success('运行日志已清除。', '墨提斯之镜');
+            return;
+        }
         if (action === 'confirm-delete') {
             const request = pendingDeleteRequest;
             pendingDeleteRequest = null;
@@ -3606,7 +5345,7 @@ function bindUiEvents() {
             const ids = $('#stsc_dialog_body [data-batch-reference-id]:checked').map((_, element) => String($(element).data('batch-reference-id') || '')).get().filter(Boolean);
             const references = settings.references.filter(reference => ids.includes(reference.id));
             if (!references.length) {
-                toastr.warning('请至少选择一个要导出的资料库。', '写作前置自检');
+                toastr.warning('请至少选择一个要导出的资料库。', '墨提斯之镜');
                 return;
             }
             if (downloadReferenceBundleFile(references)) closeDialog();
@@ -3658,7 +5397,7 @@ function bindUiEvents() {
             if (!bulkDraft) return;
             bulkDraft.raw = String($('#stsc_bulk_raw').val() || '');
             bulkDraft.items = splitBulkQuestions(bulkDraft.raw);
-            if (!bulkDraft.items.length) toastr.warning('没有识别到明显的问题，请调整原文或手动补充。', '写作前置自检');
+            if (!bulkDraft.items.length) toastr.warning('没有识别到明显的问题，请调整原文或手动补充。', '墨提斯之镜');
             renderBulkImportDialog();
             return;
         }
@@ -3682,7 +5421,7 @@ function bindUiEvents() {
             const preset = settings.presets.find(x => x.id === bulkDraft.presetId);
             const items = bulkDraft.items.map(x => String(x || '').trim()).filter(Boolean);
             if (!preset || !items.length) {
-                toastr.warning('没有可以导入的问题。', '写作前置自检');
+                toastr.warning('没有可以导入的问题。', '墨提斯之镜');
                 return;
             }
             const createdQuestions = items.map(text => createQuestion(text));
@@ -3692,7 +5431,7 @@ function bindUiEvents() {
             const count = items.length;
             closeDialog();
             renderAll();
-            toastr.success(`已确认导入 ${count} 个问题。`, '写作前置自检');
+            toastr.success(`已确认导入 ${count} 个问题。`, '墨提斯之镜');
         }
     });
 
@@ -3713,6 +5452,12 @@ function bindUiEvents() {
 
 
 function openExtensionManagerForUpdate() {
+    if (editDirty) {
+        toastr.warning('当前还有未保存的插件设置，请先保存，再打开酒馆扩展页面。', '墨提斯之镜');
+        return;
+    }
+    closeDialog();
+    performCloseManager();
     const detailsButton = document.querySelector('#extensions_details');
     if (detailsButton) {
         detailsButton.click();
@@ -3749,16 +5494,28 @@ async function getInstalledExtensionType() {
 
 async function fetchOwnExtensionVersion(isGlobal) {
     const context = ctx();
-    const response = await fetch('/api/extensions/version', {
-        method: 'POST',
-        headers: context?.getRequestHeaders?.() || { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            extensionName: STSC_EXTENSION_FOLDER_NAME,
-            global: Boolean(isGlobal),
-        }),
-    });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    return await response.json();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    try {
+        const response = await fetch('/api/extensions/version', {
+            method: 'POST',
+            headers: context?.getRequestHeaders?.() || { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                extensionName: STSC_EXTENSION_FOLDER_NAME,
+                global: Boolean(isGlobal),
+            }),
+            signal: controller.signal,
+        });
+        if (!response.ok) {
+            const detail = compactPromptText(await response.text());
+            const error = new Error(detail || `HTTP ${response.status}`);
+            error.httpStatus = response.status;
+            throw error;
+        }
+        return await response.json();
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 function compareVersions(left, right) {
@@ -3783,32 +5540,78 @@ function compareVersions(left, right) {
     return 0;
 }
 
-async function fetchRemoteManifestVersion() {
-    const separator = STSC_REMOTE_MANIFEST_URL.includes('?') ? '&' : '?';
-    const response = await fetch(`${STSC_REMOTE_MANIFEST_URL}${separator}stsc=${Date.now()}`, {
-        method: 'GET',
-        cache: 'no-store',
-        headers: { Accept: 'application/json' },
+function decodeRemoteJsonPayload(payload) {
+    if (!payload || typeof payload !== 'object' || payload.encoding !== 'base64' || typeof payload.content !== 'string') return payload;
+    const binary = atob(payload.content.replace(/\s+/g, ''));
+    const bytes = Uint8Array.from(binary, char => char.charCodeAt(0));
+    return JSON.parse(new TextDecoder('utf-8').decode(bytes));
+}
+
+async function fetchRemoteJsonUrl(url) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 12000);
+    const separator = url.includes('?') ? '&' : '?';
+    try {
+        const response = await fetch(`${url}${separator}stsc=${Date.now()}`, {
+            method: 'GET',
+            cache: 'no-store',
+            headers: { Accept: 'application/json, application/vnd.github+json' },
+            signal: controller.signal,
+        });
+        if (!response.ok) {
+            const error = new Error(`HTTP ${response.status}`);
+            error.httpStatus = response.status;
+            throw error;
+        }
+        return decodeRemoteJsonPayload(await response.json());
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+function fetchRemoteJsonFromMirrors(urls, label) {
+    return new Promise((resolve, reject) => {
+        const failures = [];
+        let remaining = urls.length;
+        for (const url of urls) {
+            fetchRemoteJsonUrl(url).then(resolve).catch(error => {
+                failures.push(error);
+                remaining -= 1;
+                if (remaining === 0) {
+                    const combined = new Error(`${label}的 ${urls.length} 个网络地址都没有连接成功。`);
+                    combined.causes = failures;
+                    reject(combined);
+                }
+            });
+        }
     });
-    if (!response.ok) throw new Error(`远程 manifest HTTP ${response.status}`);
-    const manifest = await response.json();
+}
+
+function plainUpdateFailureReason(error) {
+    const raw = compactPromptText(error?.message || error || '没有收到具体原因');
+    const status = Number(error?.httpStatus) || Number(raw.match(/HTTP\s*(\d{3})/i)?.[1]) || 0;
+    if (/AbortError|aborted|超时|timeout/i.test(raw)) return '等待超时，网络或酒馆服务没有及时回答';
+    if (/Failed to fetch|NetworkError|fetch failed|network|ECONN|ENOTFOUND/i.test(raw)) return '没有连接成功，可能是网络暂时无法访问该地址';
+    if (status === 401 || status === 403) return `请求被拒绝（${status}），可能是权限或网络代理限制`;
+    if (status === 404) return '当前酒馆没有这个检查接口，或插件目录没有找到（404）';
+    if (status >= 500) return `酒馆或远程服务内部出错（${status}）`;
+    if (/Git repository|not a Git|不是.*Git/i.test(raw)) return '当前插件不是通过 Git 仓库安装，酒馆无法直接拉取更新';
+    if (/\d+ 个网络地址都没有连接成功/.test(raw)) return raw;
+    return raw || '没有收到具体原因';
+}
+
+async function fetchRemoteManifestVersion() {
+    const manifest = await fetchRemoteJsonFromMirrors(STSC_REMOTE_MANIFEST_URLS, '远程版本号');
     const version = String(manifest?.version || '').trim();
-    if (!version) throw new Error('远程 manifest 缺少版本号');
+    if (!version) throw new Error('远程版本文件已经收到，但里面没有版本号。');
     return version;
 }
 
 
 async function fetchRemoteReleaseInfo() {
-    const separator = STSC_REMOTE_RELEASE_URL.includes('?') ? '&' : '?';
-    const response = await fetch(`${STSC_REMOTE_RELEASE_URL}${separator}stsc=${Date.now()}`, {
-        method: 'GET',
-        cache: 'no-store',
-        headers: { Accept: 'application/json' },
-    });
-    if (!response.ok) throw new Error(`远程版本说明 HTTP ${response.status}`);
-    const info = await response.json();
+    const info = await fetchRemoteJsonFromMirrors(STSC_REMOTE_RELEASE_URLS, '远程更新说明');
     const version = String(info?.version || '').trim();
-    if (!version) throw new Error('远程版本说明缺少版本号');
+    if (!version) throw new Error('远程更新说明已经收到，但里面没有版本号。');
     return {
         version,
         releasedAt: String(info?.releasedAt || ''),
@@ -3826,7 +5629,9 @@ function markInstalledReleaseSeen() {
 
 function clearPluginUpdateNotice() {
     updateAvailableVersion = '';
+    gitUpdateAvailable = false;
     latestRemoteReleaseInfo = null;
+    renderHeaderUpdateBadge();
     $('#stsc_extensions_menu_button').removeClass('stsc-has-update').find('.stsc-menu-update-badge').remove();
     if (updateToast) {
         try { toastr.clear(updateToast); } catch { /* 忽略旧 toast 清理失败 */ }
@@ -3834,13 +5639,15 @@ function clearPluginUpdateNotice() {
     }
 }
 
-function showPluginUpdateNotice(remoteVersion = '', releaseInfo = null) {
+function showPluginUpdateNotice(remoteVersion = '', releaseInfo = null, { gitOnly = false } = {}) {
     updateAvailableVersion = String(remoteVersion || releaseInfo?.version || '').trim();
+    gitUpdateAvailable = Boolean(gitOnly);
     latestRemoteReleaseInfo = releaseInfo || latestRemoteReleaseInfo;
-    if (!updateAvailableVersion || compareVersions(updateAvailableVersion, STSC_VERSION) <= 0) {
+    if (!gitUpdateAvailable && (!updateAvailableVersion || compareVersions(updateAvailableVersion, STSC_VERSION) <= 0)) {
         clearPluginUpdateNotice();
         return;
     }
+    renderHeaderUpdateBadge();
 
     const $menuButton = $('#stsc_extensions_menu_button');
     $menuButton.addClass('stsc-has-update');
@@ -3856,32 +5663,53 @@ function showPluginUpdateNotice(remoteVersion = '', releaseInfo = null) {
         saveSettings();
     }
 
-    const versionText = ` v${updateAvailableVersion}`;
+    const versionText = updateAvailableVersion ? ` v${updateAvailableVersion}` : '';
     const detail = Array.isArray(releaseInfo?.changes) && releaseInfo.changes.length
         ? ` 更新内容：${releaseInfo.changes.slice(0, 2).join('；')}`
         : '';
     updateToast = toastr.info(
-        `检测到“写作前置自检”有新版本${versionText}。${detail} 点击打开插件内更新页面。`,
+        `检测到“墨提斯之镜”有新版本${versionText}。${detail} 点击打开插件内更新页面。`,
         '插件有更新｜立即查看',
         {
             timeOut: 0,
             extendedTimeOut: 0,
             closeButton: true,
             tapToDismiss: false,
-            onclick: () => openManager('updates'),
+            onclick: () => openVersionDialog(),
             onHidden: () => { updateToast = null; },
         },
     );
 }
 
-async function updatePluginFromManager() {
+function plainExtensionUpdateFailure(error) {
+    const raw = compactPromptText(error?.message || error || '没有收到具体原因');
+    const status = Number(error?.httpStatus) || Number(raw.match(/HTTP\s*(\d{3})/i)?.[1]) || 0;
+    if (/not a Git|Git repository|不是.*Git/i.test(raw)) return '当前插件文件夹不是通过 GitHub 仓库安装的，所以酒馆不能直接拉取更新。请到酒馆扩展页面删除后，再用 正式仓库链接重新安装。';
+    if (status === 401 || status === 403) return '酒馆拒绝了更新操作。若插件安装在全局扩展目录，请使用管理员账号更新。';
+    if (status === 404) return '酒馆没有找到这个插件目录，可能是插件文件夹名称被改过，或当前酒馆版本不支持这个更新接口。';
+    if (status >= 500) return `酒馆没有成功拉取插件文件（返回 ${status}）。常见原因是插件不是 Git 安装、GitHub 暂时连不上，或插件目录里的 Git 状态异常。`;
+    if (/AbortError|timeout|超时/i.test(raw)) return '更新等待超时，酒馆没有及时从 GitHub 拉到文件。请稍后重试或在扩展页面更新。';
+    if (/Failed to fetch|NetworkError|network|连接/i.test(raw)) return '更新时没有连接成功，请检查酒馆服务器到 GitHub 的网络。';
+    return `酒馆没有完成更新。酒馆给出的提示是：${raw}`;
+}
+
+async function updatePluginFromManager({ skipCheck = false } = {}) {
     if (updateCheckInFlight || updateCheckState === 'updating') return;
     if (editDirty) {
-        toastr.warning('当前还有未保存的修改，请先点击“保存更改”再更新插件。', '写作前置自检');
+        toastr.warning('当前还有未保存的修改，请先点击“保存更改”再更新插件。', '墨提斯之镜');
         return;
     }
-    if (!updateAvailableVersion || compareVersions(updateAvailableVersion, STSC_VERSION) <= 0) {
-        await checkForPluginUpdate({ force: true });
+    if (installedExtensionGitState === 'non_git') {
+        updateCheckState = 'error';
+        updateCheckError = '当前插件不是通过 GitHub 仓库安装的，酒馆无法在插件内直接更新。';
+        updateCheckDiagnostics = ['请打开酒馆扩展页面，删除当前插件，再使用 正式仓库链接重新安装；插件设置通常保存在酒馆设置中，不会因为重装插件文件而清空。'];
+        addRuntimeLog('error', '插件更新', updateCheckError, updateCheckDiagnostics[0]);
+        renderUpdatesTab();
+        toastr.error(updateCheckError, '无法直接更新', { timeOut: 7000 });
+        return;
+    }
+    if (!skipCheck && updateCheckState !== 'available' && !gitUpdateAvailable && (!updateAvailableVersion || compareVersions(updateAvailableVersion, STSC_VERSION) <= 0)) {
+        await checkForPluginUpdate({ force: true, userInitiated: true });
         if (updateCheckState !== 'available') return;
     }
 
@@ -3902,17 +5730,30 @@ async function updatePluginFromManager() {
             }),
         });
         if (!response.ok) {
-            const text = await response.text();
-            throw new Error(text || `HTTP ${response.status}`);
+            const detail = compactPromptText(await response.text());
+            const error = new Error(detail || `HTTP ${response.status}`);
+            error.httpStatus = response.status;
+            throw error;
         }
         const result = await response.json();
         if (result?.isUpToDate) {
-            updateCheckState = 'available';
-            toastr.warning('远程版本号较新，但 Git 未拉取到新提交。请确认插件安装分支为 main，或重新安装插件。', '插件未能更新');
+            if (skipCheck) {
+                updateCheckState = 'latest';
+                updateCheckError = '';
+                updateCheckDiagnostics = [];
+                clearPluginUpdateNotice();
+                addRuntimeLog('info', '插件更新', '酒馆已经直接检查过插件文件，当前没有可拉取的新提交。', '当前插件已经是 Git 仓库能获取到的最新内容。');
+                toastr.success('酒馆已经直接检查过，当前没有可拉取的新提交。', '插件已经是最新状态');
+            } else {
+                updateCheckState = 'available';
+                addRuntimeLog('warning', '插件更新', '远程版本号显示有更新，但酒馆没有拉取到新提交。', '请确认插件安装分支是 main；如果仍然如此，请到酒馆扩展页面重新安装 正式仓库。');
+                toastr.warning('远程版本号显示有更新，但酒馆没有拉取到新提交。请确认插件安装分支为 main，或重新安装插件。', '插件未能更新');
+            }
             return;
         }
 
-        const installedTargetVersion = updateAvailableVersion;
+        const installedTargetVersion = gitUpdateAvailable ? '' : updateAvailableVersion;
+        addRuntimeLog('info', '插件更新', `插件文件已经成功更新${installedTargetVersion ? `到 v${installedTargetVersion}` : '到远程最新提交'}。`, '页面会自动刷新并加载新版本。');
         clearPluginUpdateNotice();
         toastr.success(`已拉取新版本${installedTargetVersion ? ` v${installedTargetVersion}` : ''}，页面即将刷新。`, '插件更新成功', {
             timeOut: 1400,
@@ -3921,7 +5762,9 @@ async function updatePluginFromManager() {
         setTimeout(() => window.location.reload(), 900);
     } catch (error) {
         updateCheckState = 'error';
-        updateCheckError = error?.message || String(error || '未知错误');
+        updateCheckError = plainExtensionUpdateFailure(error);
+        updateCheckDiagnostics = ['可以稍后重试；也可以打开酒馆扩展页面使用酒馆自带的更新按钮。'];
+        addRuntimeLog('error', '插件更新', updateCheckError, updateCheckDiagnostics[0]);
         console.error('[STSC] 插件内更新失败：', error);
         toastr.error(updateCheckError, '插件更新失败', { timeOut: 6000 });
     } finally {
@@ -3930,7 +5773,7 @@ async function updatePluginFromManager() {
     }
 }
 
-async function checkForPluginUpdate({ force = false } = {}) {
+async function checkForPluginUpdate({ force = false, userInitiated = false } = {}) {
     if (updateCheckInFlight) return;
 
     const now = Date.now();
@@ -3939,6 +5782,7 @@ async function checkForPluginUpdate({ force = false } = {}) {
     updateCheckInFlight = true;
     updateCheckState = 'checking';
     updateCheckError = '';
+    updateCheckDiagnostics = [];
     if (initialized) renderUpdatesTab();
 
     const settings = normalizeSettings();
@@ -3960,21 +5804,48 @@ async function checkForPluginUpdate({ force = false } = {}) {
         const remoteVersion = [manifestVersion, releaseInfo?.version]
             .filter(Boolean)
             .sort((a, b) => compareVersions(b, a))[0] || '';
+        const gitData = gitResult.status === 'fulfilled' ? gitResult.value : null;
+        installedExtensionGitState = gitData?.currentCommitHash
+            ? 'git'
+            : (gitResult.status === 'fulfilled' && gitData?.isUpToDate === true ? 'non_git' : 'unknown');
         const semanticVersionHasUpdate = Boolean(remoteVersion && compareVersions(remoteVersion, STSC_VERSION) > 0);
+        const gitHasUpdate = installedExtensionGitState === 'git' && gitData?.isUpToDate === false;
+        const gitCheckUsable = installedExtensionGitState === 'git' && typeof gitData?.isUpToDate === 'boolean';
 
         latestRemoteReleaseInfo = releaseInfo;
-        if (semanticVersionHasUpdate) {
+        if (semanticVersionHasUpdate || gitHasUpdate) {
             updateCheckState = 'available';
-            showPluginUpdateNotice(remoteVersion, releaseInfo);
-        } else if (gitResult.status === 'fulfilled' || manifestResult.status === 'fulfilled' || releaseResult.status === 'fulfilled') {
+            showPluginUpdateNotice(remoteVersion, releaseInfo, { gitOnly: gitHasUpdate && !semanticVersionHasUpdate });
+            if (userInitiated) addRuntimeLog('info', '更新检查', `检查完成：发现新版本${remoteVersion ? ` v${remoteVersion}` : '或新的远程提交'}。`, '可以在插件的“版本更新”页面点击“立即更新”。');
+        } else if (remoteVersion || gitCheckUsable) {
             updateCheckState = 'latest';
             clearPluginUpdateNotice();
+            if (userInitiated) addRuntimeLog('info', '更新检查', `检查完成：当前插件 v${STSC_VERSION} 已经是最新版本。`, '不需要进行任何操作。');
         } else {
-            throw new Error('Git 检查、远程版本检查与版本说明检查均失败');
+            updateCheckState = 'error';
+            updateCheckError = installedExtensionGitState === 'non_git'
+                ? '远程版本地址没有连接成功，而且当前插件不是 Git 安装，酒馆也无法替它检查远程提交。'
+                : '插件已经尝试了多个远程地址和酒馆自身的检查接口，但这次都没有拿到结果。';
+            updateCheckDiagnostics = [
+                gitResult.status === 'rejected'
+                    ? `酒馆自身检查：${plainUpdateFailureReason(gitResult.reason)}`
+                    : installedExtensionGitState === 'non_git'
+                        ? '酒馆自身检查：当前插件文件夹不是 Git 安装，无法直接比较远程提交'
+                        : '酒馆自身检查：没有返回足够的信息',
+                manifestResult.status === 'rejected'
+                    ? `远程版本号：${plainUpdateFailureReason(manifestResult.reason)}`
+                    : '远程版本号：已经读取成功',
+                releaseResult.status === 'rejected'
+                    ? `远程更新说明：${plainUpdateFailureReason(releaseResult.reason)}`
+                    : '远程更新说明：已经读取成功',
+            ];
+            if (userInitiated) addRuntimeLog('warning', '更新检查', updateCheckError, `${updateCheckDiagnostics.join('；')}。可以点击“跳过检查，直接尝试更新”，或打开酒馆扩展页面。`);
         }
     } catch (error) {
         updateCheckState = 'error';
-        updateCheckError = error?.message || String(error || '未知错误');
+        updateCheckError = '检查更新时发生了意外问题，这不影响插件继续自检。';
+        updateCheckDiagnostics = [`具体情况：${plainUpdateFailureReason(error)}`];
+        if (userInitiated) addRuntimeLog('warning', '更新检查', updateCheckError, `${updateCheckDiagnostics[0]}。可以稍后重试或打开酒馆扩展页面。`);
         console.debug('[STSC] 插件更新检查失败：', error);
     } finally {
         updateCheckInFlight = false;
@@ -3985,9 +5856,9 @@ async function checkForPluginUpdate({ force = false } = {}) {
 function addExtensionsMenuButton() {
     if ($('#stsc_extensions_menu_button').length || !$('#extensionsMenu').length) return;
     const button = $(
-        `<div id="stsc_extensions_menu_button" class="list-group-item flex-container flexGap5 interactable" title="打开写作前置自检">
+        `<div id="stsc_extensions_menu_button" class="list-group-item flex-container flexGap5 interactable" title="打开墨提斯之镜">
             <i class="fa-solid fa-list-check"></i>
-            <span>写作前置自检</span>
+            <span>墨提斯之镜</span>
         </div>`
     );
     button.on('click', () => openManager('status'));
@@ -4019,7 +5890,7 @@ async function initialize() {
     setTimeout(() => void checkForPluginUpdate({ force: true }), 2500);
     if (updatePollTimer) clearInterval(updatePollTimer);
     updatePollTimer = setInterval(() => void checkForPluginUpdate(), STSC_UPDATE_CHECK_INTERVAL_MS);
-    console.info(`[STSC] 写作前置自检 v${STSC_VERSION} 已加载。`);
+    console.info(`[STSC] 墨提斯之镜 v${STSC_VERSION} 已加载。`);
 }
 
 jQuery(() => {
@@ -4030,7 +5901,7 @@ jQuery(() => {
             await initialize();
         } catch (error) {
             console.error('[STSC] 插件初始化失败：', error);
-            toastr.error('写作前置自检插件加载失败，请查看浏览器控制台。');
+            toastr.error('墨提斯之镜 插件加载失败，请查看浏览器控制台。');
         }
     };
 

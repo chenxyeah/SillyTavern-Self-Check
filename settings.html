@@ -1,24 +1,25 @@
 <div id="stsc_manager_overlay" class="stsc-overlay stsc-hidden" aria-hidden="true">
-  <div class="stsc-manager" role="dialog" aria-modal="true" aria-label="写作前置自检管理器">
+  <div class="stsc-manager" role="dialog" aria-modal="true" aria-label="墨提斯之镜 管理器">
     <div class="stsc-manager-header">
       <div class="stsc-manager-heading">
-        <div class="stsc-manager-title">写作前置自检 <span class="stsc-manager-version">v0.3.0</span></div>
+        <div class="stsc-manager-title">墨提斯之镜 <button id="stsc_version_button" class="stsc-manager-version" type="button" title="查看版本信息">v0.4.0<span class="stsc-header-dot" aria-hidden="true"></span></button></div>
         <div id="stsc_manager_subtitle" class="stsc-manager-subtitle"></div>
       </div>
       <div class="stsc-header-actions">
+        <button id="stsc_log_button" class="menu_button stsc-header-log-button" type="button">运行日志<span class="stsc-header-dot" aria-hidden="true"></span></button>
         <span id="stsc_save_state" class="stsc-save-state">已保存</span>
         <button id="stsc_save_changes" class="menu_button stsc-save-button" type="button" disabled>保存更改</button>
         <button id="stsc_close_manager" class="menu_button stsc-icon-button" type="button" title="关闭" aria-label="关闭">✕</button>
       </div>
     </div>
 
-    <div class="stsc-tabs" role="tablist" aria-label="写作前置自检功能页">
+    <div class="stsc-tabs" role="tablist" aria-label="墨提斯之镜 功能页">
       <button class="stsc-tab active" type="button" data-tab="status">当前状态</button>
       <button class="stsc-tab" type="button" data-tab="presets">自检预设</button>
       <button class="stsc-tab" type="button" data-tab="references">参考资料库</button>
       <button class="stsc-tab" type="button" data-tab="temporary">快捷指令</button>
       <button class="stsc-tab" type="button" data-tab="settings">插件设置</button>
-      <button class="stsc-tab" type="button" data-tab="updates">版本更新</button>
+      <button class="stsc-tab" type="button" data-tab="appearance">界面显示</button>
     </div>
 
     <div class="stsc-manager-body">
@@ -27,13 +28,14 @@
       <section id="stsc_tab_references" class="stsc-tab-panel"></section>
       <section id="stsc_tab_temporary" class="stsc-tab-panel"></section>
       <section id="stsc_tab_settings" class="stsc-tab-panel"></section>
-      <section id="stsc_tab_updates" class="stsc-tab-panel"></section>
+      <section id="stsc_tab_appearance" class="stsc-tab-panel"></section>
+      <section id="stsc_tab_updates" class="stsc-hidden" aria-hidden="true"></section>
     </div>
   </div>
 </div>
 
 <div id="stsc_dialog_overlay" class="stsc-dialog-overlay stsc-hidden" aria-hidden="true">
-  <div class="stsc-dialog" role="dialog" aria-modal="true" aria-label="写作前置自检操作窗口">
+  <div class="stsc-dialog" role="dialog" aria-modal="true" aria-label="墨提斯之镜 操作窗口">
     <div class="stsc-dialog-header">
       <div id="stsc_dialog_title" class="stsc-dialog-title"></div>
       <button id="stsc_dialog_close" class="menu_button stsc-icon-button" type="button" title="关闭" aria-label="关闭">✕</button>
@@ -62,6 +64,7 @@
   <div class="stsc-floating-tabs" role="tablist" aria-label="悬浮窗功能">
     <button class="stsc-floating-tab active" type="button" data-floating-page="check" role="tab">自检问答</button>
     <button class="stsc-floating-tab" type="button" data-floating-page="instructions" role="tab">快捷指令</button>
+    <button class="stsc-floating-tab" type="button" data-floating-page="review" role="tab">复盘线索</button>
   </div>
   <div id="stsc_floating_content" class="stsc-floating-content"></div>
   <div class="stsc-floating-footer">
