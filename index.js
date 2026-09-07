@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.0';
+const STSC_VERSION = '0.4.1';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -37,16 +37,12 @@ const STSC_REMOTE_RELEASE_URLS = Object.freeze([
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-09-03',
-    title: 'DEV 功能正式迁入：双API、复盘与可靠性升级',
+    releasedAt: '2026-09-07',
+    title: '修复角色卡开场白代码块被删除',
     changes: Object.freeze([
-        '正式整合 beta.22 已验证功能：双API自检、上一轮复盘、强力YAML规范、运行日志与插件内更新。',
-        '沿用正式版预设和角色绑定；可在插件设置中从同一酒馆的DEV迁入配置，并恢复迁入前的正式版设置。',
-        '单API提示词新增严格输出边界：原有思维链必须先完整闭合，自检和最终正文必须位于思维链标签之外。',
-        '双API普通注入与强力YAML规范同步加入正文边界要求，避免执行规范诱发正文顺序错乱。',
-        '当模型把思维链标签错误地跨过插件自检区并包住正文时，插件会只修复这一处边界，不删除正常思维链。',
-        '运行日志会明确记录“正文误入思维链但已自动分开”，方便判断是已修复的小格式问题还是仍需排查接口。',
-        '若双API正文仍被完整包在思维链中且无法安全自动拆分，日志会明确报警并保留原文，避免误删正文或泄露隐藏推理。',
+        '修复导入角色卡时，首条开场白恰好以三个反引号开头和结尾会被插件误删代码围栏的问题。',
+        '插件现在只处理自己发起的生成，不再解析角色卡导入、聊天载入等其他流程产生的AI消息。',
+        '普通Markdown代码块保持原样；仅当围栏内部确实包含插件自检协议时，才兼容移除外层围栏并解析。',
     ]),
 });
 
@@ -2428,10 +2424,16 @@ async function markLatestIssueViewed() {
 }
 
 function normalizeModelXmlText(text) {
-    let source = String(text ?? '')
-        .replace(/^\s*```(?:xml)?\s*/i, '')
-        .replace(/\s*```\s*$/i, '')
-        .trim();
+    const original = String(text ?? '');
+    const containsPluginProtocol = /<\/?stsc_(?:self_check|previous_review|response)\b/i.test(original)
+        || /&lt;\s*\/?\s*stsc_(?:self_check|previous_review|response)\b/i.test(original);
+    // 普通Markdown代码块属于用户正文。只有插件协议确实位于整段围栏内时，才移除外层围栏以兼容模型输出。
+    let source = containsPluginProtocol
+        ? original
+            .replace(/^\s*```(?:xml)?\s*/i, '')
+            .replace(/\s*```\s*$/i, '')
+            .trim()
+        : original;
     let decodedOuterXml = false;
     if (!STSC_CHECK_OPEN_RE.test(source) && /&lt;\s*stsc_self_check\b/i.test(source)) {
         source = decodeXmlEntities(source).trim();
@@ -2758,6 +2760,10 @@ function statusClass(status) {
 
 async function handleMessageReceived(data) {
     if (internalQuietActive) return;
+    // 角色卡导入、聊天载入和其他扩展也可能触发 MESSAGE_RECEIVED。
+    // 本插件只处理由自身拦截器建立 pendingRun 的生成，避免改写外部导入的开场白或历史消息。
+    const run = pendingRun;
+    if (!run) return;
 
     const settings = normalizeSettings();
     if (!settings?.enabled) {
@@ -2774,9 +2780,9 @@ async function handleMessageReceived(data) {
     const message = context.chat[messageId];
     if (!message || message.is_user || message.is_system) return;
 
-    const run = pendingRun;
-    const questions = run?.questions || getActiveQuestions();
-    const mode = run?.mode || 'single';
+    if (messageId < run.targetMessageFloor) return;
+    const questions = run.questions || [];
+    const mode = run.mode || 'single';
     const rawText = message.mes || '';
     let parsed;
     let latest;
