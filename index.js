@@ -1,7 +1,13 @@
+import {
+    API_PROVIDERS, providerId, getProvider, normalizeEndpoint, connectionSignature, switchProvider,
+    buildGenerationRequest, buildModelsRequest, extractModelIds, readGenerationText,
+    requestProvider, testConnection,
+} from './api-providers.mjs';
+
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.1';
+const STSC_VERSION = '0.4.2';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -37,12 +43,14 @@ const STSC_REMOTE_RELEASE_URLS = Object.freeze([
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-09-07',
-    title: '修复角色卡开场白代码块被删除',
+    releasedAt: '2026-09-26',
+    title: '多供应商自检 API 与连接测试',
     changes: Object.freeze([
-        '修复导入角色卡时，首条开场白恰好以三个反引号开头和结尾会被插件误删代码围栏的问题。',
-        '插件现在只处理自己发起的生成，不再解析角色卡导入、聊天载入等其他流程产生的AI消息。',
-        '普通Markdown代码块保持原样；仅当围栏内部确实包含插件自检协议时，才兼容移除外层围栏并解析。',
+        '新增火山方舟 Plan、百度千帆 Plan、OpenAI/GPT、DeepSeek、Claude、Gemini、GLM及自定义 OpenAI 兼容供应商适配。',
+        '支持手动填写模型 ID 和独立连接测试；模型列表不可用时仍可手动使用，刷新列表不再覆盖已填模型。',
+        '保留 Plan 专属接口路径，Claude 和 Gemini 使用酒馆原生转发；切换供应商会清空旧密钥和模型。',
+        '自检只读取最终文本，跳过思考内容；错误提示简化并避免回显密钥或聊天资料。',
+        '保留 v0.4.1 的开场白代码围栏修复；60 项模拟及酒馆转发合同测试通过，真实账户与移动端仍需验收。',
     ]),
 });
 
@@ -101,6 +109,7 @@ const DEFAULT_SETTINGS = Object.freeze({
         role: 'system',
     },
     dualApi: {
+        provider: 'custom',
         endpoint: '',
         apiKey: '',
         model: '',
@@ -190,6 +199,9 @@ let dualApiModelsLoading = false;
 let dualApiModelsError = '';
 let dualApiModelsSignature = '';
 let dualApiModelFetchTimer = null;
+let dualApiModelsController = null;
+let dualApiConnectionTestBusy = false;
+let dualApiConnectionTestResult = null;
 
 function sanitizeLogText(value) {
     return String(value ?? '')
@@ -370,6 +382,7 @@ function normalizeSettings() {
     if (settings.mode === 'strict') settings.mode = 'single';
     settings.mode = ['single', 'dual_api'].includes(settings.mode) ? settings.mode : 'single';
     if (!settings.dualApi || typeof settings.dualApi !== 'object') settings.dualApi = clone(DEFAULT_SETTINGS.dualApi);
+    settings.dualApi.provider = providerId(settings.dualApi.provider);
     settings.dualApi.endpoint = String(settings.dualApi.endpoint || '');
     settings.dualApi.apiKey = String(settings.dualApi.apiKey || '');
     settings.dualApi.model = String(settings.dualApi.model || '');
@@ -861,48 +874,13 @@ function clampNumber(value, min, max, fallback) {
     return Math.min(max, Math.max(min, number));
 }
 
-function normalizeDualApiBaseUrl(value) {
-    const raw = String(value || '').trim();
-    if (!raw) return '';
-
-    try {
-        const url = new URL(raw);
-        url.hash = '';
-        url.search = '';
-        let path = url.pathname.replace(/\/+$/g, '');
-        path = path
-            .replace(/\/chat\/completions$/i, '')
-            .replace(/\/responses$/i, '')
-            .replace(/\/models$/i, '');
-        url.pathname = path || '/';
-        return url.toString().replace(/\/+$/g, '');
-    } catch {
-        return '';
-    }
+function normalizeDualApiBaseUrl(value, provider = getUiSettings()?.dualApi?.provider) {
+    return normalizeEndpoint(value, provider);
 }
 
 function dualApiConnectionSignature(dual = getUiSettings()?.dualApi) {
     if (!dual) return '';
-    return `${normalizeDualApiBaseUrl(dual.endpoint)}\n${String(dual.apiKey || '')}`;
-}
-
-function extractDualApiModelIds(payload) {
-    const candidates = [
-        payload?.data,
-        payload?.data?.data,
-        payload?.models,
-        payload?.result,
-    ];
-    const list = candidates.find(value => Array.isArray(value)) || [];
-    const ids = list
-        .map(item => {
-            if (typeof item === 'string') return item;
-            if (!item || typeof item !== 'object') return '';
-            return item.id || item.name || item.model || '';
-        })
-        .map(value => String(value || '').trim())
-        .filter(Boolean);
-    return [...new Set(ids)].sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+    return connectionSignature(dual);
 }
 
 function dualApiModelOptionsHtml(dual) {
@@ -914,7 +892,7 @@ function dualApiModelOptionsHtml(dual) {
     }
 
     if (dualApiModels.length) {
-        return dualApiModels.map(model => `<option value="${escapeHtml(model)}" ${model === savedModel ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('');
+        return '<option value="">从列表选择（也可手填）</option>' + dualApiModels.map(model => `<option value="${escapeHtml(model)}" ${model === savedModel ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('');
     }
 
     if (!endpoint) {
@@ -923,23 +901,24 @@ function dualApiModelOptionsHtml(dual) {
 
     if (dualApiModelsError) {
         const saved = savedModel ? `<option value="${escapeHtml(savedModel)}" selected>${escapeHtml(savedModel)}（上次选择）</option>` : '';
-        return `${saved}<option value="" ${saved ? '' : 'selected'}>模型获取失败，请检查接口</option>`;
+        return `${saved}<option value="" ${saved ? '' : 'selected'}>列表不可用，可手动填写模型</option>`;
     }
 
     if (savedModel) {
-        return `<option value="${escapeHtml(savedModel)}" selected>${escapeHtml(savedModel)}（等待刷新）</option>`;
+        return `<option value="${escapeHtml(savedModel)}" selected>${escapeHtml(savedModel)}（已填写）</option>`;
     }
 
-    return '<option value="">模型将自动获取</option>';
+    return '<option value="">可手动填写模型 ID</option>';
 }
 
 function dualApiModelStatusText(dual) {
+    if (!getProvider(dual).models) return '此预设使用手动模型 ID，不依赖 /models；可点击“测试连接”验证。';
     const endpoint = normalizeDualApiBaseUrl(dual.endpoint);
-    if (!endpoint) return '填写接口地址后，插件会自动读取该接口提供的模型列表。';
+    if (!endpoint) return '请填写有效基础地址，再点击刷新模型或手动填写模型 ID。';
     if (dualApiModelsLoading) return '正在连接接口并读取模型列表……';
     if (dualApiModelsError) return dualApiModelsError;
-    if (dualApiModels.length) return `已获取 ${dualApiModels.length} 个可用模型。`;
-    return '等待自动获取模型列表。';
+    if (dualApiModels.length) return `已读取 ${dualApiModels.length} 个模型 ID（可能仅含首批）；列表不保证每个模型都支持文本自检，可手动填写。原有模型不会被自动替换。`;
+    return '可点击刷新模型；获取不到列表时仍可手动填写模型 ID。';
 }
 
 function updateDualApiModelControl() {
@@ -956,17 +935,10 @@ function updateDualApiModelControl() {
     const endpoint = normalizeDualApiBaseUrl(dual.endpoint);
     select.disabled = !endpoint || dualApiModelsLoading || !dualApiModels.length;
 
-    if (dualApiModels.length) {
-        const selected = dualApiModels.includes(dual.model) ? dual.model : dualApiModels[0];
-        if (dual.model !== selected) {
-            dual.model = selected;
-            markDirty();
-        }
-        select.value = selected;
-    }
+    if (dualApiModels.length) select.value = dualApiModels.includes(dual.model) ? dual.model : '';
 
     if (button) {
-        button.disabled = !endpoint || dualApiModelsLoading;
+        button.disabled = !endpoint || dualApiModelsLoading || !getProvider(dual).models;
         button.textContent = dualApiModelsLoading ? '获取中…' : '刷新模型';
     }
 
@@ -978,6 +950,9 @@ function updateDualApiModelControl() {
 }
 
 function resetDualApiModelState() {
+    dualApiModelsController?.abort();
+    dualApiModelsController = null;
+    invalidateApiConnectionTest();
     dualApiModels = [];
     dualApiModelsLoading = false;
     dualApiModelsError = '';
@@ -987,6 +962,11 @@ function resetDualApiModelState() {
         dualApiModelFetchTimer = null;
     }
     updateDualApiModelControl();
+}
+
+function invalidateApiConnectionTest() {
+    dualApiConnectionTestResult = null;
+    $('#stsc_api_test_status').html('<i class="stsc-signal is-na"></i>自检API尚未测试');
 }
 
 function scheduleDualApiModelFetch(delay = 650, { force = false, showToast = false } = {}) {
@@ -1003,7 +983,7 @@ async function fetchDualApiModels({ force = false, showToast = false } = {}) {
     if (!dual) return [];
 
     const endpoint = normalizeDualApiBaseUrl(dual.endpoint);
-    if (!endpoint) {
+    if (!endpoint || !getProvider(dual).models || (providerId(dual.provider) !== 'custom' && !String(dual.apiKey || '').trim())) {
         dualApiModels = [];
         dualApiModelsError = '';
         dualApiModelsSignature = '';
@@ -1020,63 +1000,73 @@ async function fetchDualApiModels({ force = false, showToast = false } = {}) {
     dualApiModelsLoading = true;
     dualApiModelsError = '';
     dualApiModelsSignature = signature;
+    dualApiModelsController?.abort();
+    const controller = new AbortController();
+    dualApiModelsController = controller;
+    const timer = setTimeout(() => controller.abort(), 20000);
     updateDualApiModelControl();
 
     try {
-        const context = ctx();
-        const headers = {
-            'Content-Type': 'application/json',
-            ...(context?.getRequestHeaders?.() || {}),
-        };
-        const response = await fetch('/api/backends/chat-completions/status', {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({
-                chat_completion_source: 'openai',
-                reverse_proxy: endpoint,
-                proxy_password: String(dual.apiKey || ''),
-            }),
+        const payload = await requestProvider('status', buildModelsRequest(dual), {
+            headers: ctx()?.getRequestHeaders?.() || {},
+            signal: controller.signal,
         });
-
-        let payload = {};
-        try {
-            payload = await response.json();
-        } catch {
-            payload = {};
-        }
-
-        if (dualApiConnectionSignature(getUiSettings()?.dualApi) !== signature) {
+        if (dualApiModelsController !== controller || dualApiConnectionSignature(getUiSettings()?.dualApi) !== signature) {
             return [];
         }
 
-        const models = extractDualApiModelIds(payload);
-        if (!response.ok || payload?.error || !models.length) {
-            const message = String(payload?.message || payload?.error?.message || '').trim();
-            throw new Error(message || '没有读取到模型列表。请确认填写的是以 /v1 结尾的 OpenAI 兼容接口，并且该接口支持 /models。');
-        }
+        const models = extractModelIds(payload, dual);
+        if (!models.length) throw new Error('接口没有提供模型列表；可手动填写模型 ID 后测试连接。');
 
         dualApiModels = models;
         dualApiModelsError = '';
-        const liveDual = getUiSettings().dualApi;
-        if (!models.includes(liveDual.model)) {
-            liveDual.model = models[0];
-            markDirty();
-        }
         if (showToast) toastr.success(`已获取 ${models.length} 个模型。`, '墨提斯之镜');
         return models;
     } catch (error) {
-        if (dualApiConnectionSignature(getUiSettings()?.dualApi) !== signature) {
+        if (dualApiModelsController !== controller || dualApiConnectionSignature(getUiSettings()?.dualApi) !== signature) {
             return [];
         }
         dualApiModels = [];
-        dualApiModelsError = `模型获取失败：${String(error?.message || error || '未知错误')}`;
+        dualApiModelsError = `模型列表不可用：${error.name === 'AbortError' ? '读取超时。' : error.message} 可手动填写模型后测试连接。`;
         if (showToast) toastr.error(dualApiModelsError, '墨提斯之镜');
         return [];
     } finally {
-        if (dualApiConnectionSignature(getUiSettings()?.dualApi) === signature) {
+        clearTimeout(timer);
+        if (dualApiModelsController === controller && dualApiConnectionSignature(getUiSettings()?.dualApi) === signature) {
+            dualApiModelsController = null;
             dualApiModelsLoading = false;
             updateDualApiModelControl();
         }
+    }
+}
+
+function apiTestSignature(dual) {
+    return dualApiConnectionSignature(dual) + '\n' + String(dual?.model || '') + '\n' + String(dual?.maxTokens || '');
+}
+
+async function testDualApiConnection() {
+    if (dualApiConnectionTestBusy) return;
+    const dual = { ...getUiSettings().dualApi };
+    const signature = apiTestSignature(dual);
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), clampNumber(dual.timeoutSeconds, 60, 300, 150) * 1000);
+    dualApiConnectionTestBusy = true;
+    const button = document.getElementById('stsc_test_api_connection');
+    if (button) { button.disabled = true; button.textContent = '测试中…'; }
+    try {
+        await testConnection(dual, { headers: ctx()?.getRequestHeaders?.() || {}, signal: controller.signal });
+        if (apiTestSignature(getUiSettings().dualApi) !== signature) return;
+        dualApiConnectionTestResult = { signature, ok: true };
+        toastr.success('连接成功，所选模型已返回文本。请保存设置后使用。', '墨提斯之镜');
+    } catch (error) {
+        if (apiTestSignature(getUiSettings().dualApi) !== signature) return;
+        dualApiConnectionTestResult = { signature, ok: false };
+        toastr.error(error.name === 'AbortError' ? '连接测试超时，请稍后再试。' : error.message, '墨提斯之镜');
+    } finally {
+        clearTimeout(timeout);
+        dualApiConnectionTestBusy = false;
+        renderSettingsTab();
+        updateSaveState();
     }
 }
 
@@ -2113,48 +2103,11 @@ ${buildQuestionXml(questions)}
     ];
 }
 
-function extractDualApiText(payload) {
-    const choices = Array.isArray(payload?.choices) ? payload.choices : [];
-    const first = choices[0] || {};
-    const candidates = [
-        first?.message?.content,
-        first?.message?.reasoning_content,
-        first?.text,
-        payload?.content,
-        payload?.text,
-        payload?.response,
-        payload?.output_text,
-    ];
-    for (const candidate of candidates) {
-        if (Array.isArray(candidate)) {
-            const joined = candidate.map(part => {
-                if (typeof part === 'string') return part;
-                return part?.text || part?.content || part?.value || '';
-            }).join('\n').trim();
-            if (joined) return joined;
-        }
-        const text = compactPromptText(candidate);
-        if (text && text !== '[object Object]') return text;
-    }
-    return '';
-}
-
 function isTransientDualApiFailure(error) {
+    if (error?.transient === false) return false;
     if (error?.transient === true) return true;
     if (error?.name === 'TypeError') return true;
     return /(?:429|5\d\d|rate.?limit|too many requests|temporar|overload|network|fetch failed|socket|timeout|超时|限流|繁忙|网络)/i.test(String(error?.message || error || ''));
-}
-
-function dualApiProviderErrorText(payload, responseText = '') {
-    const candidate = payload?.error?.message ?? payload?.message ?? payload?.error ?? responseText;
-    if (candidate && typeof candidate === 'object') {
-        try {
-            return compactPromptText(JSON.stringify(candidate));
-        } catch {
-            return compactPromptText(String(candidate));
-        }
-    }
-    return compactPromptText(candidate);
 }
 
 function waitForDualApiRetry(milliseconds) {
@@ -2166,10 +2119,10 @@ async function callDualApiSelfCheck(
     { compact = false, allowTransientRetry = true, timeoutSecondsOverride = 0 } = {},
 ) {
     const dual = settings.dualApi;
-    const endpoint = normalizeDualApiBaseUrl(dual.endpoint);
+    const endpoint = normalizeEndpoint(dual.endpoint, dual.provider);
     const model = String(dual.model || '').trim();
     if (!endpoint) throw new Error('尚未填写有效的自检API接口地址。');
-    if (!model) throw new Error('尚未选择自检模型。请先在设置页获取并选择模型，然后保存。');
+    if (!model) throw new Error('尚未填写自检模型。请先在设置页手动填写或选择模型，然后保存。');
 
     const context = ctx();
     const configuredTimeout = clampNumber(timeoutSecondsOverride || dual.timeoutSeconds, 60, 300, 150);
@@ -2189,49 +2142,12 @@ async function callDualApiSelfCheck(
                 'Content-Type': 'application/json',
                 ...(context?.getRequestHeaders?.() || {}),
             };
-            const response = await fetch('/api/backends/chat-completions/generate', {
-                method: 'POST',
+            const messages = buildDualApiMessages(chat, questions, references, temporaryInstructions, settings, { compact: attemptCompact });
+            const payload = await requestProvider('generate', buildGenerationRequest(dual, messages), {
                 headers,
                 signal: controller.signal,
-                body: JSON.stringify({
-                    type: 'quiet',
-                    messages: buildDualApiMessages(chat, questions, references, temporaryInstructions, settings, { compact: attemptCompact }),
-                    model,
-                    temperature: 0.15,
-                    frequency_penalty: 0,
-                    presence_penalty: 0,
-                    top_p: 1,
-                    max_tokens: clampNumber(dual.maxTokens, 256, 12000, 4096),
-                    stream: false,
-                    chat_completion_source: 'openai',
-                    reverse_proxy: endpoint,
-                    proxy_password: String(dual.apiKey || ''),
-                    include_reasoning: false,
-                }),
             });
-
-            const responseText = await response.text();
-            let payload = {};
-            try {
-                payload = responseText ? JSON.parse(responseText) : {};
-            } catch {
-                payload = { text: responseText };
-            }
-
-            if (!response.ok || payload?.error) {
-                const providerMessage = dualApiProviderErrorText(payload, responseText);
-                const error = new Error(`${response.status ? `HTTP ${response.status}：` : ''}${providerMessage || '自检API返回错误。'}`);
-                error.httpStatus = response.status;
-                error.transient = [408, 425, 429].includes(response.status) || response.status >= 500;
-                throw error;
-            }
-
-            const text = extractDualApiText(payload);
-            if (!text) {
-                const error = new Error('自检API返回成功，但没有读取到任何文本。');
-                error.transient = true;
-                throw error;
-            }
+            const text = readGenerationText(payload);
             return { text, attempts: attempt + 1, compact: attemptCompact };
         } catch (caught) {
             let error = caught instanceof Error ? caught : new Error(String(caught || '未知错误'));
@@ -3494,6 +3410,7 @@ function renderSettingsTab() {
     const dualVisible = settings.mode === 'dual_api';
     const customTurnsVisible = dual.contextMode === 'custom';
     const modelOptions = dualApiModelOptionsHtml(dual);
+    const apiTest = dualApiConnectionTestResult?.signature === apiTestSignature(dual) ? dualApiConnectionTestResult : null;
     $('#stsc_tab_settings').html(`
         ${devMigrationSettingsHtml()}
         <div class="stsc-section">
@@ -3502,7 +3419,8 @@ function renderSettingsTab() {
                 <span><i class="stsc-signal ${settings.enabled ? 'is-on' : 'is-off'}"></i>插件${settings.enabled ? '已启用' : '未启用'}</span>
                 <span><i class="stsc-signal ${settings.generalEnabled ? 'is-on' : 'is-off'}"></i>通用自检${settings.generalEnabled ? '已启用' : '未启用'}</span>
                 <span><i class="stsc-signal ${settings.characterEnabled ? 'is-on' : 'is-off'}"></i>角色自检${settings.characterEnabled ? '已启用' : '未启用'}</span>
-                <span><i class="stsc-signal ${settings.mode === 'dual_api' ? (dualApiModelsError ? 'is-off' : 'is-on') : 'is-na'}"></i>${settings.mode === 'dual_api' ? '双API模式' : '单API模式'}</span>
+                <span><i class="stsc-signal ${settings.mode === 'dual_api' ? 'is-on' : 'is-na'}"></i>${settings.mode === 'dual_api' ? '双API模式' : '单API模式'}</span>
+                <span id="stsc_api_test_status"><i class="stsc-signal ${apiTest ? (apiTest.ok ? 'is-on' : 'is-off') : 'is-na'}"></i>${apiTest ? (apiTest.ok ? '自检API已通过连接测试' : '自检API连接测试失败') : '自检API尚未测试'}</span>
                 <span><i class="stsc-signal ${settings.mode === 'dual_api' ? (dual.transformFormat ? 'is-on' : 'is-off') : 'is-na'}"></i>强力规范转化</span>
                 <span><i class="stsc-signal ${settings.mode === 'dual_api' ? (dual.previousReview ? 'is-on' : 'is-off') : 'is-na'}"></i>上一轮复盘</span>
             </div>
@@ -3546,22 +3464,31 @@ function renderSettingsTab() {
                 双API核心流程已启用：每次生成会先消耗一次自检API调用，再把自检结果临时交给酒馆主API生成正文。可选择开启上一轮复盘和强力规范。
             </div>
 
+            <div class="stsc-field" style="margin-top:12px">
+                <label for="stsc_dual_provider">自检 API 供应商</label>
+                <select id="stsc_dual_provider" class="text_pole">
+                    ${Object.entries(API_PROVIDERS).map(([id, provider]) => `<option value="${id}" ${providerId(dual.provider) === id ? 'selected' : ''}>${escapeHtml(provider.name)}</option>`).join('')}
+                </select>
+                <div class="stsc-muted">${escapeHtml(getProvider(dual).hint)}</div>
+                <div class="stsc-muted">切换供应商会清空当前密钥和模型，保存后生效。不会自动发送连接请求。</div>
+            </div>
             <div class="stsc-grid-2" style="margin-top:12px">
                 <div class="stsc-field">
                     <label>自检API接口地址</label>
                     <input id="stsc_dual_endpoint" class="text_pole" type="text" autocomplete="off" placeholder="例如：https://example.com/v1" value="${escapeHtml(dual.endpoint)}">
-                    <div class="stsc-muted">填写 OpenAI 兼容接口的基础地址，通常以 <code>/v1</code> 结尾；不要填写 <code>/chat/completions</code>。</div>
+                    <div class="stsc-muted">保留供应商给出的完整基础路径，不要统一改成 /v1。不要在地址里包含密钥。</div>
                 </div>
                 <div class="stsc-field">
                     <label>自检模型</label>
+                    <input id="stsc_dual_model_manual" class="text_pole" type="text" autocomplete="off" placeholder="填写控制台中的模型 ID" value="${escapeHtml(dual.model)}">
                     <div class="stsc-model-row">
                         <select id="stsc_dual_model" class="text_pole" ${dualApiModels.length && !dualApiModelsLoading ? '' : 'disabled'}>
                             ${modelOptions}
                         </select>
-                        <button id="stsc_refresh_models" class="menu_button stsc-small-button" type="button" ${normalizeDualApiBaseUrl(dual.endpoint) && !dualApiModelsLoading ? '' : 'disabled'}>${dualApiModelsLoading ? '获取中…' : '刷新模型'}</button>
+                        <button id="stsc_refresh_models" class="menu_button stsc-small-button" type="button" ${normalizeDualApiBaseUrl(dual.endpoint) && getProvider(dual).models && !dualApiModelsLoading ? '' : 'disabled'}>${dualApiModelsLoading ? '获取中…' : '刷新模型'}</button>
                     </div>
                     <div id="stsc_dual_model_status" class="stsc-muted stsc-model-status ${dualApiModelsError ? 'stsc-model-status-error' : ''} ${dualApiModels.length && !dualApiModelsError ? 'stsc-model-status-success' : ''}">${escapeHtml(dualApiModelStatusText(dual))}</div>
-                    <div class="stsc-muted">模型列表会根据接口自动拉取，不需要手动输入模型名称。</div>
+                    <div class="stsc-muted">支持手动填写；刷新列表不会覆盖已填模型。Plan 的模型请按套餐控制台填写。</div>
                 </div>
             </div>
 
@@ -3572,6 +3499,8 @@ function renderSettingsTab() {
                     <button id="stsc_toggle_api_key" class="menu_button stsc-small-button" type="button">显示</button>
                 </div>
                 <div class="stsc-muted">密钥保存在当前酒馆的插件设置中，不会写入导出的预设或资料库文件。</div>
+                <button id="stsc_test_api_connection" class="menu_button" type="button" ${dualApiConnectionTestBusy ? 'disabled' : ''}>${dualApiConnectionTestBusy ? '测试中…' : '测试连接'}</button>
+                <div class="stsc-muted">仅发送一句测试文字，不发送角色卡和聊天记录；会产生少量 API 用量。测试使用当前表单，不自动保存。</div>
             </div>
 
             <div class="stsc-grid-3" style="margin-top:10px">
@@ -3678,12 +3607,8 @@ function renderSettingsTab() {
     `);
 
     if (dualVisible) {
-        const signature = dualApiConnectionSignature(dual);
         setTimeout(() => {
             updateDualApiModelControl();
-            if (normalizeDualApiBaseUrl(dual.endpoint) && signature !== dualApiModelsSignature) {
-                scheduleDualApiModelFetch(120);
-            }
         }, 0);
     }
 }
@@ -4830,6 +4755,20 @@ function bindUiEvents() {
         markDirty();
         renderAll();
     });
+    $('#stsc_manager_overlay').on('change', '#stsc_dual_provider', function () {
+        getUiSettings().dualApi = switchProvider(getUiSettings().dualApi, this.value);
+        markDirty();
+        resetDualApiModelState();
+        renderSettingsTab();
+        updateSaveState();
+    });
+    $('#stsc_manager_overlay').on('input change', '#stsc_dual_model_manual', function () {
+        getUiSettings().dualApi.model = this.value.trim();
+        markDirty();
+        invalidateApiConnectionTest();
+        updateDualApiModelControl();
+    });
+    $('#stsc_manager_overlay').on('click', '#stsc_test_api_connection', testDualApiConnection);
     $('#stsc_manager_overlay').on('input change', '#stsc_dual_endpoint', function (event) {
         const dual = getUiSettings().dualApi;
         dual.endpoint = this.value;
@@ -4842,20 +4781,18 @@ function bindUiEvents() {
         }
         markDirty();
         resetDualApiModelState();
-        if (normalizeDualApiBaseUrl(dual.endpoint)) scheduleDualApiModelFetch(event.type === 'change' ? 0 : 800);
     });
     $('#stsc_manager_overlay').on('change', '#stsc_dual_model', function () {
         if (!dualApiModels.includes(this.value)) return;
         getUiSettings().dualApi.model = this.value;
+        $('#stsc_dual_model_manual').val(this.value);
+        invalidateApiConnectionTest();
         markDirty();
     });
-    $('#stsc_manager_overlay').on('input change', '#stsc_dual_api_key', function (event) {
+    $('#stsc_manager_overlay').on('input change', '#stsc_dual_api_key', function () {
         getUiSettings().dualApi.apiKey = this.value;
         markDirty();
         resetDualApiModelState();
-        if (normalizeDualApiBaseUrl(getUiSettings().dualApi.endpoint)) {
-            scheduleDualApiModelFetch(event.type === 'change' ? 0 : 800);
-        }
     });
     $('#stsc_manager_overlay').on('click', '#stsc_refresh_models', function () {
         scheduleDualApiModelFetch(0, { force: true, showToast: true });
@@ -4871,6 +4808,7 @@ function bindUiEvents() {
         getUiSettings().dualApi.maxTokens = clampNumber(this.value, 256, 12000, 4096);
         this.value = Math.round(getUiSettings().dualApi.maxTokens);
         markDirty();
+        invalidateApiConnectionTest();
     });
     $('#stsc_manager_overlay').on('change', '#stsc_dual_timeout_seconds', function () {
         getUiSettings().dualApi.timeoutSeconds = clampNumber(this.value, 60, 300, 150);
