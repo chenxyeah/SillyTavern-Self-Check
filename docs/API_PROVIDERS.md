@@ -1,7 +1,23 @@
-# 自检 API 供应商适配设计（正式版 v0.4.2）
+# 自检 API 供应商适配设计（正式版 v0.4.3）
 
 核对日期：2026-09-26。基线：正式版 v0.4.1，提交 `e32802c501a425217e39446c0bbd0bcecc52678e`。
-本次版本为正式版 v0.4.2；实现与模拟测试已完成。发布不等于已完成真实供应商联调或移动端交互验收，详见文末测试范围。
+当前版本为正式版 v0.4.3；实现与模拟测试已完成。发布不等于已完成真实供应商联调或移动端交互验收，详见文末测试范围。
+
+## v0.4.3：请求参数与附加提示词
+
+2026-09-26 实现，2026-09-27 随正式版 0.4.3 发布；旧版 0.4.2 不包含以下内容：
+
+- “插件设置 → 双 API 调用设置”增加温度、Top P、思考强度，不新增第七个标签页。空值不发送，保留供应商默认；0 不误判为空。温度接受 0–2（Claude 为 0–1），Top P 接受 0–1，具体模型仍可能有更严格限制。通常只调温度或 Top P 之一。
+- 思考档位提供默认／低／中／高，当前只开放给 OpenAI、自定义兼容及 Google Gemini。通过 reasoning_effort 发送，非所有模型都支持；不提供通用“关闭思考”。Plan、GLM、DeepSeek、原生 Claude 暂不透传该字段，避免把一种协议的参数直接套给另一种协议。
+- **Google 原生预设的特殊行为**：默认档沿用原生 generateContent；用户明确选择低／中／高且地址为官方 HTTPS 根地址时，生成改走同一 Google 官方的 /v1beta/openai/chat/completions，避免旧酒馆丢失 thinkingConfig。模型列表保持原生。第三方原生代理、不同路径／协议不会自动改到 Google；会提示恢复默认或用户自行配置其兼容入口。UI 已说明此选择的效果。
+- 所有副 API 默认最大回复长度统一 8192：新配置、缺失／空值／非法值回退、旧 2000 默认值迁移、重置按钮及适配层。保留既有手动数值（如 4096）；“恢复默认参数”可切为 8192，同时清空三项可选参数。不更改酒馆主 API 的设置。上限仍为 12000，思考模型可能将思考与回答合计，8192 不是无条件杜绝空回的保证。
+- 新增默认空白的“前置附加提示词”：放在自检 system 消息开头，插件原有输出约束随后保留。普通及精简重试均使用；不直接添加到主 API 请求。不会内置破限文本或承诺解除供应商限制。
+- 连接测试使用当前请求参数，但不携带附加提示词／聊天／角色资料；新增参数变化会让旧测试结果失效。切换供应商清空密钥、模型和三项可选参数，保留回复长度与附加提示词。编辑先存草稿，保存才影响自检。
+- 可选字段只允许上述固定字段，不允许通过任意 JSON 覆盖鉴权、消息、流式设置或地址。错误仍为简短类别，不回显提示词与密钥。新版 GPT / Claude 可能拒绝采样参数，400 提示恢复默认；本地范围校验不能替代服务端的模型能力校验。
+
+本次依据 [OpenAI Chat Completions](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)、[Gemini 官方 OpenAI 兼容接口](https://ai.google.dev/gemini-api/docs/openai)、[Gemini 思考说明](https://ai.google.dev/gemini-api/docs/generate-content/thinking)、[Claude Messages](https://platform.claude.com/docs/en/api/messages/create)。使用 OpenAI Docs 技能核对参数，不根据非官方“破限”教程实现。
+
+验证：80 项自动测试全部通过、0 跳过（其中 19 项加载本机酒馆实际后端），包含真实转发的温度／Top P／reasoning_effort、8192 默认、保存／放弃草稿、提示词隔离、旧功能回归。另以实际设置渲染函数和 CSS 在隔离 Edge 中检查 360px / 980px 布局、默认值和无横向溢出，查看截图。没有付费调用、没有修改正在使用的酒馆，真实账户与手机实机联调仍待用户安排。
 
 ## 范围与架构
 
@@ -28,7 +44,7 @@
 ## 协议差异
 
 - OpenAI 兼容类发送 Bearer 密钥，保留 Plan 和自定义路径，只追加 /chat/completions。
-- GPT 使用 `max_completion_tokens`；其他兼容类使用 `max_tokens`。省略 temperature、top_p 和惩罚参数，减少推理模型拒绝请求的情况。使用酒馆 custom 源，避免酒馆 OpenAI 源按模型名额外改写参数。
+- GPT 使用 `max_completion_tokens`；其他兼容类使用 `max_tokens`。默认省略 temperature、top_p 和惩罚参数，减少推理模型拒绝请求的情况。使用酒馆 custom 源；本地可选参数透传差异见上节。
 - Claude 使用酒馆原生源，由酒馆转成 system/messages、max_tokens，并加 `x-api-key` 与 `anthropic-version: 2023-06-01`。适配层优先读取保留的原生 content 文本块，跳过 thinking/tool_use。
 - Gemini 使用酒馆原生源，由酒馆转成 systemInstruction、contents、user/model、generationConfig，并选择 generateContent。输入可带 models/ 前缀，发送前移除。读取候选最终文本，排除 thought。
 - 模型列表借用酒馆 custom status 路由，Claude 使用 x-api-key，Gemini 使用 x-goog-api-key，并覆盖 Authorization 为空，避免借用主接口保存的密钥。
@@ -38,7 +54,7 @@
 ## 配置、安全与容错
 
 旧设置缺少 provider 时迁移为 custom；不重置原地址、密钥、模型或其他自检参数。
-明确选择另一供应商时清空当前草稿密钥、模型，并填入该供应商默认地址；保存前不影响已保存配置。
+明确选择另一供应商时清空当前草稿密钥、模型和可选请求参数，并填入该供应商默认地址；保存前不影响已保存配置。
 不自动发起模型列表／连接请求，只有用户点击或正常自检生成才请求。
 
 地址只接受 HTTP(S)，拒绝用户名密码、查询参数和片段；密钥放独立字段。不把 /responses 静默改写为 Chat Completions。
@@ -100,6 +116,6 @@ $env:ST_SOURCE_ROOT = 'E:\Sillytavern\SillyTavern-1.12.14'
 node --test --test-reporter=spec tests/*.test.mjs
 ```
 
-本轮结果：60 项全部通过，0 失败，0 跳过（设置了 ST_SOURCE_ROOT）。未设置时会跳过 13 项酒馆合同测试，其余 47 项仍可独立运行。
+原 v0.4.2 发布时结果：60 项全部通过，0 失败，0 跳过（设置了 ST_SOURCE_ROOT）。本地最新请求参数改动共 80 项；未设置 ST_SOURCE_ROOT 时会跳过 19 项酒馆合同测试，其余 61 项仍可独立运行。
 涵盖八家请求、路径、鉴权、最终文本、配置兼容、列表失败手填、过期结果、测试连接隔离、认证不重试、精简重试、正式版身份与开场白代码围栏回归。
 语法、版本 JSON 和 git diff --check 通过。未使用真实 API 密钥；未做真实浏览器视觉／移动端交互测试。

@@ -1,5 +1,34 @@
 // Provider adapters for SillyTavern's same-origin chat-completions backend.
 // Never send browser requests (or SillyTavern's CSRF headers) to a provider.
+export const DEFAULT_MAX_TOKENS = 8192;
+
+export function normalizeMaxTokens(value) {
+    const number = Number(value);
+    return value == null || String(value).trim() === '' || !Number.isFinite(number)
+        ? DEFAULT_MAX_TOKENS : Math.round(Math.min(12000, Math.max(256, number)));
+}
+
+export function reasoningOptions(config = {}) {
+    return ['custom', 'openai', 'gemini'].includes(providerId(config.provider)) ? ['low', 'medium', 'high'] : [];
+}
+
+export function requestParameters(config = {}) {
+    const params = {};
+    for (const [field, wire, max] of [['temperature', 'temperature', config.provider === 'claude' ? 1 : 2], ['topP', 'top_p', 1]]) {
+        const value = config[field];
+        if (value == null || String(value).trim() === '') continue;
+        const number = Number(value);
+        if (!Number.isFinite(number) || number < 0 || number > max) throw new Error(wire + ' 必须在 0～' + max + ' 之间，或留空使用供应商默认值。');
+        params[wire] = number;
+    }
+    const effort = String(config.reasoningEffort || '').trim();
+    if (effort) {
+        if (!reasoningOptions(config).includes(effort)) throw new Error('当前供应商不支持此思考档位，请改为“供应商默认”。');
+        params.reasoning_effort = effort;
+    }
+    return params;
+}
+
 export const API_PROVIDERS = Object.freeze({
     custom: { name: '自定义 OpenAI 兼容', endpoint: '', protocol: 'openai', models: true,
         hint: '填写服务商提供的基础地址；保留 /v1 或其他自定义路径。仅支持 Chat Completions，不支持 Responses 专用接口。' },
@@ -64,7 +93,8 @@ export function switchProvider(config, nextProvider) {
     const id = providerId(nextProvider);
     if (id === providerId(config.provider)) return { ...config };
     // Do not reuse an old vendor's secret at the new endpoint.
-    return { ...config, provider: id, endpoint: API_PROVIDERS[id].endpoint, apiKey: '', model: '' };
+    return { ...config, provider: id, endpoint: API_PROVIDERS[id].endpoint, apiKey: '', model: '',
+        temperature: '', topP: '', reasoningEffort: '' };
 }
 
 function validated(config, needsModel = false) {
@@ -86,26 +116,35 @@ function validated(config, needsModel = false) {
 
 export function buildGenerationRequest(config, messages) {
     const { id, provider, endpoint, key, model } = validated(config, true);
-    const limit = Math.round(Math.min(12000, Math.max(256, Number(config.maxTokens) || 4096)));
-    const common = { type: 'quiet', messages, model, stream: false };
+    const limit = normalizeMaxTokens(config.maxTokens);
+    const params = requestParameters(config);
+    const common = { type: 'quiet', messages, model, stream: false, ...params };
     if (provider.protocol === 'claude') {
         return { ...common, chat_completion_source: 'claude', reverse_proxy: endpoint,
             proxy_password: key, max_tokens: limit, claude_use_sysprompt: true, include_reasoning: false };
     }
-    if (provider.protocol === 'gemini') {
+    let generationEndpoint = endpoint;
+    if (provider.protocol === 'gemini' && params.reasoning_effort) {
+        // Old ST native backends discard thinkingConfig. This explicit setting opts
+        // into Google's documented compatible endpoint, never a third-party host.
+        if (endpoint !== API_PROVIDERS.gemini.endpoint) {
+            throw new Error('Gemini 原生代理暂不能透传思考档位。请选供应商默认，或使用服务商提供的 OpenAI 兼容地址。');
+        }
+        generationEndpoint += '/v1beta/openai';
+    } else if (provider.protocol === 'gemini') {
         return { ...common, chat_completion_source: 'makersuite', reverse_proxy: endpoint,
             proxy_password: key, max_tokens: limit, use_makersuite_sysprompt: true,
             include_reasoning: false, enable_web_search: false };
     }
     // The custom backend avoids ST's model-name heuristics and preserves Plan paths.
     // Explicitly override Authorization so the main API's saved key is never borrowed.
-    const body = id === 'openai' ? { max_completion_tokens: limit } : { max_tokens: limit };
-    return { ...common, chat_completion_source: 'custom', custom_url: endpoint,
+    const body = { ...(id === 'openai' ? { max_completion_tokens: limit } : { max_tokens: limit }), ...params };
+    return { ...common, chat_completion_source: 'custom', custom_url: generationEndpoint,
         custom_include_headers: JSON.stringify({ Authorization: key ? 'Bearer ' + key : '' }),
         custom_include_body: JSON.stringify(body),
-        // No temperature/top_p penalties: many reasoning models reject these.
-        custom_exclude_body: JSON.stringify(['temperature', 'top_p', 'top_k', 'presence_penalty', 'frequency_penalty',
-            id === 'openai' ? 'max_tokens' : 'max_completion_tokens']) };
+        // Omit unspecified sampling parameters; never inherit main-API settings.
+        custom_exclude_body: JSON.stringify(['temperature', 'top_p', 'reasoning_effort', 'top_k', 'presence_penalty', 'frequency_penalty',
+            id === 'openai' ? 'max_tokens' : 'max_completion_tokens'].filter(field => !Object.hasOwn(params, field))) };
 }
 
 export function buildModelsRequest(config) {
@@ -177,7 +216,7 @@ export function providerError(status, payload = {}) {
         message = '地址或模型不存在；请核对基础路径和模型 ID。';
         transient = false;
     } else if (status === 400) {
-        message = '接口不接受当前请求；请核对协议、模型和最大回复长度。';
+        message = '接口不接受当前请求；请核对模型和回复长度，尝试将温度、Top P、思考强度恢复默认。';
         transient = false;
     } else if (payload?.error === true) {
         // Older native ST backends flatten even authentication failures into HTTP 500.

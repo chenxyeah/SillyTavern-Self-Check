@@ -101,3 +101,37 @@ for (const [id, provider] of Object.entries(API_PROVIDERS)) {
         assert.deepEqual(extractModelIds(reply.body, config), [id === 'gemini' ? 'gemini-text' : 'text-model']);
     });
 }
+
+for (const [id, model, params] of [
+    ['custom', 'text-model', { temperature: 0, topP: .8, reasoningEffort: 'low' }],
+    ['openai', 'o3', { reasoningEffort: 'low' }],
+    ['claude', 'claude-3-7-sonnet-latest', { temperature: .4 }],
+    ['claude', 'claude-3-7-sonnet-latest', { topP: .8 }],
+    ['gemini', 'gemini-2.5-flash', { temperature: 0, topP: .8 }],
+    ['gemini', 'gemini-3.8-flash', { temperature: 1, reasoningEffort: 'low' }],
+]) {
+    test(id + ': installed ST forwards optional parameters ' + JSON.stringify(params), { skip: !stRoot, timeout: 5000 }, async () => {
+        let outgoing;
+        const cfg = { provider: id, endpoint: API_PROVIDERS[id].endpoint || 'https://custom.example/v1',
+            apiKey: 'MOCK_KEY', model, ...params };
+        const send = backend(async (url, options) => {
+            outgoing = { url: String(url), headers: options.headers, body: JSON.parse(options.body) };
+            return new Response(JSON.stringify(id === 'claude' ? { content: [{ type: 'text', text: 'OK' }] }
+                : id === 'gemini' && !params.reasoningEffort ? { candidates: [{ content: { parts: [{ text: 'OK' }] } }] }
+                    : { choices: [{ message: { content: 'OK' } }] }));
+        });
+        const result = await send('generate', buildGenerationRequest(cfg, [{ role: 'user', content: 'TEST' }]));
+        assert.equal(result.status, 200);
+        assert.equal(readGenerationText(result.body), 'OK');
+        const nativeGemini = id === 'gemini' && !params.reasoningEffort;
+        const body = nativeGemini ? outgoing.body.generationConfig : outgoing.body;
+        assert.equal(body.temperature, params.temperature);
+        assert.equal(body[nativeGemini ? 'topP' : 'top_p'], params.topP);
+        assert.equal(body.reasoning_effort, params.reasoningEffort);
+        assert.equal(body[nativeGemini ? 'maxOutputTokens' : id === 'openai' ? 'max_completion_tokens' : 'max_tokens'], 8192);
+        if (id === 'gemini' && params.reasoningEffort) {
+            assert.equal(outgoing.url, 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions');
+            assert.equal(outgoing.headers.Authorization, 'Bearer MOCK_KEY');
+        }
+    });
+}

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {
     API_PROVIDERS, providerId, getProvider, normalizeEndpoint, connectionSignature, switchProvider,
     buildGenerationRequest, buildModelsRequest, extractModelIds, extractResponseText,
-    providerError, requestProvider, readGenerationText, testConnection,
+    providerError, requestProvider, readGenerationText, testConnection, normalizeMaxTokens, requestParameters,
 } from '../api-providers.mjs';
 
 const config = (id, extras = {}) => ({ provider: id, endpoint: API_PROVIDERS[id].endpoint || 'https://custom.example/v1',
@@ -150,7 +150,7 @@ test('errors are short and never echo secrets/prompts/provider HTML', async () =
 
 test('request transport is same-origin and connection probe sends no chat/state', async () => {
     let calls = 0;
-    const cfg = config('qianfan', { chat: ['PRIVATE'], questions: ['PRIVATE'], previousReview: true });
+    const cfg = config('qianfan', { chat: ['PRIVATE'], questions: ['PRIVATE'], preamble: 'PRIVATE PROMPT', previousReview: true });
     assert.equal(await testConnection(cfg, { headers: { 'X-CSRF-Token': 'LOCAL' }, fetchImpl: async (url, options) => {
         calls++;
         assert.equal(url, '/api/backends/chat-completions/generate');
@@ -171,4 +171,66 @@ test('transport rejects upstream JSON errors, preserves AbortError and supports 
         new Promise((_resolve, reject) => options.signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')))) });
     controller.abort();
     await assert.rejects(pending, { name: 'AbortError' });
+});
+
+test('all providers default to 8192; explicit limits remain unchanged', () => {
+    for (const id of Object.keys(API_PROVIDERS)) {
+        for (const value of [undefined, null, '', '  ', NaN, Infinity, 'invalid']) {
+            const req = buildGenerationRequest(config(id, { maxTokens: value }), messages);
+            const body = req.custom_include_body ? JSON.parse(req.custom_include_body) : req;
+            assert.equal(body.max_tokens ?? body.max_completion_tokens, 8192);
+        }
+        assert.equal(normalizeMaxTokens(4096), 4096);
+        assert.equal(normalizeMaxTokens(0), 256);
+        assert.equal(normalizeMaxTokens(20000), 12000);
+    }
+});
+
+test('sampling fields preserve zero, omit blank defaults and validate ranges', () => {
+    assert.deepEqual(requestParameters({ temperature: '0', topP: '0' }), { temperature: 0, top_p: 0 });
+    assert.deepEqual(requestParameters({ temperature: ' ', topP: null, reasoningEffort: '' }), {});
+    for (const value of [-1, 3, 'invalid', Infinity]) {
+        assert.throws(() => requestParameters({ temperature: value }), /temperature/);
+    }
+    assert.throws(() => requestParameters({ topP: 1.1 }), /top_p/);
+    assert.throws(() => requestParameters({ provider: 'claude', temperature: 1.5 }), /temperature/);
+});
+
+test('configured parameters are included, not accidentally excluded by ST custom source', () => {
+    const req = buildGenerationRequest(config('openai', { temperature: '0', topP: '.8', reasoningEffort: 'low' }), messages);
+    assert.deepEqual(JSON.parse(req.custom_include_body), {
+        max_completion_tokens: 4096, temperature: 0, top_p: .8, reasoning_effort: 'low',
+    });
+    for (const key of ['temperature', 'top_p', 'reasoning_effort']) assert.ok(!JSON.parse(req.custom_exclude_body).includes(key));
+    assert.equal(req.reasoning_effort, 'low', 'old ST o-series heuristics read top-level field');
+});
+
+test('Gemini explicit thinking opts into Google compatibility only on official endpoint', () => {
+    for (const effort of ['low', 'medium', 'high']) {
+        const req = buildGenerationRequest(config('gemini', { reasoningEffort: effort }), messages);
+        assert.equal(req.custom_url, API_PROVIDERS.gemini.endpoint + '/v1beta/openai');
+        assert.equal(req.chat_completion_source, 'custom');
+        assert.equal(JSON.parse(req.custom_include_body).reasoning_effort, effort);
+        assert.equal(JSON.parse(req.custom_include_headers).Authorization, 'Bearer test-only-secret');
+    }
+    for (const endpoint of ['https://proxy.example/google', 'https://generativelanguage.googleapis.com.evil.example',
+        'http://generativelanguage.googleapis.com', API_PROVIDERS.gemini.endpoint + '/proxy']) {
+        assert.throws(() => buildGenerationRequest(config('gemini', { endpoint, reasoningEffort: 'low' }), messages), /原生代理/);
+        assert.equal(buildGenerationRequest(config('gemini', { endpoint }), messages).reverse_proxy, endpoint);
+    }
+    assert.equal(buildGenerationRequest(config('gemini'), messages).chat_completion_source, 'makersuite');
+});
+
+test('unsupported thinking fields fail locally and changing provider resets optional fields only', () => {
+    for (const id of ['claude', 'glm', 'volcengine', 'qianfan', 'deepseek']) {
+        assert.throws(() => buildGenerationRequest(config(id, { reasoningEffort: 'low' }), messages), /思考档位/);
+    }
+    assert.throws(() => requestParameters({ provider: 'gemini', reasoningEffort: 'minimal' }), /思考档位/);
+    const before = config('custom', { temperature: '.5', topP: '.9', reasoningEffort: 'low', preamble: 'CUSTOM PROMPT' });
+    const after = switchProvider(before, 'claude');
+    assert.equal(after.temperature, '');
+    assert.equal(after.topP, '');
+    assert.equal(after.reasoningEffort, '');
+    assert.equal(after.preamble, before.preamble);
+    assert.equal(after.maxTokens, 4096);
 });

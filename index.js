@@ -1,13 +1,13 @@
 import {
     API_PROVIDERS, providerId, getProvider, normalizeEndpoint, connectionSignature, switchProvider,
     buildGenerationRequest, buildModelsRequest, extractModelIds, readGenerationText,
-    requestProvider, testConnection,
+    requestProvider, testConnection, DEFAULT_MAX_TOKENS, normalizeMaxTokens, reasoningOptions, requestParameters,
 } from './api-providers.mjs';
 
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.2';
+const STSC_VERSION = '0.4.3';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -43,14 +43,15 @@ const STSC_REMOTE_RELEASE_URLS = Object.freeze([
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-09-26',
-    title: '多供应商自检 API 与连接测试',
+    releasedAt: '2026-09-27',
+    title: '自检请求参数与快捷指令高亮',
     changes: Object.freeze([
-        '新增火山方舟 Plan、百度千帆 Plan、OpenAI/GPT、DeepSeek、Claude、Gemini、GLM及自定义 OpenAI 兼容供应商适配。',
-        '支持手动填写模型 ID 和独立连接测试；模型列表不可用时仍可手动使用，刷新列表不再覆盖已填模型。',
-        '保留 Plan 专属接口路径，Claude 和 Gemini 使用酒馆原生转发；切换供应商会清空旧密钥和模型。',
-        '自检只读取最终文本，跳过思考内容；错误提示简化并避免回显密钥或聊天资料。',
-        '保留 v0.4.1 的开场白代码围栏修复；60 项模拟及酒馆转发合同测试通过，真实账户与移动端仍需验收。',
+        '新增副 API 请求参数：温度、Top P 与可用的思考强度，默认留空沿用供应商设置。',
+        '新增默认空白的前置附加提示词，仅用于副 API 自检，不携带到连接测试。',
+        '各供应商默认最大回复长度统一为 8192 Token，保留已有手动值，支持一键恢复默认。',
+        'Google 官方地址可通过官方兼容接口透传思考档位；第三方原生地址不会被自动替换。',
+        '悬浮窗快捷指令增加状态高亮：常开绿色、临时一轮金黄、关闭灰色。',
+        '80 项模拟及酒馆转发合同测试通过；真实供应商账户仍需联调，不能保证消除所有空回。',
     ]),
 });
 
@@ -113,7 +114,11 @@ const DEFAULT_SETTINGS = Object.freeze({
         endpoint: '',
         apiKey: '',
         model: '',
-        maxTokens: 4096,
+        maxTokens: DEFAULT_MAX_TOKENS,
+        temperature: '',
+        topP: '',
+        reasoningEffort: '',
+        preamble: '',
         timeoutSeconds: 150,
         retryTransient: true,
         contextMode: 'recent5',
@@ -386,7 +391,8 @@ function normalizeSettings() {
     settings.dualApi.endpoint = String(settings.dualApi.endpoint || '');
     settings.dualApi.apiKey = String(settings.dualApi.apiKey || '');
     settings.dualApi.model = String(settings.dualApi.model || '');
-    settings.dualApi.maxTokens = clampNumber(settings.dualApi.maxTokens, 256, 12000, 4096);
+    settings.dualApi.maxTokens = normalizeMaxTokens(settings.dualApi.maxTokens);
+    settings.dualApi.preamble = String(settings.dualApi.preamble || '');
     settings.dualApi.timeoutSeconds = clampNumber(settings.dualApi.timeoutSeconds, 60, 300, 150);
     settings.dualApi.retryTransient = Boolean(settings.dualApi.retryTransient);
     // beta.3：聊天范围只保留“默认最近5轮 / 自定义 / 全部”。旧界面的跟随、10轮、20轮统一迁移为最近5轮。
@@ -446,7 +452,7 @@ function normalizeSettings() {
     let settingsMigrated = compactedLegacyLogs;
     if (!settings.migrations.dualApiReliabilityV1) {
         // beta.17：旧版默认 2000 Token 容易在 6～8 题时截断；只迁移旧默认值，保留用户主动设置的其他数值。
-        if (Math.round(settings.dualApi.maxTokens) === 2000) settings.dualApi.maxTokens = 4096;
+        if (Math.round(settings.dualApi.maxTokens) === 2000) settings.dualApi.maxTokens = DEFAULT_MAX_TOKENS;
         settings.migrations.dualApiReliabilityV1 = true;
         settingsMigrated = true;
     }
@@ -1041,7 +1047,9 @@ async function fetchDualApiModels({ force = false, showToast = false } = {}) {
 }
 
 function apiTestSignature(dual) {
-    return dualApiConnectionSignature(dual) + '\n' + String(dual?.model || '') + '\n' + String(dual?.maxTokens || '');
+    return dualApiConnectionSignature(dual) + '\n' + JSON.stringify([
+        dual?.model, dual?.maxTokens, dual?.temperature, dual?.topP, dual?.reasoningEffort,
+    ]);
 }
 
 async function testDualApiConnection() {
@@ -2097,7 +2105,7 @@ ${buildQuestionXml(questions)}
 `.trim();
 
     return [
-        { role: 'system', content: systemPrompt },
+        { role: 'system', content: [String(settings.dualApi.preamble || '').trim(), systemPrompt].filter(Boolean).join('\n\n') },
         ...selectedChat,
         { role: 'user', content: questionPrompt },
     ];
@@ -3470,7 +3478,7 @@ function renderSettingsTab() {
                     ${Object.entries(API_PROVIDERS).map(([id, provider]) => `<option value="${id}" ${providerId(dual.provider) === id ? 'selected' : ''}>${escapeHtml(provider.name)}</option>`).join('')}
                 </select>
                 <div class="stsc-muted">${escapeHtml(getProvider(dual).hint)}</div>
-                <div class="stsc-muted">切换供应商会清空当前密钥和模型，保存后生效。不会自动发送连接请求。</div>
+                <div class="stsc-muted">切换供应商会清空当前密钥、模型和可选请求参数，保留附加提示词，保存后生效。不会自动发送连接请求。</div>
             </div>
             <div class="stsc-grid-2" style="margin-top:12px">
                 <div class="stsc-field">
@@ -3500,14 +3508,48 @@ function renderSettingsTab() {
                 </div>
                 <div class="stsc-muted">密钥保存在当前酒馆的插件设置中，不会写入导出的预设或资料库文件。</div>
                 <button id="stsc_test_api_connection" class="menu_button" type="button" ${dualApiConnectionTestBusy ? 'disabled' : ''}>${dualApiConnectionTestBusy ? '测试中…' : '测试连接'}</button>
-                <div class="stsc-muted">仅发送一句测试文字，不发送角色卡和聊天记录；会产生少量 API 用量。测试使用当前表单，不自动保存。</div>
+                <div class="stsc-muted">仅发送一句测试文字，不发送附加提示词、角色卡和聊天记录；会产生少量 API 用量。测试使用当前表单参数，不自动保存。</div>
+            </div>
+
+            <div class="stsc-dual-branch-card" style="margin-top:12px">
+                <div class="stsc-section-title">模型请求参数（可选）</div>
+                <div class="stsc-grid-3">
+                    <div class="stsc-field">
+                        <label for="stsc_dual_temperature">温度 Temperature</label>
+                        <input id="stsc_dual_temperature" class="text_pole" type="number" min="0" max="${dual.provider === 'claude' ? 1 : 2}" step="any" placeholder="供应商默认" value="${escapeHtml(dual.temperature ?? '')}">
+                    </div>
+                    <div class="stsc-field">
+                        <label for="stsc_dual_top_p">Top P</label>
+                        <input id="stsc_dual_top_p" class="text_pole" type="number" min="0" max="1" step="any" placeholder="供应商默认" value="${escapeHtml(dual.topP ?? '')}">
+                    </div>
+                    <div class="stsc-field">
+                        <label for="stsc_dual_reasoning_effort">思考强度</label>
+                        <select id="stsc_dual_reasoning_effort" class="text_pole" ${reasoningOptions(dual).length ? '' : 'disabled'}>
+                            <option value="">供应商默认</option>
+                            ${reasoningOptions(dual).map(value => `<option value="${value}" ${dual.reasoningEffort === value ? 'selected' : ''}>${({ low: '低', medium: '中', high: '高' })[value]}</option>`).join('')}
+                        </select>
+                    </div>
+                </div>
+                <div class="stsc-muted">留空表示不发送该参数。温度影响随机性，Top P 影响候选范围，通常只调其中一个；它们不等于思考预算。部分 GPT 推理模型和新版 Claude 不接受采样参数，遇到参数错误请先留空。</div>
+                <div class="stsc-muted">${dual.provider === 'gemini'
+                    ? 'Google 官方地址选择思考档位后，生成请求改走 Google 官方 OpenAI 兼容接口；默认档仍走原生接口。第三方原生代理请保留默认，或自行配置其兼容地址。低档不等于关闭思考。'
+                    : reasoningOptions(dual).length
+                        ? '思考档位通过 reasoning_effort 发送；仅支持该字段的模型／中转有效，不支持时请选默认。'
+                        : '此供应商暂不提供思考档位透传，使用供应商默认；不会发送无效档位。'}</div>
+                <button id="stsc_dual_reset_parameters" class="menu_button stsc-small-button" type="button">恢复默认参数（8192 Token）</button>
+            </div>
+
+            <div class="stsc-field" style="margin-top:12px">
+                <label for="stsc_dual_preamble">前置附加提示词（可选）</label>
+                <textarea id="stsc_dual_preamble" class="text_pole" rows="5" placeholder="可填写自检模型的补充要求；不需要时留空。">${escapeHtml(dual.preamble || '')}</textarea>
+                <div class="stsc-muted">默认留空，仅放在副 API 自检系统提示的开头，不直接发送给正文 API。不内置破限词，也不保证解除供应商限制；请勿填写密钥，勿要求改变插件的 XML 输出格式。</div>
             </div>
 
             <div class="stsc-grid-3" style="margin-top:10px">
                 <div class="stsc-field">
-                    <label>自检最大回复长度</label>
+                    <label for="stsc_dual_max_tokens">自检最大回复长度</label>
                     <input id="stsc_dual_max_tokens" class="text_pole" type="number" min="256" max="12000" step="128" value="${Math.round(dual.maxTokens)}">
-                    <div class="stsc-muted">单位：Token</div>
+                    <div class="stsc-muted">单位：Token，默认8192。思考模型可能把思考与最终回答合计在内；提高上限可能增加用量。已有自定义值保留。</div>
                 </div>
                 <div class="stsc-field">
                     <label>自检API读取聊天范围</label>
@@ -3777,7 +3819,7 @@ function renderFloatingInstructionPage() {
         const empty = !String(instruction.content || '').trim();
         const preview = empty ? '内容为空，请先到完整管理器编辑。' : String(instruction.content).trim();
         return `
-            <div class="stsc-floating-instruction-card" data-floating-temp-id="${escapeHtml(instruction.id)}">
+            <div class="stsc-floating-instruction-card" data-floating-temp-id="${escapeHtml(instruction.id)}" data-activation="${mode}">
                 <div class="stsc-floating-instruction-head">
                     <div class="stsc-floating-instruction-name">${escapeHtml(instruction.name)}</div>
                     <select class="text_pole stsc-floating-instruction-mode" data-floating-instruction-mode aria-label="${escapeHtml(instruction.name)}的启用方式" ${empty ? 'disabled' : ''}>
@@ -4805,10 +4847,36 @@ function bindUiEvents() {
         $(this).text(showing ? '显示' : '隐藏');
     });
     $('#stsc_manager_overlay').on('change', '#stsc_dual_max_tokens', function () {
-        getUiSettings().dualApi.maxTokens = clampNumber(this.value, 256, 12000, 4096);
+        getUiSettings().dualApi.maxTokens = normalizeMaxTokens(this.value);
         this.value = Math.round(getUiSettings().dualApi.maxTokens);
         markDirty();
         invalidateApiConnectionTest();
+    });
+    for (const [selector, field] of [['#stsc_dual_temperature', 'temperature'], ['#stsc_dual_top_p', 'topP'], ['#stsc_dual_reasoning_effort', 'reasoningEffort']]) {
+        $('#stsc_manager_overlay').on('change', selector, function () {
+            const dual = getUiSettings().dualApi;
+            const value = this.value.trim();
+            try {
+                requestParameters({ ...dual, [field]: value });
+            } catch (error) {
+                this.value = dual[field] ?? '';
+                toastr.error(error.message, '墨提斯之镜');
+                return;
+            }
+            dual[field] = value;
+            markDirty();
+            invalidateApiConnectionTest();
+        });
+    }
+    $('#stsc_manager_overlay').on('input change', '#stsc_dual_preamble', function () {
+        getUiSettings().dualApi.preamble = this.value;
+        markDirty();
+    });
+    $('#stsc_manager_overlay').on('click', '#stsc_dual_reset_parameters', function () {
+        Object.assign(getUiSettings().dualApi, { maxTokens: DEFAULT_MAX_TOKENS, temperature: '', topP: '', reasoningEffort: '' });
+        markDirty();
+        invalidateApiConnectionTest();
+        renderSettingsTab();
     });
     $('#stsc_manager_overlay').on('change', '#stsc_dual_timeout_seconds', function () {
         getUiSettings().dualApi.timeoutSeconds = clampNumber(this.value, 60, 300, 150);

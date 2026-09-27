@@ -190,10 +190,61 @@ test('formal v0.4.1 greeting fence behavior is preserved and imported messages a
     }
 });
 
-test('version/identity are formal v0.4.2; release metadata and UI stay in sync', () => {
+test('floating instruction cards reflect saved activation states, not an unsaved draft', () => {
+    const app = plugin();
+    app.run(`runtimeForFloating = clone(DEFAULT_SETTINGS);
+        runtimeForFloating.temporaryInstructions = [
+            { id: 'green', name: '常开指令', content: 'always content' },
+            { id: 'gold', name: '单轮指令', content: 'once content' },
+            { id: 'grey', name: '关闭指令', content: 'off content' }
+        ];
+        runtimeForFloating.persistentInstructionIds = ['green'];
+        runtimeForFloating.pendingInstructionIds = ['gold'];
+        editDraft.persistentInstructionIds = ['grey'];
+        normalizeSettings = () => runtimeForFloating;
+        renderFloatingInstructionPage();`);
+    const markup = app.html['#stsc_floating_content'];
+    for (const [id, mode] of [['green', 'always'], ['gold', 'once'], ['grey', 'off']]) {
+        assert.ok(markup.includes('data-floating-temp-id="' + id + '" data-activation="' + mode + '"'));
+        assert.ok(markup.includes('value="' + mode + '" selected'));
+    }
+    assert.ok(markup.includes('data-floating-instruction-mode'));
+    assert.ok(markup.includes('aria-label="常开指令的启用方式"'));
+});
+
+test('floating highlight follows activation changes and clears when single-use state is consumed', () => {
+    const app = plugin();
+    app.run(`runtimeForFloating = clone(DEFAULT_SETTINGS);
+        runtimeForFloating.temporaryInstructions = [{ id: 'item', name: '测试', content: 'content' }];
+        normalizeSettings = () => runtimeForFloating;
+        renderCompact = renderStatusTab = renderTemporaryTab = () => {};
+        renderFloating = renderFloatingInstructionPage;`);
+    for (const mode of ['always', 'once', 'off']) {
+        assert.equal(app.run(`setInstructionActivation('item', '${mode}')`), true);
+        assert.ok(app.html['#stsc_floating_content'].includes('data-activation="' + mode + '"'));
+    }
+    app.run("setInstructionActivation('item', 'once'); runtimeForFloating.pendingInstructionIds = []; renderFloatingInstructionPage();");
+    assert.ok(app.html['#stsc_floating_content'].includes('data-activation="off"'));
+});
+
+test('empty floating instructions stay disabled and instruction names remain escaped', () => {
+    const app = plugin();
+    app.run(`runtimeForFloating = clone(DEFAULT_SETTINGS);
+        runtimeForFloating.temporaryInstructions = [{ id: 'empty', name: '<img onerror=x>', content: '' }];
+        normalizeSettings = () => runtimeForFloating;
+        renderFloatingInstructionPage();`);
+    const markup = app.html['#stsc_floating_content'];
+    assert.ok(markup.includes('data-activation="off"'));
+    assert.ok(/<select[^>]* disabled>/.test(markup));
+    assert.ok(!markup.includes('<img onerror=x>'));
+    assert.ok(markup.includes('&lt;img onerror=x&gt;'));
+    assert.equal(app.run("setInstructionActivation('empty', 'always')"), false);
+});
+
+test('version/identity are formal v0.4.3; release metadata and UI stay in sync', () => {
     const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url)));
     const release = JSON.parse(readFileSync(new URL('../version.json', import.meta.url)));
-    assert.equal(manifest.version, '0.4.2');
+    assert.equal(manifest.version, '0.4.3');
     assert.equal(release.version, manifest.version);
     assert.equal(manifest.homePage, 'https://github.com/chenxyeah/SillyTavern-Self-Check');
     const app = plugin();
@@ -203,4 +254,108 @@ test('version/identity are formal v0.4.2; release metadata and UI stay in sync',
     assert.ok(settings.includes('>v' + manifest.version + '<'));
     const readme = readFileSync(new URL('../README.md', import.meta.url), 'utf8');
     assert.ok(readme.includes('当前正式版本：`' + manifest.version + '`'));
+});
+
+test('request controls render escaped values and edit draft only without requests', () => {
+    const app = plugin();
+    app.event('change', '#stsc_dual_temperature', '0');
+    app.event('change', '#stsc_dual_top_p', '.8');
+    app.event('change', '#stsc_dual_reasoning_effort', 'low');
+    app.event('input', '#stsc_dual_preamble', '</textarea><script>PRIVATE</script>');
+    app.run('renderSettingsTab()');
+    const markup = app.html['#stsc_tab_settings'];
+    for (const id of ['temperature', 'top_p', 'reasoning_effort', 'preamble', 'reset_parameters']) {
+        assert.ok(markup.includes('id="stsc_dual_' + id + '"'));
+    }
+    assert.ok(markup.includes('&lt;/textarea&gt;&lt;script&gt;PRIVATE&lt;/script&gt;'));
+    assert.ok(!markup.includes('<script>PRIVATE'));
+    assert.equal(app.run('editDraft.dualApi.temperature'), '0');
+    assert.equal(app.run('editDraft.dualApi.maxTokens'), 8192);
+    assert.equal(app.requestBodies.length, 0);
+    assert.equal(app.run('editDirty'), true);
+    assert.deepEqual(app.st.extensionSettings, {});
+    app.event('change', '#stsc_dual_temperature', '9');
+    assert.equal(app.run('editDraft.dualApi.temperature'), '0');
+    assert.ok(app.notices.at(-1).includes('temperature'));
+});
+
+test('reset restores 8192 and omitted optional fields, preserving credentials/preamble', () => {
+    const app = plugin();
+    app.event('input', '#stsc_dual_preamble', 'MY PROMPT');
+    app.event('change', '#stsc_dual_max_tokens', '4096');
+    assert.equal(app.run('editDraft.dualApi.maxTokens'), 4096);
+    app.event('change', '#stsc_dual_temperature', '.4');
+    app.event('click', '#stsc_dual_reset_parameters', '');
+    for (const field of ['temperature', 'topP', 'reasoningEffort']) assert.equal(app.run('editDraft.dualApi.' + field), '');
+    assert.equal(app.run('editDraft.dualApi.maxTokens'), 8192);
+    assert.equal(app.run('editDraft.dualApi.preamble'), 'MY PROMPT');
+    assert.equal(app.run('editDraft.dualApi.apiKey'), 'TEST_SECRET');
+    app.event('change', '#stsc_dual_max_tokens', '');
+    assert.equal(app.run('editDraft.dualApi.maxTokens'), 8192);
+});
+
+test('saved settings normalization defaults to 8192 but preserves saved manual limits', () => {
+    const app = plugin();
+    app.run(`ctx().extensionSettings[STSC_MODULE] = clone(DEFAULT_SETTINGS);
+        delete ctx().extensionSettings[STSC_MODULE].dualApi.maxTokens;`);
+    assert.equal(app.run('normalizeSettings().dualApi.maxTokens'), 8192);
+    app.run('ctx().extensionSettings[STSC_MODULE].dualApi.maxTokens = 4096');
+    assert.equal(app.run('normalizeSettings().dualApi.maxTokens'), 4096);
+    assert.equal(app.run('normalizeSettings().dualApi.preamble'), '');
+    assert.equal(app.run('normalizeSettings().dualApi.temperature'), '');
+});
+
+test('parameter changes invalidate pending connection tests and actual probe uses selected parameters', async () => {
+    const app = plugin();
+    app.event('change', '#stsc_dual_temperature', '0');
+    app.event('input', '#stsc_dual_preamble', 'PRIVATE PREAMBLE');
+    let finish;
+    app.scope.fetch = async (_url, options) => {
+        const body = JSON.parse(options.body);
+        assert.equal(JSON.parse(body.custom_include_body).temperature, 0);
+        assert.equal(JSON.parse(body.custom_include_body).max_tokens, 8192);
+        assert.ok(!options.body.includes('PRIVATE PREAMBLE'));
+        return new Promise(resolve => { finish = resolve; });
+    };
+    const pending = app.run('testDualApiConnection()');
+    app.event('change', '#stsc_dual_temperature', '.5');
+    finish(new Response(JSON.stringify({ choices: [{ message: { content: 'OK' } }] })));
+    await pending;
+    assert.equal(app.run('dualApiConnectionTestResult'), null);
+    assert.equal(app.notices.length, 0);
+});
+
+test('preamble prefixes only the self-check system message, also in compact retry', () => {
+    const app = plugin();
+    app.run(`getDualApiCharacterContext = () => 'CHARACTER';
+        buildPreviousReviewRequest = () => '';
+        selectedRepairDirectives = () => [];
+        selectDualApiChat = () => [{ role: 'user', content: 'CHAT' }];
+        testSettings = clone(DEFAULT_SETTINGS);
+        testSettings.dualApi.preamble = 'CUSTOM PREAMBLE';`);
+    for (const compact of [false, true]) {
+        const result = JSON.parse(app.run(`JSON.stringify(buildDualApiMessages([], [], [], [], testSettings, { compact: ${compact} }))`));
+        assert.equal(result[0].role, 'system');
+        assert.ok(result[0].content.startsWith('CUSTOM PREAMBLE\n\n[墨提斯之镜'));
+        assert.ok(result[0].content.includes('<stsc_self_check>'));
+        assert.equal(JSON.stringify(result).split('CUSTOM PREAMBLE').length, 2);
+        assert.equal(result[1].content, 'CHAT');
+        assert.equal(result.at(-1).role, 'user');
+    }
+});
+
+test('save persists request fields while discard restores the saved settings', () => {
+    const app = plugin();
+    app.run('applyTheme = renderAll = clearRuntimePrompts = () => {}');
+    app.event('change', '#stsc_dual_temperature', '.6');
+    app.event('change', '#stsc_dual_reasoning_effort', 'low');
+    app.event('input', '#stsc_dual_preamble', 'MY SAVED PROMPT');
+    app.run('commitEditDraft({ notify: false })');
+    assert.equal(app.run('normalizeSettings().dualApi.temperature'), '.6');
+    assert.equal(app.run('normalizeSettings().dualApi.reasoningEffort'), 'low');
+    assert.equal(app.run('normalizeSettings().dualApi.preamble'), 'MY SAVED PROMPT');
+    assert.equal(app.run('normalizeSettings().dualApi.maxTokens'), 8192);
+    app.event('input', '#stsc_dual_preamble', 'UNSAVED');
+    app.run('discardEditDraft()');
+    assert.equal(app.run('editDraft.dualApi.preamble'), 'MY SAVED PROMPT');
 });
