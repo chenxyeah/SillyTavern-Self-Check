@@ -7,7 +7,7 @@ import {
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.3';
+const STSC_VERSION = '0.4.4';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -43,15 +43,13 @@ const STSC_REMOTE_RELEASE_URLS = Object.freeze([
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-09-27',
-    title: '自检请求参数与快捷指令高亮',
+    releasedAt: '2026-10-04',
+    title: '参考资料库自定义排序',
     changes: Object.freeze([
-        '新增副 API 请求参数：温度、Top P 与可用的思考强度，默认留空沿用供应商设置。',
-        '新增默认空白的前置附加提示词，仅用于副 API 自检，不携带到连接测试。',
-        '各供应商默认最大回复长度统一为 8192 Token，保留已有手动值，支持一键恢复默认。',
-        'Google 官方地址可通过官方兼容接口透传思考档位；第三方原生地址不会被自动替换。',
-        '悬浮窗快捷指令增加状态高亮：常开绿色、临时一轮金黄、关闭灰色。',
-        '80 项模拟及酒馆转发合同测试通过；真实供应商账户仍需联调，不能保证消除所有空回。',
+        '参考资料库新增上移、下移按钮，折叠状态也能调整资料及关联自检问题的顺序。',
+        '排序先保存在编辑草稿，点击保存更改后生效；单 API、双 API 与批量导出均沿用保存顺序。',
+        '保留资料内容、启用状态、角色绑定和展开状态；首尾位置自动禁用不可用的移动方向。',
+        '85 项自动测试通过，并完成 320px、360px 与桌面宽度的隔离界面检查。',
     ]),
 });
 
@@ -3248,7 +3246,7 @@ function renderReferencesTab() {
     const settings = getUiSettings();
     const entity = getCurrentEntity();
     const references = settings.references.length
-        ? settings.references.map(reference => {
+        ? settings.references.map((reference, index) => {
             const expanded = expandedReferenceIds.has(reference.id);
             const config = referenceTypeConfig(reference.type);
             const questionDisabled = !reference.enabled;
@@ -3267,6 +3265,10 @@ function renderReferencesTab() {
                         <input type="checkbox" data-reference-field="enabled" ${reference.enabled ? 'checked' : ''}>
                         <span>${reference.enabled ? '已启用' : '未启用'}</span>
                     </label>
+                    <div class="stsc-reference-order-actions">
+                        <button class="menu_button stsc-small-button stsc-icon-action" type="button" data-action="move-reference-up" title="上移资料及自检问题" aria-label="上移资料及自检问题" ${index === 0 ? 'disabled' : ''}><i class="fa-solid fa-arrow-up" aria-hidden="true"></i><span class="stsc-action-label">上移</span></button>
+                        <button class="menu_button stsc-small-button stsc-icon-action" type="button" data-action="move-reference-down" title="下移资料及自检问题" aria-label="下移资料及自检问题" ${index === settings.references.length - 1 ? 'disabled' : ''}><i class="fa-solid fa-arrow-down" aria-hidden="true"></i><span class="stsc-action-label">下移</span></button>
+                    </div>
                 </div>
 
                 <div class="stsc-reference-body">
@@ -3361,6 +3363,7 @@ function renderReferencesTab() {
         <div class="stsc-section">
             <div class="stsc-section-title">参考资料库</div>
             <div class="stsc-muted">像世界书一样保存文风、强制限制或其他长期资料。所有资料默认折叠；只有启用资料库后，才能开启它对应的自检问题。</div>
+            <div class="stsc-muted">使用每条资料右侧的上移／下移调整顺序，关联自检问题会同步排序；点击“保存更改”后生效。不改变通用、角色与资料问题的分组顺序。</div>
             <div class="stsc-toolbar stsc-reference-action-toolbar" style="margin-top:9px">
                 <button class="menu_button stsc-compact-action" type="button" data-action="open-create-reference" title="新建资料库" aria-label="新建资料库"><i class="fa-solid fa-plus"></i><span class="stsc-action-label">新建资料库</span></button>
                 <button class="menu_button stsc-compact-action" type="button" data-action="batch-export-references" title="批量导出资料库" aria-label="批量导出资料库" ${settings.references.length ? '' : 'disabled'}><i class="fa-solid fa-box-archive"></i><span class="stsc-action-label">批量导出</span></button>
@@ -5148,6 +5151,12 @@ function bindUiEvents() {
             }
             if (index > 0 && action === 'move-question-up') [preset.questions[index - 1], preset.questions[index]] = [preset.questions[index], preset.questions[index - 1]];
             if (index >= 0 && index < preset.questions.length - 1 && action === 'move-question-down') [preset.questions[index + 1], preset.questions[index]] = [preset.questions[index], preset.questions[index + 1]];
+        } else if (action === 'move-reference-up' || action === 'move-reference-down') {
+            const id = $(this).closest('[data-reference-id]').data('reference-id');
+            const index = settings.references.findIndex(item => item.id === id);
+            const next = index + (action === 'move-reference-up' ? -1 : 1);
+            if (index < 0 || next < 0 || next >= settings.references.length) return;
+            [settings.references[index], settings.references[next]] = [settings.references[next], settings.references[index]];
         } else if (action === 'export-reference') {
             const id = $(this).closest('[data-reference-id]').data('reference-id');
             const reference = settings.references.find(item => item.id === id);

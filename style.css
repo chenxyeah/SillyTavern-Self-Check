@@ -1574,6 +1574,18 @@ body.stsc-modal-open {
   font-size: 0.86rem;
 }
 
+.stsc-reference-order-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
+}
+
+.stsc-reference-order-actions .menu_button {
+  min-height: 38px;
+  margin: 0;
+}
+
 .stsc-reference-body {
   display: block;
   width: 100%;

@@ -16,6 +16,7 @@ function plugin() {
     const st = { extensionSettings: {}, chat: [], saveSettingsDebounced() {}, getRequestHeaders: () => ({ 'X-CSRF-Token': 'LOCAL' }) };
     const $ = selector => {
         const chain = new Proxy({}, { get(_target, method) {
+            if (method === 'data' && typeof selector === 'object') return key => selector.data?.[key];
             if (method === 'on') return (types, delegate, handler) => {
                 const target = typeof delegate === 'string' ? delegate : selector;
                 const callback = handler || delegate;
@@ -48,7 +49,8 @@ function plugin() {
         editDraft.dualApi = { ...editDraft.dualApi, endpoint: 'https://custom.example/v1', apiKey: 'TEST_SECRET', model: 'private-model' };
         updateSaveState = () => {}; devMigrationSettingsHtml = () => ''; bindUiEvents();`);
     return { run, scope, st, html, nodes, notices, requestBodies,
-        event(type, id, value) { return events.get(type + ':' + id).call({ value }, { type }); } };
+        event(type, id, value) { return events.get(type + ':' + id).call({ value }, { type }); },
+        action(action, referenceId) { return events.get('click:[data-action]').call({ data: { action, 'reference-id': referenceId } }); } };
 }
 
 test('settings UI renders all eight providers and manual model/connection controls', async () => {
@@ -241,10 +243,10 @@ test('empty floating instructions stay disabled and instruction names remain esc
     assert.equal(app.run("setInstructionActivation('empty', 'always')"), false);
 });
 
-test('version/identity are formal v0.4.3; release metadata and UI stay in sync', () => {
+test('version/identity are formal v0.4.4; release metadata and UI stay in sync', () => {
     const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url)));
     const release = JSON.parse(readFileSync(new URL('../version.json', import.meta.url)));
-    assert.equal(manifest.version, '0.4.3');
+    assert.equal(manifest.version, '0.4.4');
     assert.equal(release.version, manifest.version);
     assert.equal(manifest.homePage, 'https://github.com/chenxyeah/SillyTavern-Self-Check');
     const app = plugin();
@@ -358,4 +360,87 @@ test('save persists request fields while discard restores the saved settings', (
     app.event('input', '#stsc_dual_preamble', 'UNSAVED');
     app.run('discardEditDraft()');
     assert.equal(app.run('editDraft.dualApi.preamble'), 'MY SAVED PROMPT');
+});
+
+function referenceApp() {
+    const app = plugin();
+    app.run(`editDraft.references = ['a', 'b', 'c'].map(id => ({
+        ...createReference(id, 'other'), id, enabled: true, scope: 'global',
+        content: 'CONTENT-' + id, addToCheck: true, autoQuestion: 'QUESTION-' + id
+    }));
+    ctx().extensionSettings[STSC_MODULE] = clone(editDraft);
+    applyTheme = clearRuntimePrompts = () => {};
+    renderAll = renderReferencesTab;`);
+    return app;
+}
+
+test('reference ordering controls are visible when collapsed and disabled at list boundaries', () => {
+    const app = referenceApp();
+    app.run('renderReferencesTab()');
+    const markup = app.html['#stsc_tab_references'];
+    const cards = markup.split('data-reference-id=').slice(1);
+    assert.equal(cards.length, 3);
+    for (let i = 0; i < cards.length; i++) {
+        const header = cards[i].split('class="stsc-reference-body"')[0];
+        assert.equal(/data-action="move-reference-up"[^>]*disabled/.test(header), i === 0);
+        assert.equal(/data-action="move-reference-down"[^>]*disabled/.test(header), i === 2);
+        assert.ok(header.includes('aria-label="上移资料及自检问题"'));
+    }
+    app.run('editDraft.references.splice(1); renderReferencesTab()');
+    const single = app.html['#stsc_tab_references'];
+    assert.match(single, /data-action="move-reference-up"[^>]*disabled/);
+    assert.match(single, /data-action="move-reference-down"[^>]*disabled/);
+    app.run('editDraft.references = []; renderReferencesTab()');
+    assert.ok(!app.html['#stsc_tab_references'].includes('data-action="move-reference-'));
+});
+
+test('reference reorder changes draft only, retains all fields/expanded state, saves and survives normalization', async () => {
+    const app = referenceApp();
+    const original = app.run('JSON.stringify(editDraft.references)');
+    app.run("expandedReferenceIds.add('b')");
+    await app.action('move-reference-up', 'b');
+    assert.equal(app.run("editDraft.references.map(x => x.id).join(',')"), 'b,a,c');
+    assert.equal(app.run("normalizeSettings().references.map(x => x.id).join(',')"), 'a,b,c');
+    assert.equal(app.run("expandedReferenceIds.has('b')"), true);
+    assert.equal(app.run('editDirty'), true);
+    const reordered = JSON.parse(app.run('JSON.stringify(editDraft.references)'));
+    assert.deepEqual(reordered, [JSON.parse(original)[1], JSON.parse(original)[0], JSON.parse(original)[2]]);
+    app.run('commitEditDraft({ notify: false })');
+    assert.equal(app.run("normalizeSettings().references.map(x => x.id).join(',')"), 'b,a,c');
+    await app.action('move-reference-down', 'b');
+    assert.equal(app.run("editDraft.references.map(x => x.id).join(',')"), 'a,b,c');
+    app.run('discardEditDraft()');
+    assert.equal(app.run("editDraft.references.map(x => x.id).join(',')"), 'b,a,c');
+    assert.equal(app.requestBodies.length, 0);
+});
+
+test('invalid or boundary moves do not mark dirty or mutate reference data', async () => {
+    const app = referenceApp();
+    const before = app.run('JSON.stringify(editDraft.references)');
+    for (const [action, id] of [['move-reference-up', 'a'], ['move-reference-down', 'c'], ['move-reference-up', 'missing']]) {
+        await app.action(action, id);
+        assert.equal(app.run('JSON.stringify(editDraft.references)'), before);
+        assert.equal(app.run('editDirty'), false);
+    }
+});
+
+test('single/dual self-check reference question order follows saved sorting and skips inactive entries', async () => {
+    const app = referenceApp();
+    await app.action('move-reference-up', 'c');
+    await app.action('move-reference-up', 'c');
+    app.run("editDraft.references.find(x => x.id === 'b').enabled = false; commitEditDraft({ notify: false })");
+    for (const fn of ['getActiveQuestions', 'getDualApiQuestions']) {
+        assert.equal(app.run(`${fn}(normalizeSettings()).filter(q => q.id.startsWith('ref_')).map(q => q.id).join(',')`), 'ref_c,ref_a');
+    }
+    app.run("editDraft.references.find(x => x.id === 'c').addToCheck = false; commitEditDraft({ notify: false })");
+    assert.equal(app.run("getActiveQuestions().filter(q => q.id.startsWith('ref_')).map(q => q.id).join(',')"), 'ref_a');
+});
+
+test('reference bundle roundtrip preserves custom ordering', async () => {
+    const app = referenceApp();
+    await app.action('move-reference-down', 'a');
+    const order = app.run('JSON.stringify(makeReferenceBundleExportPayload(editDraft.references))');
+    app.scope.bundle = JSON.parse(order);
+    const imported = app.run('validateImportedReferencePayload(bundle)');
+    assert.deepEqual(Array.from(imported.references, item => item.name), ['b', 'a', 'c']);
 });
