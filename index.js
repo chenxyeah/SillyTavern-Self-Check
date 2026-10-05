@@ -7,7 +7,7 @@ import {
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.4';
+const STSC_VERSION = '0.4.5';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -43,13 +43,14 @@ const STSC_REMOTE_RELEASE_URLS = Object.freeze([
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-10-04',
-    title: '参考资料库自定义排序',
+    releasedAt: '2026-10-05',
+    title: '更新提示开关与红点已读',
     changes: Object.freeze([
-        '参考资料库新增上移、下移按钮，折叠状态也能调整资料及关联自检问题的顺序。',
-        '排序先保存在编辑草稿，点击保存更改后生效；单 API、双 API 与批量导出均沿用保存顺序。',
-        '保留资料内容、启用状态、角色绑定和展开状态；首尾位置自动禁用不可用的移动方向。',
-        '85 项自动测试通过，并完成 320px、360px 与桌面宽度的隔离界面检查。',
+        '插件设置新增“开启更新提示”开关，默认开启，保存更改后生效。',
+        '开启时每个新版本主动提示一次，魔法棒入口与版本号红点持续保留到完成更新。',
+        '关闭时不主动弹窗，两个入口红点分别点击后记为已读；刷新不再重复提示同一版本，下个新版本重新提醒。',
+        '更新检查及手动更新仍可使用，修复保存旧草稿覆盖提醒已读状态的问题。',
+        '93 项自动测试通过，并完成 320px 与桌面宽度的隔离界面检查。',
     ]),
 });
 
@@ -154,6 +155,9 @@ const DEFAULT_SETTINGS = Object.freeze({
         dualApiReliabilityV1: false,
     },
     updateNotice: {
+        enabled: true,
+        menuSeenVersion: '',
+        headerSeenVersion: '',
         lastCheckedAt: 0,
         lastNotifiedAt: 0,
         lastSeenInstalledVersion: '',
@@ -420,6 +424,9 @@ function normalizeSettings() {
     if (!settings.characterBindings || typeof settings.characterBindings !== 'object') settings.characterBindings = {};
     if (!settings.appearance || typeof settings.appearance !== 'object') settings.appearance = clone(DEFAULT_SETTINGS.appearance);
     if (!settings.updateNotice || typeof settings.updateNotice !== 'object') settings.updateNotice = clone(DEFAULT_SETTINGS.updateNotice);
+    settings.updateNotice.enabled = settings.updateNotice.enabled !== false;
+    settings.updateNotice.menuSeenVersion = String(settings.updateNotice.menuSeenVersion || '');
+    settings.updateNotice.headerSeenVersion = String(settings.updateNotice.headerSeenVersion || '');
     settings.updateNotice.lastCheckedAt = Math.max(0, Number(settings.updateNotice.lastCheckedAt) || 0);
     settings.updateNotice.lastNotifiedAt = Math.max(0, Number(settings.updateNotice.lastNotifiedAt) || 0);
     settings.updateNotice.lastSeenInstalledVersion = String(settings.updateNotice.lastSeenInstalledVersion || '');
@@ -1169,6 +1176,12 @@ function commitEditDraft({ notify = true } = {}) {
     if (!editDraft) return;
     const context = ctx();
     if (!context?.extensionSettings) return;
+    // Checks/read receipts can change while a settings draft is open.
+    // Save the edited switch without rolling back live notification metadata.
+    editDraft.updateNotice = {
+        ...normalizeSettings().updateNotice,
+        enabled: editDraft.updateNotice?.enabled !== false,
+    };
     context.extensionSettings[STSC_MODULE] = clone(editDraft);
     const savedSettings = normalizeSettings();
     if (!savedSettings?.enabled) {
@@ -1182,6 +1195,7 @@ function commitEditDraft({ notify = true } = {}) {
     editDirty = false;
     applyTheme(editDraft);
     renderAll();
+    refreshPluginUpdateNotice();
     if (notify) toastr.success('更改已保存。', '墨提斯之镜');
 }
 
@@ -3425,6 +3439,13 @@ function renderSettingsTab() {
     $('#stsc_tab_settings').html(`
         ${devMigrationSettingsHtml()}
         <div class="stsc-section">
+            <div class="stsc-section-title">更新提示</div>
+            <label class="checkbox_label"><input id="stsc_update_notices_enabled" type="checkbox" ${settings.updateNotice?.enabled !== false ? 'checked' : ''}> 开启更新提示</label>
+            <div class="stsc-muted">开启：每个新版本主动弹窗提示一次；未更新前，魔法棒入口和左上角版本号持续显示红点。</div>
+            <div class="stsc-muted">关闭：不主动弹窗；两个入口各提示一次，点击对应入口后该红点消失，刷新也不再提示同一版本。下个新版本重新提示。</div>
+            <div class="stsc-muted">保存更改后生效。关闭提醒不会关闭更新检查，仍可点击版本号手动查看和更新。</div>
+        </div>
+        <div class="stsc-section">
             <div class="stsc-section-title">运行状态</div>
             <div class="stsc-status-lights">
                 <span><i class="stsc-signal ${settings.enabled ? 'is-on' : 'is-off'}"></i>插件${settings.enabled ? '已启用' : '未启用'}</span>
@@ -3754,8 +3775,8 @@ function renderUpdatesTab() {
         </div>
         <div class="stsc-section">
             <div class="stsc-section-title">更新提醒说明</div>
-            <div>只有远程版本号高于当前版本时，插件才会显示“插件有更新”提示，并在魔法棒菜单入口标记“更新”。</div>
-            <div class="stsc-muted" style="margin-top:6px">没有新版本时不会弹窗。发现更新后可直接在本页面完成更新，更新说明可随时回来查看。</div>
+            <div>可在“插件设置 → 更新提示”关闭主动弹窗。关闭后两个入口的红点分别看过一次就会消失，新版本到来后重新提示。</div>
+            <div class="stsc-muted" style="margin-top:6px">开启时每个新版本弹一次，红点保留到更新完成。无论是否开启提醒，都可以在这里手动检查和安装更新。</div>
         </div>
     `);
     const versionDialogOpen = !$('#stsc_dialog_overlay').hasClass('stsc-hidden')
@@ -3764,8 +3785,36 @@ function renderUpdatesTab() {
 }
 
 function renderHeaderUpdateBadge() {
-    const hasUpdate = updateCheckState === 'available' || gitUpdateAvailable || Boolean(updateAvailableVersion && compareVersions(updateAvailableVersion, STSC_VERSION) > 0);
-    $('#stsc_version_button').toggleClass('has-notice', hasUpdate);
+    $('#stsc_version_button').toggleClass('has-notice', shouldShowUpdateBadge('header'));
+    const menuBadge = shouldShowUpdateBadge('menu');
+    const $button = $('#stsc_extensions_menu_button');
+    $button.toggleClass('stsc-has-update', menuBadge);
+    $button.find('.stsc-menu-update-badge').remove();
+    if (menuBadge) $button.append('<span class="stsc-menu-update-badge" title="有可用更新" aria-label="有可用更新"></span>');
+}
+
+function currentUpdateNoticeKey() {
+    if (updateAvailableVersion && compareVersions(updateAvailableVersion, STSC_VERSION) > 0) return updateAvailableVersion;
+    // Older ST returns only the installed commit, not a remote commit identifier.
+    return gitUpdateAvailable ? 'git:' + STSC_VERSION : '';
+}
+
+function shouldShowUpdateBadge(surface) {
+    const key = currentUpdateNoticeKey();
+    const notice = normalizeSettings()?.updateNotice;
+    return Boolean(key && notice && (notice.enabled || notice[surface === 'menu' ? 'menuSeenVersion' : 'headerSeenVersion'] !== key));
+}
+
+function markUpdateNoticeViewed(surface) {
+    const key = currentUpdateNoticeKey();
+    const notice = normalizeSettings()?.updateNotice;
+    if (!key || !notice || notice.enabled) return;
+    const field = surface === 'menu' ? 'menuSeenVersion' : 'headerSeenVersion';
+    if (notice[field] !== key) {
+        notice[field] = key;
+        saveSettings();
+    }
+    renderHeaderUpdateBadge();
 }
 
 function renderLogBadge() {
@@ -3775,6 +3824,7 @@ function renderLogBadge() {
 }
 
 function openVersionDialog() {
+    markUpdateNoticeViewed('header');
     renderUpdatesTab();
     openDialog('版本更新', $('#stsc_tab_updates').html(), '<button class="menu_button" type="button" data-dialog-action="cancel">关闭</button>');
 }
@@ -4580,6 +4630,10 @@ ${questionText}
 }
 
 function bindUiEvents() {
+    $('#stsc_manager_overlay').on('change', '#stsc_update_notices_enabled', function () {
+        getUiSettings().updateNotice.enabled = this.checked;
+        markDirty();
+    });
     $('#stsc_close_manager').on('click', closeManager);
     $('#stsc_version_button').on('click', openVersionDialog);
     $('#stsc_log_button').on('click', openLogDialog);
@@ -5654,6 +5708,10 @@ function clearPluginUpdateNotice() {
     latestRemoteReleaseInfo = null;
     renderHeaderUpdateBadge();
     $('#stsc_extensions_menu_button').removeClass('stsc-has-update').find('.stsc-menu-update-badge').remove();
+    clearUpdateToast();
+}
+
+function clearUpdateToast() {
     if (updateToast) {
         try { toastr.clear(updateToast); } catch { /* 忽略旧 toast 清理失败 */ }
         updateToast = null;
@@ -5661,6 +5719,7 @@ function clearPluginUpdateNotice() {
 }
 
 function showPluginUpdateNotice(remoteVersion = '', releaseInfo = null, { gitOnly = false } = {}) {
+    const previousKey = currentUpdateNoticeKey();
     updateAvailableVersion = String(remoteVersion || releaseInfo?.version || '').trim();
     gitUpdateAvailable = Boolean(gitOnly);
     latestRemoteReleaseInfo = releaseInfo || latestRemoteReleaseInfo;
@@ -5668,27 +5727,30 @@ function showPluginUpdateNotice(remoteVersion = '', releaseInfo = null, { gitOnl
         clearPluginUpdateNotice();
         return;
     }
+    if (previousKey !== currentUpdateNoticeKey()) clearUpdateToast();
+    refreshPluginUpdateNotice();
+}
+
+function refreshPluginUpdateNotice() {
     renderHeaderUpdateBadge();
-
-    const $menuButton = $('#stsc_extensions_menu_button');
-    $menuButton.addClass('stsc-has-update');
-    if (!$menuButton.find('.stsc-menu-update-badge').length) {
-        $menuButton.append('<span class="stsc-menu-update-badge">更新</span>');
-    }
-
     const settings = normalizeSettings();
-    if (settings?.updateNotice?.lastNotifiedVersion === updateAvailableVersion || updateToast) return;
+    const key = currentUpdateNoticeKey();
+    if (!settings?.updateNotice?.enabled || !key) {
+        clearUpdateToast();
+        return;
+    }
+    if (settings.updateNotice.lastNotifiedVersion === key || updateToast) return;
     if (settings?.updateNotice) {
-        settings.updateNotice.lastNotifiedVersion = updateAvailableVersion;
+        settings.updateNotice.lastNotifiedVersion = key;
         settings.updateNotice.lastNotifiedAt = Date.now();
         saveSettings();
     }
 
     const versionText = updateAvailableVersion ? ` v${updateAvailableVersion}` : '';
-    const detail = Array.isArray(releaseInfo?.changes) && releaseInfo.changes.length
-        ? ` 更新内容：${releaseInfo.changes.slice(0, 2).join('；')}`
+    const detail = Array.isArray(latestRemoteReleaseInfo?.changes) && latestRemoteReleaseInfo.changes.length
+        ? ` 更新内容：${latestRemoteReleaseInfo.changes.slice(0, 2).join('；')}`
         : '';
-    updateToast = toastr.info(
+    const toast = toastr.info(
         `检测到“墨提斯之镜”有新版本${versionText}。${detail} 点击打开插件内更新页面。`,
         '插件有更新｜立即查看',
         {
@@ -5697,9 +5759,10 @@ function showPluginUpdateNotice(remoteVersion = '', releaseInfo = null, { gitOnl
             closeButton: true,
             tapToDismiss: false,
             onclick: () => openVersionDialog(),
-            onHidden: () => { updateToast = null; },
+            onHidden: () => { if (updateToast === toast) updateToast = null; },
         },
     );
+    updateToast = toast;
 }
 
 function plainExtensionUpdateFailure(error) {
@@ -5874,6 +5937,11 @@ async function checkForPluginUpdate({ force = false, userInitiated = false } = {
     }
 }
 
+function openManagerFromMenu() {
+    markUpdateNoticeViewed('menu');
+    openManager('status');
+}
+
 function addExtensionsMenuButton() {
     if ($('#stsc_extensions_menu_button').length || !$('#extensionsMenu').length) return;
     const button = $(
@@ -5882,8 +5950,9 @@ function addExtensionsMenuButton() {
             <span>墨提斯之镜</span>
         </div>`
     );
-    button.on('click', () => openManager('status'));
+    button.on('click', openManagerFromMenu);
     $('#extensionsMenu').append(button);
+    renderHeaderUpdateBadge();
 }
 
 async function initialize() {

@@ -2146,8 +2146,10 @@ body.stsc-modal-open {
 #stsc_extensions_menu_button .stsc-menu-update-badge {
   flex: 0 0 auto;
   margin-left: auto;
-  padding: 2px 7px;
-  border-radius: 999px;
+  width: 8px;
+  height: 8px;
+  padding: 0;
+  border-radius: 50%;
   background: var(--stsc-danger, #e05454);
   color: #fff;
   font-size: 0.72rem;

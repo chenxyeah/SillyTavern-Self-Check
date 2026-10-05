@@ -12,10 +12,14 @@ function plugin() {
     const events = new Map();
     const nodes = new Map();
     const notices = [];
+    const updateToasts = [];
+    const clearedToasts = [];
+    const classes = new Map();
     const requestBodies = [];
     const st = { extensionSettings: {}, chat: [], saveSettingsDebounced() {}, getRequestHeaders: () => ({ 'X-CSRF-Token': 'LOCAL' }) };
     const $ = selector => {
         const chain = new Proxy({}, { get(_target, method) {
+            if (method === 'toggleClass') return (name, enabled) => { classes.set(selector + ':' + name, Boolean(enabled)); return chain; };
             if (method === 'data' && typeof selector === 'object') return key => selector.data?.[key];
             if (method === 'on') return (types, delegate, handler) => {
                 const target = typeof delegate === 'string' ? delegate : selector;
@@ -37,7 +41,9 @@ function plugin() {
         document: { getElementById: id => nodes.get(id) || null },
         window: { addEventListener() {} },
         SillyTavern: { getContext: () => st },
-        toastr: { success: message => notices.push(message), error: message => notices.push(message), warning: message => notices.push(message) },
+        toastr: { success: message => notices.push(message), error: message => notices.push(message), warning: message => notices.push(message),
+            info: (message, title, options) => { const toast = { message, title, options }; updateToasts.push(toast); return toast; },
+            clear: toast => { clearedToasts.push(toast); } },
         fetch: async (_url, options) => { requestBodies.push(JSON.parse(options.body)); return new Response(JSON.stringify({ data: [{ id: 'listed-model' }] })); },
     };
     scope.requestProvider = (route, body, options) => adapters.requestProvider(route, body, { ...options, fetchImpl: scope.fetch });
@@ -48,7 +54,8 @@ function plugin() {
     run(`editDraft = clone(DEFAULT_SETTINGS); editDraft.mode = 'dual_api';
         editDraft.dualApi = { ...editDraft.dualApi, endpoint: 'https://custom.example/v1', apiKey: 'TEST_SECRET', model: 'private-model' };
         updateSaveState = () => {}; devMigrationSettingsHtml = () => ''; bindUiEvents();`);
-    return { run, scope, st, html, nodes, notices, requestBodies,
+    return { run, scope, st, html, nodes, notices, requestBodies, updateToasts, clearedToasts, classes,
+        toggleUpdateNotice(checked) { return events.get('change:#stsc_update_notices_enabled').call({ checked }); },
         event(type, id, value) { return events.get(type + ':' + id).call({ value }, { type }); },
         action(action, referenceId) { return events.get('click:[data-action]').call({ data: { action, 'reference-id': referenceId } }); } };
 }
@@ -243,10 +250,10 @@ test('empty floating instructions stay disabled and instruction names remain esc
     assert.equal(app.run("setInstructionActivation('empty', 'always')"), false);
 });
 
-test('version/identity are formal v0.4.4; release metadata and UI stay in sync', () => {
+test('version/identity are formal v0.4.5; release metadata and UI stay in sync', () => {
     const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url)));
     const release = JSON.parse(readFileSync(new URL('../version.json', import.meta.url)));
-    assert.equal(manifest.version, '0.4.4');
+    assert.equal(manifest.version, '0.4.5');
     assert.equal(release.version, manifest.version);
     assert.equal(manifest.homePage, 'https://github.com/chenxyeah/SillyTavern-Self-Check');
     const app = plugin();
@@ -443,4 +450,131 @@ test('reference bundle roundtrip preserves custom ordering', async () => {
     app.scope.bundle = JSON.parse(order);
     const imported = app.run('validateImportedReferencePayload(bundle)');
     assert.deepEqual(Array.from(imported.references, item => item.name), ['b', 'a', 'c']);
+});
+
+function updateNoticeApp(enabled = true) {
+    const app = plugin();
+    app.run(`ctx().extensionSettings[STSC_MODULE] = clone(DEFAULT_SETTINGS);
+        ctx().extensionSettings[STSC_MODULE].updateNotice.enabled = ${enabled};
+        editDraft = clone(ctx().extensionSettings[STSC_MODULE]);
+        applyTheme = renderAll = clearRuntimePrompts = () => {};`);
+    return app;
+}
+
+function assertUpdateDots(app, header, menu) {
+    assert.equal(app.run("shouldShowUpdateBadge('header')"), header);
+    assert.equal(app.run("shouldShowUpdateBadge('menu')"), menu);
+    assert.equal(app.classes.get('#stsc_version_button:has-notice'), header);
+    assert.equal(app.classes.get('#stsc_extensions_menu_button:stsc-has-update'), menu);
+}
+
+test('update preference defaults on for old settings; editing checkbox stays in draft', () => {
+    const app = updateNoticeApp();
+    app.run('delete ctx().extensionSettings[STSC_MODULE].updateNotice.enabled');
+    assert.equal(app.run('normalizeSettings().updateNotice.enabled'), true);
+    app.run('renderSettingsTab()');
+    assert.match(app.html['#stsc_tab_settings'], /id="stsc_update_notices_enabled"[^>]*checked/);
+    app.toggleUpdateNotice(false);
+    assert.equal(app.run('editDraft.updateNotice.enabled'), false);
+    assert.equal(app.run('normalizeSettings().updateNotice.enabled'), true);
+    assert.equal(app.run('editDirty'), true);
+    assert.equal(app.requestBodies.length, 0);
+});
+
+test('enabled notices toast once per version and retain both dots after viewing/rechecking', () => {
+    const app = updateNoticeApp();
+    app.run("showPluginUpdateNotice('9.0.0')");
+    assertUpdateDots(app, true, true);
+    assert.equal(app.updateToasts.length, 1);
+    app.run("markUpdateNoticeViewed('header'); markUpdateNoticeViewed('menu'); clearUpdateToast(); showPluginUpdateNotice('9.0.0')");
+    assertUpdateDots(app, true, true);
+    assert.equal(app.updateToasts.length, 1);
+    app.run("showPluginUpdateNotice('9.0.1')");
+    assert.equal(app.updateToasts.length, 2);
+    assertUpdateDots(app, true, true);
+});
+
+test('silent notices acknowledge each entry independently and survive a fresh page', () => {
+    const app = updateNoticeApp(false);
+    app.run("showPluginUpdateNotice('9.0.0'); markUpdateNoticeViewed('menu')");
+    assertUpdateDots(app, true, false);
+    assert.equal(app.updateToasts.length, 0);
+    const fresh = updateNoticeApp(false);
+    fresh.st.extensionSettings = structuredClone(app.st.extensionSettings);
+    fresh.run("editDraft = clone(normalizeSettings()); showPluginUpdateNotice('9.0.0')");
+    assertUpdateDots(fresh, true, false);
+    fresh.run("markUpdateNoticeViewed('header'); showPluginUpdateNotice('9.0.0')");
+    assertUpdateDots(fresh, false, false);
+    fresh.run("showPluginUpdateNotice('9.0.1')");
+    assertUpdateDots(fresh, true, true);
+    assert.equal(fresh.updateToasts.length, 0);
+});
+
+test('saving the switch clears active notification; in-flight checks respect the latest saved preference', async () => {
+    const app = updateNoticeApp();
+    app.run("showPluginUpdateNotice('9.0.0')");
+    app.toggleUpdateNotice(false);
+    assert.equal(app.clearedToasts.length, 0);
+    app.run('commitEditDraft({ notify: false })');
+    assert.equal(app.clearedToasts.length, 1);
+    let finish;
+    app.scope.fetchRemoteManifestVersion = () => new Promise(resolve => { finish = resolve; });
+    app.run(`getInstalledExtensionType = async () => 'local';
+        fetchOwnExtensionVersion = async () => ({ currentCommitHash: 'LOCAL', isUpToDate: false });
+        fetchRemoteReleaseInfo = async () => null; addRuntimeLog = () => {};`);
+    const check = app.run('checkForPluginUpdate({ force: true, userInitiated: true })');
+    await tick();
+    finish('9.0.1');
+    await check;
+    assert.equal(app.updateToasts.length, 1, 'no new automatic toast while disabled, even on manual check');
+    assertUpdateDots(app, true, true);
+    assert.equal(app.run('updateCheckState'), 'available', 'viewing a badge must not disable updating');
+});
+
+test('stale draft saves do not overwrite read receipts or notification deduplication metadata', () => {
+    const app = updateNoticeApp(false);
+    app.run("showPluginUpdateNotice('9.0.0'); markUpdateNoticeViewed('menu'); markUpdateNoticeViewed('header'); commitEditDraft({ notify: false })");
+    assertUpdateDots(app, false, false);
+    assert.equal(app.run('normalizeSettings().updateNotice.menuSeenVersion'), '9.0.0');
+    app.toggleUpdateNotice(true);
+    app.run('commitEditDraft({ notify: false })');
+    assert.equal(app.updateToasts.length, 1);
+    app.run("clearUpdateToast(); commitEditDraft({ notify: false }); showPluginUpdateNotice('9.0.0')");
+    assert.equal(app.updateToasts.length, 1, 'saving an old draft must not re-notify same version');
+    assertUpdateDots(app, true, true);
+});
+
+test('real entry handlers acknowledge only their own silent badge; manual version dialog remains available', () => {
+    const app = updateNoticeApp(false);
+    app.run(`opened = []; openManager = tab => opened.push(tab);
+        renderUpdatesTab = () => {}; openDialog = title => opened.push(title);
+        showPluginUpdateNotice('9.0.0'); openManagerFromMenu();`);
+    assertUpdateDots(app, true, false);
+    app.event('click', '#stsc_version_button', '');
+    assertUpdateDots(app, false, false);
+    assert.equal(app.run('JSON.stringify(opened)'), '["status","版本更新"]');
+    assert.equal(app.updateToasts.length, 0);
+});
+
+test('no update leaves no badges; stable Git-only updates can be acknowledged without version metadata', () => {
+    const app = updateNoticeApp(false);
+    app.run('showPluginUpdateNotice(STSC_VERSION)');
+    assertUpdateDots(app, false, false);
+    app.run("showPluginUpdateNotice('', null, { gitOnly: true })");
+    assertUpdateDots(app, true, true);
+    app.run("markUpdateNoticeViewed('header'); markUpdateNoticeViewed('menu'); showPluginUpdateNotice('', null, { gitOnly: true })");
+    assertUpdateDots(app, false, false);
+    assert.equal(app.updateToasts.length, 0);
+    app.run("showPluginUpdateNotice('9.0.0'); clearPluginUpdateNotice()");
+    assertUpdateDots(app, false, false);
+});
+
+test('a closed older toast cannot clear a newer toast and checking before an update does not mark it read', () => {
+    const app = updateNoticeApp();
+    app.run("showPluginUpdateNotice('9.0.0'); showPluginUpdateNotice('9.0.1')");
+    app.updateToasts[0].options.onHidden();
+    assert.equal(app.run('updateToast'), app.updateToasts[1]);
+    const silent = updateNoticeApp(false);
+    silent.run("markUpdateNoticeViewed('header'); markUpdateNoticeViewed('menu'); showPluginUpdateNotice('9.0.0')");
+    assertUpdateDots(silent, true, true);
 });
