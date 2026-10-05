@@ -250,10 +250,10 @@ test('empty floating instructions stay disabled and instruction names remain esc
     assert.equal(app.run("setInstructionActivation('empty', 'always')"), false);
 });
 
-test('version/identity are formal v0.4.5; release metadata and UI stay in sync', () => {
+test('version/identity are formal v0.4.6; release metadata and UI stay in sync', () => {
     const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url)));
     const release = JSON.parse(readFileSync(new URL('../version.json', import.meta.url)));
-    assert.equal(manifest.version, '0.4.5');
+    assert.equal(manifest.version, '0.4.6');
     assert.equal(release.version, manifest.version);
     assert.equal(manifest.homePage, 'https://github.com/chenxyeah/SillyTavern-Self-Check');
     const app = plugin();
@@ -577,4 +577,40 @@ test('a closed older toast cannot clear a newer toast and checking before an upd
     const silent = updateNoticeApp(false);
     silent.run("markUpdateNoticeViewed('header'); markUpdateNoticeViewed('menu'); showPluginUpdateNotice('9.0.0')");
     assertUpdateDots(silent, true, true);
+});
+
+test('preset picker keeps native fallback, type filtering and escaped names without Select2', () => {
+    const app = plugin();
+    app.run(`editDraft.presets = [
+        { id: 'g', name: '通用一', kind: 'general', questions: [], enabled: true },
+        { id: 'c1', name: '<img src=x>', kind: 'character', questions: [], enabled: true }
+    ]; editDraft.ui.presetSection = 'character'; renderPresetsTab();`);
+    let html = app.html['#stsc_tab_presets'];
+    assert.ok(html.includes('id="stsc_character_preset_select"'));
+    assert.ok(html.includes('aria-label="角色预设，可输入名称搜索"'));
+    assert.ok(html.includes('&lt;img src=x&gt;'));
+    assert.ok(!html.includes('<img src=x>'));
+    assert.ok(!html.includes('<option value="g"'));
+    app.run("editDraft.ui.presetSection = 'general'; renderPresetsTab()");
+    html = app.html['#stsc_tab_presets'];
+    assert.ok(html.includes('id="stsc_general_preset_select"'));
+    assert.ok(!html.includes('<option value="c1"'));
+    assert.equal(app.requestBodies.length, 0);
+});
+
+test('preset selection retains binding/activation and the existing unsaved-change guard', () => {
+    const app = plugin();
+    app.run(`editDraft.presets = [
+        { id: 'c1', name: '同名', kind: 'character', questions: [], boundCharacterKey: '' },
+        { id: 'c2', name: '同名', kind: 'character', questions: [], boundCharacterKey: '' }
+    ]; editDraft.ui.presetSection = 'character'; editDraft.ui.editingCharacterPresetId = 'c1';`);
+    app.event('change', '#stsc_character_preset_select', 'c2');
+    assert.equal(app.run('editDraft.ui.editingCharacterPresetId'), 'c2');
+    assert.equal(app.run("editDraft.presets.every(p => !p.boundCharacterKey)"), true);
+    assert.equal(app.run('editDirty'), false);
+    app.run('editDirty = true; openDialog = () => {}');
+    app.event('change', '#stsc_character_preset_select', 'c1');
+    assert.equal(app.run('editDraft.ui.editingCharacterPresetId'), 'c2');
+    assert.equal(app.run('typeof pendingUnsavedAction'), 'function');
+    assert.equal(app.requestBodies.length, 0);
 });

@@ -7,7 +7,7 @@ import {
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.5';
+const STSC_VERSION = '0.4.6';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -44,13 +44,12 @@ const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
     releasedAt: '2026-10-05',
-    title: '更新提示开关与红点已读',
+    title: '预设名称快速搜索',
     changes: Object.freeze([
-        '插件设置新增“开启更新提示”开关，默认开启，保存更改后生效。',
-        '开启时每个新版本主动提示一次，魔法棒入口与版本号红点持续保留到完成更新。',
-        '关闭时不主动弹窗，两个入口红点分别点击后记为已读；刷新不再重复提示同一版本，下个新版本重新提醒。',
-        '更新检查及手动更新仍可使用，修复保存旧草稿覆盖提醒已读状态的问题。',
-        '93 项自动测试通过，并完成 320px 与桌面宽度的隔离界面检查。',
+        '角色预设与通用预设选择框支持输入名称关键词搜索，也可直接从完整列表选择。',
+        '支持中文关键词、回车选择与无结果提示，保留原有未保存确认及角色绑定逻辑。',
+        '复用酒馆内置下拉搜索组件，无新增依赖；旧宿主缺少组件时保留原生下拉选择。',
+        '95 项自动测试通过，并使用酒馆实际搜索组件完成隔离浏览器交互与手机窄屏检查。',
     ]),
 });
 
@@ -3159,7 +3158,38 @@ function renderQuestionCards(preset) {
     }).join('');
 }
 
+function closePresetSearch(destroy = false) {
+    if (typeof $.fn?.select2 !== 'function') return;
+    $('#stsc_tab_presets .stsc-preset-select').each(function () {
+        const $select = $(this);
+        if (!$select.data('select2')) return;
+        if (destroy) $select.off('.stscPresetSearch');
+        $select.select2(destroy ? 'destroy' : 'close');
+    });
+}
+
+function initializePresetSearch(selectId) {
+    // Reuse SillyTavern's bundled widget; keep the native select on older hosts.
+    if (typeof $.fn?.select2 !== 'function') return;
+    const $select = $('#' + selectId);
+    if (!$select.length) return;
+    $select.select2({
+        width: '100%',
+        dropdownParent: $('#stsc_manager_overlay'),
+        minimumResultsForSearch: 0,
+        selectionCssClass: 'stsc-preset-search-selection',
+        dropdownCssClass: 'stsc-preset-search-dropdown',
+        language: { noResults: () => '没有匹配的预设' },
+    });
+    $select.on('select2:open.stscPresetSearch', () => {
+        $('#stsc_manager_overlay .stsc-preset-search-dropdown .select2-search__field')
+            .attr({ placeholder: '输入预设名称搜索…', 'aria-label': '搜索预设名称' })
+            .trigger('focus');
+    });
+}
+
 function renderPresetsTab() {
+    closePresetSearch(true);
     const settings = getUiSettings();
     const kind = settings.ui.presetSection === 'character' ? 'character' : 'general';
     const presets = settings.presets.filter(x => x.kind === kind);
@@ -3224,7 +3254,7 @@ function renderPresetsTab() {
             <div class="stsc-section-title">${pageTitle}</div>
             <div class="stsc-muted">${kind === 'general' ? '通用预设可在所有角色中持续生效；可以创建多套，但同一时间只选择一套作为当前通用预设。' : '角色预设创建后默认不绑定。打开角色卡聊天页面后，再手动绑定到当前角色。'}</div>
             <div class="stsc-preset-controls" style="margin-top:10px">
-                ${presets.length ? `<select id="${selectId}" class="text_pole stsc-preset-select">${presetOptions(kind, preset?.id, settings)}</select>` : '<div></div>'}
+                ${presets.length ? `<select id="${selectId}" class="text_pole stsc-preset-select" aria-label="${pageTitle}，可输入名称搜索">${presetOptions(kind, preset?.id, settings)}</select>` : '<div></div>'}
                 <div class="stsc-preset-action-toolbar" role="toolbar" aria-label="预设操作">
                     <button class="menu_button stsc-compact-action" type="button" data-action="open-create-preset" data-kind="${kind}" title="新建预设" aria-label="新建预设"><i class="fa-solid fa-plus"></i><span class="stsc-action-label">新建预设</span></button>
                     <button class="menu_button stsc-compact-action" type="button" data-action="copy-preset" title="复制预设" aria-label="复制预设" ${preset ? '' : 'disabled'}><i class="fa-solid fa-copy"></i><span class="stsc-action-label">复制</span></button>
@@ -3254,6 +3284,7 @@ function renderPresetsTab() {
             <div class="stsc-test-result">${escapeHtml(lastTestResult)}</div>
         </div>` : ''}
     `);
+    initializePresetSearch(selectId);
 }
 
 function renderReferencesTab() {
@@ -4029,6 +4060,7 @@ function openManager(tab = null) {
 }
 
 function performCloseManager() {
+    closePresetSearch(true);
     closeDialog();
     expandedReferenceIds.clear();
     expandedQuestionIds.clear();
@@ -4081,6 +4113,7 @@ function openDeleteConfirmation({ title = '确认删除', message = '确定要�
 }
 
 function performSwitchTab(tab) {
+    closePresetSearch();
     const settings = getUiSettings();
     settings.ui.activeTab = tab;
     $('.stsc-tab').removeClass('active');
