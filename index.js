@@ -124,6 +124,7 @@ const DEFAULT_SETTINGS = Object.freeze({
         transformFormat: false,
         failureMode: 'fallback_single',
         previousReview: false,
+        reviewContentOnly: false,
     },
     logs: [],
     logLastViewedAt: 0,
@@ -301,7 +302,9 @@ function addGenerationResultLog(latest, visibleBody = '') {
     }
 
     const review = latest.previousReview;
-    if (review?.status === 'missing') {
+    if (review?.status === 'content_missing') {
+        handlingParts.push('已开启复盘正文过滤，但上一轮没有完整的 <content> 正文，本轮已跳过复盘。');
+    } else if (review?.status === 'missing') {
         if (level === 'info') level = 'warning';
         handlingParts.push('本轮自检正常，但AI漏掉了上一轮复盘；插件下一轮还会继续尝试。');
     } else if (review?.issues?.length) {
@@ -402,6 +405,7 @@ function normalizeSettings() {
     settings.dualApi.transformFormat = Boolean(settings.dualApi.transformFormat);
     settings.dualApi.failureMode = ['fallback_single', 'stop'].includes(settings.dualApi.failureMode) ? settings.dualApi.failureMode : 'fallback_single';
     settings.dualApi.previousReview = Boolean(settings.dualApi.previousReview);
+    settings.dualApi.reviewContentOnly = Boolean(settings.dualApi.reviewContentOnly);
     let compactedLegacyLogs = false;
     if (!Array.isArray(settings.logs)) settings.logs = [];
     settings.logs = settings.logs.filter(item => item && typeof item === 'object').slice(0, STSC_LOG_LIMIT);
@@ -2007,12 +2011,50 @@ function getReviewSource(settings = normalizeSettings()) {
     if (!latest || latest.mode !== 'dual_api' || latest.chatId !== getCurrentChatId()) return null;
     const message = ctx()?.chat?.[Number(latest.messageId)];
     if (!message || message.is_user || message.is_system) return null;
-    return { latest, output: String(message.mes || '').trim() };
+    return { latest, message, output: String(message.mes || '').trim() };
 }
 
-function buildPreviousReviewRequest(settings, { compact = false } = {}) {
-    const source = getReviewSource(settings);
+function extractReviewContent(text) {
+    // Only complete outer <content> blocks; never silently fall back to the full reply.
+    const source = String(text || '');
+    const blocks = [];
+    let depth = 0;
+    let start = 0;
+    for (const match of source.matchAll(/<\/?content(?:\s[^<>]*?)?>/gi)) {
+        if (/^<\//.test(match[0])) {
+            if (depth && --depth === 0) blocks.push(source.slice(start, match.index).trim());
+        } else {
+            if (!depth) start = match.index + match[0].length;
+            depth++;
+        }
+    }
+    return blocks.filter(Boolean).join('\n\n');
+}
+
+function filterReviewChat(chat, reviewSource) {
+    if (!reviewSource) return chat;
+    const original = reviewSource.message;
+    return (Array.isArray(chat) ? chat : []).map(message => {
+        if (dualApiChatRole(message) !== 'assistant') return message;
+        // ST's outgoing chat is a shallow copy with regex-processed mes. Also support
+        // deep copies using its timestamp, without confusing filtered chat indices.
+        const sameMessage = message === original
+            || (original?.extra && message.extra === original.extra)
+            || (original?.send_date && message.send_date === original.send_date && message.name === original.name)
+            || (reviewSource.output && dualApiChatContent(message) === reviewSource.output);
+        if (!sameMessage) return message;
+        const content = extractReviewContent(dualApiChatContent(message))
+            || '（上一轮已启用正文过滤，但未找到完整且非空的 <content> 正文；不提供标签外内容。）';
+        // Operate only on the outgoing copy, never rewrite the saved chat or main API.
+        return { ...message, mes: content, content };
+    });
+}
+
+function buildPreviousReviewRequest(settings, { compact = false, source = getReviewSource(settings) } = {}) {
     if (!source) return '';
+    const contentOnly = Boolean(settings.dualApi.reviewContentOnly);
+    const output = contentOnly ? extractReviewContent(source.output) : source.output;
+    if (contentOnly && !output) return '';
     const answers = (source.latest.answers || []).map((item, index) => [
         `Q${index + 1}：${item.question || ''}`,
         `A${index + 1}：${compactDualApiRetryText(item.answer || '', compact ? 1200 : 3000)}`,
@@ -2020,12 +2062,13 @@ function buildPreviousReviewRequest(settings, { compact = false } = {}) {
     ].filter(Boolean).join('\n')).join('\n\n');
     return `
 在回答本轮自检前，必须先复盘上一轮。只报告有明确文本依据的疑似问题；不要为了填满格式而虚构问题。
+${contentOnly ? '本轮仅复盘 <content> 内的正文，忽略标签外的状态栏、附注等内容；若未提供有效正文，不得猜测，也不得改从其他聊天片段复盘。' : ''}
 
 【上一轮自检】
 ${answers || '（没有可读取的上一轮自检问答）'}
 
 【上一轮实际正文】
-${compactDualApiRetryText(source.output || '（没有可读取的上一轮正文）', compact ? 6000 : 18000)}
+${compactDualApiRetryText(output || '（没有可读取的上一轮正文）', compact ? 6000 : 18000)}
 `.trim();
 }
 
@@ -2059,13 +2102,16 @@ function selectedRepairDirectives() {
 
 function buildDualApiMessages(chat, questions, references, temporaryInstructions, settings, { compact = false } = {}) {
     const characterContext = getDualApiCharacterContext({ compact }) || '（没有读取到当前角色卡文本，请主要依据聊天记录、问题与参考资料判断。）';
+    const reviewSource = getReviewSource(settings);
+    const reviewChat = settings.dualApi.reviewContentOnly && reviewSource
+        ? filterReviewChat(chat, reviewSource) : chat;
     const dualForChat = compact
         ? { ...settings.dualApi, contextMode: 'custom', customTurns: Math.min(2, settings.dualApi.customTurns || 2) }
         : settings.dualApi;
-    const selectedChat = selectDualApiChat(chat, dualForChat).map(message => compact
+    const selectedChat = selectDualApiChat(reviewChat, dualForChat).map(message => compact
         ? { ...message, content: compactDualApiRetryText(message.content, 6000) }
         : message);
-    const reviewRequest = buildPreviousReviewRequest(settings, { compact });
+    const reviewRequest = buildPreviousReviewRequest(settings, { compact, source: reviewSource });
     const reviewEnabledForThisRun = Boolean(reviewRequest);
     const requiredOutputSchema = reviewEnabledForThisRun
         ? `<stsc_previous_review>\n<status>ok或warning</status>\n<!-- status为warning时最多输出3个issue；ok时不要输出issue -->\n<issue><type>简短类型</type><description>疑似问题</description><evidence>上一轮正文中的具体依据</evidence><suggestion>下一轮自然修复建议</suggestion></issue>\n</stsc_previous_review>\n<stsc_self_check>\n<item id="q1"><answer>可独立执行的最终回答</answer></item>\n<item id="q2"><answer>可独立执行的最终回答</answer><evidence>具体依据</evidence></item>\n</stsc_self_check>`
@@ -2850,7 +2896,9 @@ globalThis.sillyTavernSelfCheckInterceptor = async function (_chat, _contextSize
         dualApiBusy = true;
         try {
             const dualQuestions = getDualApiQuestions(settings);
-            const reviewExpected = Boolean(getReviewSource(settings));
+            const reviewSource = getReviewSource(settings);
+            const reviewContentMissing = Boolean(reviewSource && settings.dualApi.reviewContentOnly && !extractReviewContent(reviewSource.output));
+            const reviewExpected = Boolean(reviewSource) && !reviewContentMissing;
             pendingRun.questions = clone(dualQuestions);
             const initialResponse = await callDualApiSelfCheck({
                 chat: _chat,
@@ -2916,7 +2964,12 @@ globalThis.sillyTavernSelfCheckInterceptor = async function (_chat, _contextSize
                 dualParsed.status = 'format_error';
                 dualParsed.formatIssues.push('独立自检API返回了文本，但没有按要求输出 <stsc_self_check> 结构。');
             }
-            if (reviewExpected && !previousReview) {
+            if (reviewContentMissing) {
+                previousReview = {
+                    timestamp: Date.now(), status: 'content_missing', issues: [],
+                    reason: '已开启正文过滤，但上一轮没有完整且非空的 <content>…</content>。本轮跳过复盘，没有回退发送全文；本轮自检仍正常执行。',
+                };
+            } else if (reviewExpected && !previousReview) {
                 previousReview = {
                     timestamp: Date.now(),
                     status: 'missing',
@@ -3163,7 +3216,10 @@ function closePresetSearch(destroy = false) {
     $('#stsc_tab_presets .stsc-preset-select').each(function () {
         const $select = $(this);
         if (!$select.data('select2')) return;
-        if (destroy) $select.off('.stscPresetSearch');
+        if (destroy) {
+            $select.data('stscPresetSearchCleanup')?.();
+            $select.removeData('stscPresetSearchCleanup').off('.stscPresetSearch');
+        }
         $select.select2(destroy ? 'destroy' : 'close');
     });
 }
@@ -3181,10 +3237,29 @@ function initializePresetSearch(selectId) {
         dropdownCssClass: 'stsc-preset-search-dropdown',
         language: { noResults: () => '没有匹配的预设' },
     });
+    const $parents = $select.parents();
+    const scrollEvent = 'scroll.stscPresetSearch.' + selectId;
+    const cleanup = () => $parents.off(scrollEvent);
+    $select.data('stscPresetSearchCleanup', cleanup);
+    $select.on('select2:close.stscPresetSearch', cleanup);
     $select.on('select2:open.stscPresetSearch', () => {
-        $('#stsc_manager_overlay .stsc-preset-search-dropdown .select2-search__field')
-            .attr({ placeholder: '输入预设名称搜索…', 'aria-label': '搜索预设名称' })
-            .trigger('focus');
+        // Select2 normally locks scrollable ancestors to their opening position.
+        // Release only this instance's lock; scrolling the manager dismisses the list.
+        const instance = $select.data('select2');
+        $parents.off('scroll.select2.' + instance.id);
+        cleanup();
+        $parents.on(scrollEvent, () => {
+            const positions = $parents.toArray().map(node => [node, node.scrollTop, node.scrollLeft]);
+            $select.select2('close');
+            // Select2 returns focus to its selection on close. Preserve the user's scroll.
+            for (const [node, top, left] of positions) {
+                node.scrollTop = top;
+                node.scrollLeft = left;
+            }
+        });
+        const $search = $('#stsc_manager_overlay .stsc-preset-search-dropdown .select2-search__field');
+        $search.attr({ placeholder: '输入预设名称搜索…', 'aria-label': '搜索预设名称' });
+        $search[0]?.focus({ preventScroll: true });
     });
 }
 
@@ -3660,6 +3735,11 @@ function renderSettingsTab() {
                     开启上一轮复盘
                 </label>
                 <div class="stsc-muted">仅双API支持；检查上一轮自检与正文的疑似偏差。复盘结果只作为线索，不会自动修改剧情。</div>
+                <label class="checkbox_label" style="margin-top:8px">
+                    <input id="stsc_review_content_only" type="checkbox" ${dual.reviewContentOnly ? 'checked' : ''} ${!dual.previousReview ? 'disabled' : ''}>
+                    过滤标签：复盘仅发送 &lt;content&gt; 内的正文
+                </label>
+                <div class="stsc-muted">不勾选：保留上一轮完整消息。勾选：只提取完整的 &lt;content&gt;…&lt;/content&gt; 内容，多个正文段按顺序合并；找不到正文时提示无法核对，不回退全文。仅影响副API的复盘正文及聊天中对应的上一轮消息，不修改聊天记录；仍沿用现有长度上限。</div>
             </div>
 
             <div class="stsc-grid-2" style="margin-top:12px">
@@ -3970,6 +4050,11 @@ function renderFloatingReviewPage() {
             $('#stsc_floating_subtitle').text('已记录首轮，等待下一轮复盘');
             $('#stsc_floating_content').html('<div class="stsc-empty">当前已有一轮可作为复盘来源。请再完成一轮双API正文生成；下一轮自检会先复盘本轮，再进行新的自检。</div>');
         }
+        return;
+    }
+    if (review.status === 'content_missing') {
+        $('#stsc_floating_subtitle').text('本轮复盘已跳过：未找到正文标签');
+        $('#stsc_floating_content').html(`<div class="stsc-empty">${escapeHtml(review.reason)}<br><br>请让正文使用完整的 &lt;content&gt; 标签；若希望按完整消息复盘，可关闭“过滤标签”并保存。</div>`);
         return;
     }
     if (review.status === 'missing') {
@@ -5007,6 +5092,10 @@ function bindUiEvents() {
         markDirty();
         renderSettingsTab();
         updateSaveState();
+    });
+    $('#stsc_manager_overlay').on('change', '#stsc_review_content_only', function () {
+        getUiSettings().dualApi.reviewContentOnly = this.checked;
+        markDirty();
     });
     $('#stsc_manager_overlay').on('change', '#stsc_dual_failure_mode', function () {
         getUiSettings().dualApi.failureMode = ['fallback_single', 'stop'].includes(this.value) ? this.value : 'fallback_single';
