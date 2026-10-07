@@ -7,7 +7,7 @@ import {
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.6';
+const STSC_VERSION = '0.4.7';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -43,13 +43,13 @@ const STSC_REMOTE_RELEASE_URLS = Object.freeze([
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-10-05',
-    title: '预设名称快速搜索',
+    releasedAt: '2026-10-07',
+    title: '双API用户身份与复盘优化',
     changes: Object.freeze([
-        '角色预设与通用预设选择框支持输入名称关键词搜索，也可直接从完整列表选择。',
-        '支持中文关键词、回车选择与无结果提示，保留原有未保存确认及角色绑定逻辑。',
-        '复用酒馆内置下拉搜索组件，无新增依赖；旧宿主缺少组件时保留原生下拉选择。',
-        '95 项自动测试通过，并使用酒馆实际搜索组件完成隔离浏览器交互与手机窄屏检查。',
+        '双API自检读取当前User/Persona名称和身份描述，切换身份及精简重试均生效，尊重酒馆的不发送设置。',
+        '修复预设搜索打开时页面滚动回弹，保留列表内部滚动及名称搜索。',
+        '上一轮复盘新增过滤标签选项，仅发送完整content标签内的正文；缺少正文时明确跳过复盘。',
+        '108项自动测试通过；滚动与复盘开关已完成桌面及手机宽度的隔离页面验证。',
     ]),
 });
 
@@ -1936,6 +1936,46 @@ function getDualApiCharacterContext({ compact = false } = {}) {
     return [title, ...cards].join('\n\n---\n\n');
 }
 
+function getDualApiUserContext({ compact = false } = {}) {
+    const context = ctx();
+    if (!context) return '（未读取到当前用户身份设定，请勿自行补充。）';
+    const name = compactPromptText(context.name1);
+    const personaSettings = context.powerUserSettings;
+    // SillyTavern persona_description_positions.NONE = 9. Respect explicit opt-out.
+    const disabled = Number(personaSettings?.persona_description_position) === 9;
+    let description = '';
+    if (!disabled) {
+        if (typeof personaSettings?.persona_description === 'string') {
+            // This is the active editor value, not the library of other personas.
+            description = personaSettings.persona_description;
+            if (description && typeof context.substituteParams === 'function') {
+                try {
+                    const expanded = context.substituteParams(description, context.name1, context.name2, undefined, undefined, false);
+                    if (typeof expanded === 'string') description = expanded;
+                } catch {
+                    // Keep the current description if a host macro cannot be expanded.
+                }
+            }
+        } else if (typeof context.getCharacterCardFields === 'function') {
+            // Compatibility with hosts exposing persona through the public field getter.
+            try {
+                const persona = context.getCharacterCardFields()?.persona;
+                if (typeof persona === 'string') description = persona;
+            } catch {
+                // Missing host support must not stop self-check or use a stale persona.
+            }
+        }
+    }
+    description = compactPromptText(description);
+    if (compact) description = compactDualApiRetryText(description, 12000);
+    return [
+        '以下是用户扮演的身份，不是AI扮演的角色；请区分双方设定，未提供的信息不要自行补充。',
+        name ? `【用户名称】\n${name}` : '',
+        disabled ? '（酒馆已将此身份描述设为不发送，本轮不读取该描述。）'
+            : description ? `【用户身份描述】\n${description}` : '（当前没有可读取的用户身份描述。）',
+    ].filter(Boolean).join('\n\n');
+}
+
 function dualApiChatRole(message) {
     const explicit = String(message?.role || '').toLowerCase();
     if (['system', 'user', 'assistant'].includes(explicit)) return explicit;
@@ -2102,6 +2142,7 @@ function selectedRepairDirectives() {
 
 function buildDualApiMessages(chat, questions, references, temporaryInstructions, settings, { compact = false } = {}) {
     const characterContext = getDualApiCharacterContext({ compact }) || '（没有读取到当前角色卡文本，请主要依据聊天记录、问题与参考资料判断。）';
+    const userContext = getDualApiUserContext({ compact });
     const reviewSource = getReviewSource(settings);
     const reviewChat = settings.dualApi.reviewContentOnly && reviewSource
         ? filterReviewChat(chat, reviewSource) : chat;
@@ -2123,7 +2164,7 @@ function buildDualApiMessages(chat, questions, references, temporaryInstructions
 ${compact ? '这是一次自动精简重试：只读取必要角色信息和最近2轮聊天，请优先快速、完整地输出全部题目。' : ''}
 
 工作要求：
-1. 结合角色资料、经过酒馆出站正则处理后的聊天记录、插件参考资料、快捷指令和本轮问题，逐题形成最终写作结论。
+1. 结合角色资料、当前用户身份设定、经过酒馆出站正则处理后的聊天记录、插件参考资料、快捷指令和本轮问题，逐题形成最终写作结论。
 2. 每个答案都必须能直接交给另一个没有看到题目背景或资料原文的写作模型执行。
 3. 尤其是参考资料库问题，必须明确复述本轮具体该怎样写、必须遵守什么、禁止什么，不得只写“遵照资料”“符合要求”“按上述内容执行”等模糊结论。
 4. 不得漏题、合并题目或改变 q1、q2 这类短题号。
@@ -2137,6 +2178,9 @@ ${requiredOutputSchema}
 
 【当前角色资料】
 ${characterContext}
+
+【当前用户身份设定（User / Persona）】
+${userContext}
 
 【本轮启用的插件参考资料库】
 ${buildDualApiReferenceContext(references, { compact })}

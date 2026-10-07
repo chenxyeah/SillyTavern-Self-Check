@@ -56,7 +56,7 @@ function plugin() {
         updateSaveState = () => {}; devMigrationSettingsHtml = () => ''; bindUiEvents();`);
     return { run, scope, st, html, nodes, notices, requestBodies, updateToasts, clearedToasts, classes,
         toggleUpdateNotice(checked) { return events.get('change:#stsc_update_notices_enabled').call({ checked }); },
-        event(type, id, value) { return events.get(type + ':' + id).call({ value }, { type }); },
+        event(type, id, value) { return events.get(type + ':' + id).call({ value, checked: value }, { type }); },
         action(action, referenceId) { return events.get('click:[data-action]').call({ data: { action, 'reference-id': referenceId } }); } };
 }
 
@@ -250,10 +250,10 @@ test('empty floating instructions stay disabled and instruction names remain esc
     assert.equal(app.run("setInstructionActivation('empty', 'always')"), false);
 });
 
-test('version/identity are formal v0.4.6; release metadata and UI stay in sync', () => {
+test('version/identity are formal v0.4.7; release metadata and UI stay in sync', () => {
     const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url)));
     const release = JSON.parse(readFileSync(new URL('../version.json', import.meta.url)));
-    assert.equal(manifest.version, '0.4.6');
+    assert.equal(manifest.version, '0.4.7');
     assert.equal(release.version, manifest.version);
     assert.equal(manifest.homePage, 'https://github.com/chenxyeah/SillyTavern-Self-Check');
     const app = plugin();
@@ -613,4 +613,247 @@ test('preset selection retains binding/activation and the existing unsaved-chang
     assert.equal(app.run('editDraft.ui.editingCharacterPresetId'), 'c2');
     assert.equal(app.run('typeof pendingUnsavedAction'), 'function');
     assert.equal(app.requestBodies.length, 0);
+});
+
+test('review content filter defaults off and respects UI draft, save, discard and disabled state', () => {
+    const app = plugin();
+    assert.equal(app.run('normalizeSettings().dualApi.reviewContentOnly'), false);
+    app.run('renderSettingsTab()');
+    assert.match(app.html['#stsc_tab_settings'], /id="stsc_review_content_only"[^>]*disabled/);
+    app.event('change', '#stsc_previous_review', true);
+    assert.doesNotMatch(app.html['#stsc_tab_settings'], /id="stsc_review_content_only"[^>]*disabled/);
+    app.event('change', '#stsc_review_content_only', true);
+    assert.equal(app.run('editDirty'), true);
+    assert.equal(app.run('normalizeSettings().dualApi.reviewContentOnly'), false);
+    app.run('applyTheme = renderAll = clearRuntimePrompts = () => {}; commitEditDraft({ notify: false })');
+    assert.equal(app.run('normalizeSettings().dualApi.reviewContentOnly'), true);
+    app.event('change', '#stsc_review_content_only', false);
+    app.run('discardEditDraft()');
+    assert.equal(app.run('editDraft.dualApi.reviewContentOnly'), true);
+    assert.equal(app.requestBodies.length, 0);
+});
+
+test('review extraction only accepts complete content blocks, preserving order and inner markup', () => {
+    const app = plugin();
+    const samples = [
+        ['外部<content>正文\n第二行</content><status>秘密</status>', '正文\n第二行'],
+        ['<CONTENT class="story">一</CONTENT>外部<content>二</content>', '一\n\n二'],
+        ['<content><b>正文</b><content>内层</content>结尾</content>外部', '<b>正文</b><content>内层</content>结尾'],
+        ['<content> </content>', ''], ['<content>未闭合', ''],
+        ['&lt;content&gt;伪标签&lt;/content&gt;', ''],
+        ['<content-extra>不是正文</content-extra>', ''],
+        ['<content>完整</content><content>未闭合外部', '完整'],
+        ['</content>外部<content>正文</content>', '正文'],
+    ];
+    for (const [input, expected] of samples) {
+        assert.equal(app.run(`extractReviewContent(${JSON.stringify(input)})`), expected);
+    }
+});
+
+function reviewApp() {
+    const app = plugin();
+    app.run(`testSettings = clone(DEFAULT_SETTINGS); testSettings.mode = 'dual_api';
+        testSettings.dualApi.previousReview = true;
+        testSettings.dualApi.reviewContentOnly = true;
+        ctx().chatId = 'chat-a';
+        ctx().chat = [
+            { is_user: false, name: '角色', send_date: 'old', mes: 'OLDER_HISTORY' },
+            { is_user: true, mes: '用户上一轮' },
+            { is_user: false, name: '角色', send_date: 'unique-last', extra: { reasoning: 'PRIVATE_THOUGHT' },
+              mes: '<think>OUTSIDE_THOUGHT</think><content>STORY_ONE</content><status>OUTSIDE_STATUS</status><content>STORY_TWO</content>' },
+            { is_user: true, mes: 'USER_CURRENT' }
+        ];
+        ctx().chatMetadata = { [STSC_CHAT_META_KEY]: {
+            mode: 'dual_api', chatId: 'chat-a', messageId: 2,
+            answers: [{ question: 'QUESTION', answer: 'ANSWER', evidence: 'EVIDENCE' }]
+        } };
+        getDualApiCharacterContext = () => 'CHARACTER'; selectedRepairDirectives = () => [];
+        outgoing = ctx().chat.map(m => ({ ...m }));`);
+    return app;
+}
+
+test('review filter covers review text and duplicate history in normal and compact requests', () => {
+    const app = reviewApp();
+    const original = app.run('JSON.stringify(ctx().chat)');
+    for (const compact of [false, true]) {
+        const messages = JSON.parse(app.run(`JSON.stringify(buildDualApiMessages(outgoing, [], [], [], testSettings, { compact: ${compact} }))`));
+        const payload = JSON.stringify(messages);
+        for (const value of ['STORY_ONE', 'STORY_TWO', 'QUESTION', 'ANSWER', 'EVIDENCE', 'OLDER_HISTORY', 'USER_CURRENT']) assert.ok(payload.includes(value), value);
+        for (const value of ['OUTSIDE_THOUGHT', 'OUTSIDE_STATUS', 'PRIVATE_THOUGHT']) assert.ok(!payload.includes(value), value);
+        assert.equal(messages.find(m => m.role === 'assistant' && m.content.includes('STORY_ONE')).content, 'STORY_ONE\n\nSTORY_TWO');
+    }
+    assert.equal(app.run('JSON.stringify(ctx().chat)'), original, 'do not rewrite saved chat');
+    assert.equal(app.run('JSON.stringify(outgoing)'), original, 'do not rewrite main API outgoing chat');
+    app.run('testSettings.dualApi.reviewContentOnly = false');
+    const full = app.run('JSON.stringify(buildDualApiMessages(outgoing, [], [], [], testSettings))');
+    assert.ok(full.includes('OUTSIDE_STATUS'));
+    assert.ok(full.includes('OUTSIDE_THOUGHT'));
+});
+
+test('review filtering matches regex-processed and deep-copied history without changing user messages', () => {
+    const app = reviewApp();
+    app.run(`outgoing[2].mes = '<think>REGEX_THOUGHT</think><content>PROCESSED_STORY</content><status>REGEX_STATUS</status>';
+        outgoing[3].mes = ctx().chat[2].mes;`);
+    for (const deepCopy of [false, true]) {
+        if (deepCopy) app.run('outgoing = clone(outgoing)');
+        const rows = JSON.parse(app.run('JSON.stringify(filterReviewChat(outgoing, getReviewSource(testSettings)))'));
+        assert.equal(rows[2].mes, 'PROCESSED_STORY');
+        assert.equal(rows[3].mes, app.st.chat[2].mes);
+        assert.equal(rows[0].mes, 'OLDER_HISTORY');
+    }
+    app.run("outgoing[2].mes = 'TAGS_REMOVED_BY_REGEX'");
+    assert.ok(!app.run('JSON.stringify(filterReviewChat(outgoing, getReviewSource(testSettings))[2])').includes('TAGS_REMOVED_BY_REGEX'));
+});
+
+test('review filter does not activate without a valid enabled same-chat dual API review', () => {
+    const app = reviewApp();
+    for (const setup of [
+        'testSettings.dualApi.previousReview = false',
+        "testSettings.dualApi.previousReview = true; ctx().chatMetadata[STSC_CHAT_META_KEY].chatId = 'other'",
+        "ctx().chatMetadata[STSC_CHAT_META_KEY].chatId = 'chat-a'; ctx().chatMetadata[STSC_CHAT_META_KEY].mode = 'single'",
+    ]) {
+        app.run(setup);
+        assert.equal(app.run('buildPreviousReviewRequest(testSettings)'), '');
+        assert.ok(app.run('JSON.stringify(buildDualApiMessages(outgoing, [], [], [], testSettings))').includes('OUTSIDE_STATUS'));
+    }
+});
+
+test('missing content skips review without full-text fallback, extra retry or blocking self-check', async () => {
+    const app = reviewApp();
+    app.run(`ctx().chat[2].mes = '<status>NO_STORY_SECRET</status>'; outgoing = ctx().chat.map(m => ({ ...m }));`);
+    assert.equal(app.run('buildPreviousReviewRequest(testSettings)'), '');
+    const payload = app.run('JSON.stringify(buildDualApiMessages(outgoing, [], [], [], testSettings))');
+    assert.ok(!payload.includes('NO_STORY_SECRET'));
+    assert.ok(!payload.includes('必须先完整输出 <stsc_previous_review>'));
+    app.run(`normalizeSettings = () => testSettings;
+        getActiveQuestions = getDualApiQuestions = () => [{ id: 'q1', text: '问题', requireEvidence: false }];
+        getActiveReferences = getSelectedTemporaryInstructions = () => [];
+        clearRuntimePrompts = applyReferencePrompts = applyTemporaryPrompt = applyDualApiMainPrompt = () => {};
+        calls = 0; callDualApiSelfCheck = async () => {
+            calls++;
+            return { text: '<stsc_self_check><item id="q1"><answer>结论</answer></item></stsc_self_check>', attempts: 1 };
+        };`);
+    await app.run('sillyTavernSelfCheckInterceptor(outgoing, 10000, () => { throw new Error("must not abort"); }, "normal")');
+    assert.equal(app.run('calls'), 1);
+    assert.equal(app.run('pendingRun.previousReview.status'), 'content_missing');
+    app.run('ctx().chatMetadata[STSC_CHAT_META_KEY].previousReview = pendingRun.previousReview; renderFloatingReviewPage()');
+    assert.ok(app.html['#stsc_floating_content'].includes('本轮跳过复盘'));
+    assert.ok(!app.html['#stsc_floating_content'].includes('上一轮未发现明显问题'));
+});
+
+test('dual API carries the active user persona in single/group chats, every history scope and compact retry', () => {
+    const app = plugin();
+    app.st.name1 = '用户甲';
+    app.st.name2 = '角色乙';
+    app.st.powerUserSettings = {
+        persona_description: 'ACTIVE_USER_PROFILE', persona_description_position: 0,
+        persona_descriptions: { other: { description: 'UNSELECTED_PROFILE' } },
+    };
+    const before = JSON.stringify(app.st.powerUserSettings);
+    for (const groupId of [null, 'group-a']) {
+        app.st.groupId = groupId;
+        for (const mode of ['recent5', 'custom', 'all']) {
+            app.run(`editDraft.dualApi.contextMode = '${mode}'`);
+            for (const compact of [false, true]) {
+                const messages = JSON.parse(app.run(`JSON.stringify(buildDualApiMessages([], [], [], [], editDraft, { compact: ${compact} }))`));
+                assert.ok(messages[0].content.includes('【当前用户身份设定（User / Persona）】'));
+                assert.ok(messages[0].content.includes('用户甲'));
+                assert.ok(messages[0].content.includes('ACTIVE_USER_PROFILE'));
+                assert.ok(!JSON.stringify(messages).includes('UNSELECTED_PROFILE'));
+            }
+        }
+    }
+    assert.equal(JSON.stringify(app.st.powerUserSettings), before, 'identity remains read-only');
+});
+
+test('persona switches and cleared descriptions are read fresh, not cached or revived from the library', () => {
+    const app = plugin();
+    app.st.name1 = 'FIRST_NAME';
+    app.st.powerUserSettings = { persona_description: 'FIRST_PROFILE' };
+    assert.ok(app.run('getDualApiUserContext()').includes('FIRST_PROFILE'));
+    app.st.name1 = 'SECOND_NAME';
+    app.st.powerUserSettings.persona_description = 'SECOND_PROFILE';
+    const next = app.run('JSON.stringify(buildDualApiMessages([], [], [], [], editDraft))');
+    assert.ok(next.includes('SECOND_NAME'));
+    assert.ok(next.includes('SECOND_PROFILE'));
+    assert.ok(!next.includes('FIRST_'));
+    app.st.powerUserSettings.persona_description = '';
+    app.st.getCharacterCardFields = () => { throw new Error('must not replace explicitly empty persona'); };
+    const empty = app.run('getDualApiUserContext()');
+    assert.ok(empty.includes('SECOND_NAME'));
+    assert.ok(empty.includes('没有可读取'));
+    assert.ok(!empty.includes('SECOND_PROFILE'));
+});
+
+test('persona opt-out is respected without consulting the fallback or macro resolver', () => {
+    const app = plugin();
+    app.st.name1 = 'USERNAME';
+    app.st.getCharacterCardFields = app.st.substituteParams = () => { throw new Error('opt-out must not read'); };
+    for (const position of [9, '9']) {
+        app.st.powerUserSettings = { persona_description_position: position, persona_description: 'DO_NOT_SEND' };
+        const text = app.run('JSON.stringify(buildDualApiMessages([], [], [], [], editDraft))');
+        assert.ok(!text.includes('DO_NOT_SEND'));
+        assert.ok(text.includes('不发送'));
+    }
+    for (const position of [0, 1, 2, 3, 4]) {
+        app.st.powerUserSettings.persona_description_position = position;
+        assert.ok(app.run('getDualApiUserContext()').includes('DO_NOT_SEND'), 'all enabled injection positions are supported');
+    }
+});
+
+test('persona macros use the host substitution API once, preserving raw text on resolver failure', () => {
+    const app = plugin();
+    app.st.name1 = '用户甲'; app.st.name2 = '角色乙';
+    app.st.powerUserSettings = { persona_description: '{{user}}认识{{char}}。' };
+    let calls = 0;
+    app.st.substituteParams = (text, user, char, original, group, replaceCard) => {
+        calls++;
+        assert.equal(replaceCard, false);
+        return text.replace('{{user}}', user).replace('{{char}}', char);
+    };
+    assert.ok(app.run('getDualApiUserContext()').includes('用户甲认识角色乙。'));
+    assert.equal(calls, 1);
+    app.st.substituteParams = () => { throw new Error('unsupported macro'); };
+    assert.ok(app.run('getDualApiUserContext()').includes('{{user}}认识{{char}}。'));
+});
+
+test('persona getter fallback supports missing context fields without aborting self-check', () => {
+    const app = plugin();
+    app.st.getCharacterCardFields = () => ({ persona: 'FALLBACK_PROFILE' });
+    assert.ok(app.run('getDualApiUserContext()').includes('FALLBACK_PROFILE'));
+    app.st.getCharacterCardFields = () => { throw new Error('old host'); };
+    assert.ok(app.run('getDualApiUserContext()').includes('没有可读取'));
+    delete app.st.getCharacterCardFields;
+    assert.ok(!app.run('getDualApiUserContext()').includes('undefined'));
+    app.run('SillyTavern.getContext = () => null');
+    assert.ok(app.run('getDualApiUserContext()').includes('未读取到'));
+});
+
+test('long persona is full in normal requests and retains head/tail in compact retry', () => {
+    const app = plugin();
+    const description = 'PROFILE_START' + '字'.repeat(18000) + 'PROFILE_END';
+    app.st.powerUserSettings = { persona_description: description };
+    assert.ok(app.run('getDualApiUserContext()').includes(description));
+    const compact = app.run('getDualApiUserContext({ compact: true })');
+    assert.ok(compact.includes('PROFILE_START') && compact.includes('PROFILE_END'));
+    assert.ok(compact.includes('精简重试已省略中段'));
+    assert.ok(compact.length < 12300);
+    assert.equal(app.st.powerUserSettings.persona_description, description);
+});
+
+test('generation sends active persona to the configured secondary API; connection test still sends no persona', async () => {
+    const app = plugin();
+    app.st.name1 = 'PRIVATE_USER_NAME';
+    app.st.powerUserSettings = { persona_description: 'PRIVATE_USER_PROFILE' };
+    const bodies = [];
+    app.scope.fetch = async (_url, options) => {
+        bodies.push(JSON.parse(options.body));
+        return new Response(JSON.stringify({ choices: [{ message: { content: 'OK' } }] }));
+    };
+    await app.run('callDualApiSelfCheck({ chat: [], questions: [], references: [], temporaryInstructions: [], settings: editDraft })');
+    assert.ok(JSON.stringify(bodies[0].messages).includes('PRIVATE_USER_PROFILE'));
+    await app.run('testDualApiConnection()');
+    assert.deepEqual(bodies[1].messages, [{ role: 'user', content: 'Reply with OK only.' }]);
+    assert.ok(!JSON.stringify(app.notices).includes('PRIVATE_USER'));
+    assert.ok(!app.run('JSON.stringify(normalizeSettings().logs)').includes('PRIVATE_USER'));
 });
