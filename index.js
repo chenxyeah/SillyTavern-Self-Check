@@ -7,7 +7,7 @@ import {
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.7';
+const STSC_VERSION = '0.4.8';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -43,13 +43,13 @@ const STSC_REMOTE_RELEASE_URLS = Object.freeze([
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-10-07',
-    title: '双API用户身份与复盘优化',
+    releasedAt: '2026-10-14',
+    title: 'API配置保存与切换',
     changes: Object.freeze([
-        '双API自检读取当前User/Persona名称和身份描述，切换身份及精简重试均生效，尊重酒馆的不发送设置。',
-        '修复预设搜索打开时页面滚动回弹，保留列表内部滚动及名称搜索。',
-        '上一轮复盘新增过滤标签选项，仅发送完整content标签内的正文；缺少正文时明确跳过复盘。',
-        '108项自动测试通过；滚动与复盘开关已完成桌面及手机宽度的隔离页面验证。',
+        '双API设置新增可命名的API配置，保存接口、Key、模型和请求参数，切换后自动恢复。',
+        '升级时保留原有API配置，支持另存、重命名和删除，同一供应商也可保存多套Key。',
+        '修改或切换后点击顶部保存更改长期保留，放弃更改可恢复原配置；切换不自动发起API请求。',
+        '116项自动测试通过，并完成桌面及手机宽度的配置保存、回切和删除交互验证。',
     ]),
 });
 
@@ -95,6 +95,11 @@ const ROLE_MAP = Object.freeze({
     assistant: 2,
 });
 
+const API_PROFILE_FIELDS = Object.freeze([
+    'provider', 'endpoint', 'apiKey', 'model', 'maxTokens', 'temperature', 'topP',
+    'reasoningEffort', 'preamble', 'timeoutSeconds', 'retryTransient',
+]);
+
 const DEFAULT_SETTINGS = Object.freeze({
     enabled: true,
     mode: 'single',
@@ -126,6 +131,8 @@ const DEFAULT_SETTINGS = Object.freeze({
         previousReview: false,
         reviewContentOnly: false,
     },
+    apiProfiles: [],
+    activeApiProfileId: '',
     logs: [],
     logLastViewedAt: 0,
     presets: [],
@@ -153,6 +160,7 @@ const DEFAULT_SETTINGS = Object.freeze({
         defaultGeneralCoreV3: false,
         defaultGeneralCoreV4: false,
         dualApiReliabilityV1: false,
+        apiProfilesV1: false,
     },
     updateNotice: {
         enabled: true,
@@ -406,6 +414,7 @@ function normalizeSettings() {
     settings.dualApi.failureMode = ['fallback_single', 'stop'].includes(settings.dualApi.failureMode) ? settings.dualApi.failureMode : 'fallback_single';
     settings.dualApi.previousReview = Boolean(settings.dualApi.previousReview);
     settings.dualApi.reviewContentOnly = Boolean(settings.dualApi.reviewContentOnly);
+    normalizeApiProfiles(settings);
     let compactedLegacyLogs = false;
     if (!Array.isArray(settings.logs)) settings.logs = [];
     settings.logs = settings.logs.filter(item => item && typeof item === 'object').slice(0, STSC_LOG_LIMIT);
@@ -507,6 +516,16 @@ function normalizeSettings() {
     if (!settings.migrations.defaultGeneralCoreV4) {
         migrateBuiltInGeneralPresetV4(settings);
         settings.migrations.defaultGeneralCoreV4 = true;
+        settingsMigrated = true;
+    }
+
+    if (!settings.migrations.apiProfilesV1) {
+        if (!settings.apiProfiles.length && ['endpoint', 'apiKey', 'model'].some(field => settings.dualApi[field].trim())) {
+            const profile = { id: uid('api'), name: '原有API配置', config: apiProfileConfig(settings.dualApi) };
+            settings.apiProfiles.push(profile);
+            settings.activeApiProfileId = profile.id;
+        }
+        settings.migrations.apiProfilesV1 = true;
         settingsMigrated = true;
     }
 
@@ -1162,6 +1181,78 @@ function getUiSettings() {
     return editDraft || normalizeSettings();
 }
 
+function apiProfileConfig(dual = {}) {
+    const config = Object.fromEntries(API_PROFILE_FIELDS.map(field => [field, dual[field] ?? DEFAULT_SETTINGS.dualApi[field]]));
+    config.provider = providerId(config.provider);
+    for (const field of ['endpoint', 'apiKey', 'model', 'temperature', 'topP', 'reasoningEffort', 'preamble']) config[field] = String(config[field] ?? '');
+    config.maxTokens = normalizeMaxTokens(config.maxTokens);
+    config.timeoutSeconds = clampNumber(config.timeoutSeconds, 60, 300, 150);
+    config.retryTransient = Boolean(config.retryTransient);
+    return config;
+}
+
+function normalizeApiProfiles(settings) {
+    const ids = new Set();
+    settings.apiProfiles = (Array.isArray(settings.apiProfiles) ? settings.apiProfiles : [])
+        .filter(profile => isPlainObject(profile) && isPlainObject(profile.config))
+        .map(profile => {
+            let id = String(profile.id || '').trim();
+            if (!id || ids.has(id)) id = uid('api');
+            ids.add(id);
+            return { id, name: String(profile.name || '未命名API配置').trim().slice(0, 80) || '未命名API配置', config: apiProfileConfig(profile.config) };
+        });
+    settings.activeApiProfileId = String(settings.activeApiProfileId || '');
+    if (!ids.has(settings.activeApiProfileId)) settings.activeApiProfileId = '';
+}
+
+function rememberActiveApiProfile(settings) {
+    const profile = settings.apiProfiles.find(item => item.id === settings.activeApiProfileId);
+    if (profile) profile.config = apiProfileConfig(settings.dualApi);
+}
+
+function switchApiProfile(id, settings = getUiSettings()) {
+    const profile = settings.apiProfiles.find(item => item.id === id);
+    if (id && !profile) return false;
+    rememberActiveApiProfile(settings);
+    settings.activeApiProfileId = id;
+    if (profile) settings.dualApi = { ...settings.dualApi, ...apiProfileConfig(profile.config) };
+    return true;
+}
+
+function apiProfileName(value, settings, excludeId = '') {
+    const name = String(value || '').trim();
+    if (!name || name.length > 80) throw new Error('请填写1—80字的API配置名称。');
+    if (settings.apiProfiles.some(item => item.id !== excludeId && item.name.toLowerCase() === name.toLowerCase())) throw new Error('这个API配置名称已存在，请换一个名称。');
+    return name;
+}
+
+function createApiProfile(name, settings = getUiSettings()) {
+    name = apiProfileName(name, settings);
+    const profile = { id: uid('api'), name, config: apiProfileConfig(settings.dualApi) };
+    settings.apiProfiles.push(profile);
+    settings.activeApiProfileId = profile.id;
+    return profile;
+}
+
+function renameApiProfile(name, settings = getUiSettings()) {
+    const profile = settings.apiProfiles.find(item => item.id === settings.activeApiProfileId);
+    if (!profile) return false;
+    profile.name = apiProfileName(name, settings, profile.id);
+    return true;
+}
+
+function deleteApiProfile(id, settings = getUiSettings()) {
+    if (!settings.apiProfiles.some(item => item.id === id)) return false;
+    rememberActiveApiProfile(settings);
+    settings.apiProfiles = settings.apiProfiles.filter(item => item.id !== id);
+    if (settings.activeApiProfileId === id) {
+        const next = settings.apiProfiles[0];
+        settings.activeApiProfileId = next?.id || '';
+        settings.dualApi = { ...settings.dualApi, ...apiProfileConfig(next?.config) };
+    }
+    return true;
+}
+
 function beginEditSession() {
     editDraft = clone(normalizeSettings());
     editDirty = false;
@@ -1185,6 +1276,7 @@ function commitEditDraft({ notify = true } = {}) {
         ...normalizeSettings().updateNotice,
         enabled: editDraft.updateNotice?.enabled !== false,
     };
+    rememberActiveApiProfile(editDraft);
     context.extensionSettings[STSC_MODULE] = clone(editDraft);
     const savedSettings = normalizeSettings();
     if (!savedSettings?.enabled) {
@@ -3582,6 +3674,7 @@ function renderTemporaryTab() {
 function renderSettingsTab() {
     const settings = getUiSettings();
     const dual = settings.dualApi || DEFAULT_SETTINGS.dualApi;
+    const activeProfile = settings.apiProfiles.find(profile => profile.id === settings.activeApiProfileId);
     const dualVisible = settings.mode === 'dual_api';
     const customTurnsVisible = dual.contextMode === 'custom';
     const modelOptions = dualApiModelOptionsHtml(dual);
@@ -3644,6 +3737,29 @@ function renderSettingsTab() {
             </div>
             <div class="stsc-dev-notice">
                 双API核心流程已启用：每次生成会先消耗一次自检API调用，再把自检结果临时交给酒馆主API生成正文。可选择开启上一轮复盘和强力规范。
+            </div>
+
+            <div class="stsc-dual-branch-card stsc-api-profiles" style="margin-top:12px">
+                <div class="stsc-section-title">保存的API配置</div>
+                <div class="stsc-grid-2">
+                    <div class="stsc-field">
+                        <label for="stsc_api_profile_select">切换配置</label>
+                        <select id="stsc_api_profile_select" class="text_pole">
+                            <option value="" ${!activeProfile ? 'selected' : ''}>当前配置（未命名）</option>
+                            ${settings.apiProfiles.map(profile => `<option value="${escapeHtml(profile.id)}" ${profile.id === settings.activeApiProfileId ? 'selected' : ''}>${escapeHtml(profile.name)}</option>`).join('')}
+                        </select>
+                    </div>
+                    <div class="stsc-field">
+                        <label for="stsc_api_profile_name">配置名称</label>
+                        <input id="stsc_api_profile_name" class="text_pole" type="text" maxlength="80" autocomplete="off" placeholder="例如：日常自检、备用接口" value="${escapeHtml(activeProfile?.name || '')}">
+                    </div>
+                </div>
+                <div class="stsc-toolbar" style="margin-top:8px">
+                    <button class="menu_button" type="button" data-action="create-api-profile">保存为新配置</button>
+                    <button class="menu_button" type="button" data-action="rename-api-profile" ${!activeProfile ? 'disabled' : ''}>重命名</button>
+                    <button class="menu_button stsc-danger-button" type="button" data-action="delete-api-profile" ${!activeProfile ? 'disabled' : ''}>删除配置</button>
+                </div>
+                <div class="stsc-muted">每套配置保存接口、Key、模型和请求参数。修改或切换时记住当前配置；点击顶部“保存更改”后长期保留，放弃更改则恢复原配置。密钥仅保存在酒馆设置中。</div>
             </div>
 
             <div class="stsc-field" style="margin-top:12px">
@@ -5017,11 +5133,24 @@ function bindUiEvents() {
         renderAll();
     });
     $('#stsc_manager_overlay').on('change', '#stsc_dual_provider', function () {
-        getUiSettings().dualApi = switchProvider(getUiSettings().dualApi, this.value);
+        const settings = getUiSettings();
+        if (providerId(this.value) === providerId(settings.dualApi.provider)) return;
+        rememberActiveApiProfile(settings);
+        settings.activeApiProfileId = '';
+        settings.dualApi = switchProvider(settings.dualApi, this.value);
         markDirty();
         resetDualApiModelState();
         renderSettingsTab();
         updateSaveState();
+    });
+    $('#stsc_manager_overlay').on('change', '#stsc_api_profile_select', function () {
+        if (!switchApiProfile(this.value)) {
+            $(this).val(getUiSettings().activeApiProfileId);
+            return;
+        }
+        markDirty();
+        resetDualApiModelState();
+        renderSettingsTab();
     });
     $('#stsc_manager_overlay').on('input change', '#stsc_dual_model_manual', function () {
         getUiSettings().dualApi.model = this.value.trim();
@@ -5221,7 +5350,32 @@ function bindUiEvents() {
         const settings = getUiSettings();
         const preset = getEditingPreset(null, settings);
 
-        if (action === 'import-dev-settings' || action === 'restore-dev-migration') {
+        if (action === 'create-api-profile' || action === 'rename-api-profile') {
+            const name = document.getElementById('stsc_api_profile_name')?.value || '';
+            try {
+                if (action === 'create-api-profile') createApiProfile(name, settings);
+                else if (!renameApiProfile(name, settings)) return;
+                markDirty();
+                renderSettingsTab();
+                toastr.success('API配置已记入草稿，请点击顶部“保存更改”。', '墨提斯之镜');
+            } catch (error) {
+                toastr.warning(error.message, '墨提斯之镜');
+            }
+            return;
+        } else if (action === 'delete-api-profile') {
+            const profile = settings.apiProfiles.find(item => item.id === settings.activeApiProfileId);
+            if (!profile) return;
+            openDeleteConfirmation({ title: '删除API配置', message: `确定删除“${profile.name}”吗？`,
+                detail: '删除当前配置后会切换到剩余配置；没有其他配置时清空API连接信息。',
+                perform: () => {
+                    deleteApiProfile(profile.id, getUiSettings());
+                    markDirty();
+                    resetDualApiModelState();
+                    renderSettingsTab();
+                },
+            });
+            return;
+        } else if (action === 'import-dev-settings' || action === 'restore-dev-migration') {
             openDevMigrationDialog(action === 'restore-dev-migration');
             return;
         } else if (action === 'open-create-preset') {

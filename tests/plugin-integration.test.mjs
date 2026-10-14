@@ -33,7 +33,7 @@ function plugin() {
         } });
         return chain;
     };
-    for (const id of ['stsc_dual_model', 'stsc_refresh_models', 'stsc_dual_model_status', 'stsc_dual_model_manual', 'stsc_test_api_connection']) {
+    for (const id of ['stsc_dual_model', 'stsc_refresh_models', 'stsc_dual_model_status', 'stsc_dual_model_manual', 'stsc_test_api_connection', 'stsc_api_profile_name']) {
         nodes.set(id, { innerHTML: '', disabled: false, value: '', textContent: '', classList: { toggle() {} } });
     }
     const scope = { ...adapters, $, jQuery() {}, URL, AbortController, structuredClone, Error, TypeError,
@@ -250,10 +250,10 @@ test('empty floating instructions stay disabled and instruction names remain esc
     assert.equal(app.run("setInstructionActivation('empty', 'always')"), false);
 });
 
-test('version/identity are formal v0.4.7; release metadata and UI stay in sync', () => {
+test('version/identity are formal v0.4.8; release metadata and UI stay in sync', () => {
     const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url)));
     const release = JSON.parse(readFileSync(new URL('../version.json', import.meta.url)));
-    assert.equal(manifest.version, '0.4.7');
+    assert.equal(manifest.version, '0.4.8');
     assert.equal(release.version, manifest.version);
     assert.equal(manifest.homePage, 'https://github.com/chenxyeah/SillyTavern-Self-Check');
     const app = plugin();
@@ -856,4 +856,159 @@ test('generation sends active persona to the configured secondary API; connectio
     assert.deepEqual(bodies[1].messages, [{ role: 'user', content: 'Reply with OK only.' }]);
     assert.ok(!JSON.stringify(app.notices).includes('PRIVATE_USER'));
     assert.ok(!app.run('JSON.stringify(normalizeSettings().logs)').includes('PRIVATE_USER'));
+});
+
+function profileApp() {
+    const app = plugin();
+    app.run(`ctx().extensionSettings[STSC_MODULE] = clone(editDraft);
+        applyTheme = renderAll = clearRuntimePrompts = () => {}; beginEditSession();`);
+    return app;
+}
+
+test('API profile migration preserves old connection once and survives a new editing session', () => {
+    const app = profileApp();
+    const id = app.run('editDraft.activeApiProfileId');
+    assert.ok(id);
+    assert.equal(app.run('editDraft.apiProfiles.length'), 1);
+    assert.equal(app.run('editDraft.apiProfiles[0].name'), '原有API配置');
+    assert.equal(app.run('editDraft.apiProfiles[0].config.apiKey'), 'TEST_SECRET');
+    app.run('normalizeSettings(); normalizeSettings(); beginEditSession()');
+    assert.equal(app.run('editDraft.activeApiProfileId'), id);
+    assert.equal(app.run('editDraft.apiProfiles.length'), 1);
+    assert.equal(app.requestBodies.length, 0);
+});
+
+test('API profiles restore independent same-provider keys, models and parameters while global options stay put', () => {
+    const app = profileApp();
+    app.run(`firstId = editDraft.activeApiProfileId;
+        editDraft.dualApi.apiKey = 'KEY_B'; editDraft.dualApi.endpoint = 'https://b.example/v1';
+        editDraft.dualApi.model = 'model-b'; editDraft.dualApi.temperature = '0'; editDraft.dualApi.maxTokens = 4096;
+        secondId = createApiProfile('备用').id;
+        editDraft.dualApi.contextMode = 'all'; editDraft.dualApi.previousReview = true;
+        switchApiProfile(firstId);`);
+    assert.equal(app.run('editDraft.dualApi.apiKey'), 'TEST_SECRET', 'save-as-new must not overwrite original key');
+    assert.equal(app.run('editDraft.dualApi.model'), 'private-model');
+    app.run(`editDraft.dualApi.apiKey = 'UPDATED_A'; switchApiProfile(secondId)`);
+    assert.equal(app.run('editDraft.dualApi.apiKey'), 'KEY_B');
+    assert.equal(app.run('editDraft.dualApi.endpoint'), 'https://b.example/v1');
+    assert.equal(app.run('editDraft.dualApi.temperature'), '0');
+    assert.equal(app.run('editDraft.dualApi.maxTokens'), 4096);
+    assert.equal(app.run('editDraft.dualApi.contextMode'), 'all');
+    assert.equal(app.run('editDraft.dualApi.previousReview'), true);
+    app.run('switchApiProfile(firstId); commitEditDraft({ notify: false }); beginEditSession(); switchApiProfile(secondId); switchApiProfile(firstId)');
+    assert.equal(app.run('editDraft.dualApi.apiKey'), 'UPDATED_A');
+    assert.equal(app.run('editDraft.apiProfiles.length'), 2);
+    assert.equal(app.requestBodies.length, 0);
+});
+
+test('profile switch remains draft-only, discards safely and saves current edits even without switching', () => {
+    const app = profileApp();
+    app.run(`editDraft.dualApi.apiKey = 'UNSAVED'; createApiProfile('临时'); markDirty();`);
+    assert.equal(app.run('normalizeSettings().dualApi.apiKey'), 'TEST_SECRET');
+    app.run('discardEditDraft()');
+    assert.equal(app.run('editDraft.apiProfiles.length'), 1);
+    assert.equal(app.run('editDraft.dualApi.apiKey'), 'TEST_SECRET');
+    app.event('input', '#stsc_dual_api_key', 'ROTATED');
+    app.run('commitEditDraft({ notify: false }); beginEditSession()');
+    assert.equal(app.run('editDraft.apiProfiles[0].config.apiKey'), 'ROTATED');
+    assert.equal(app.run('editDraft.dualApi.apiKey'), 'ROTATED');
+});
+
+test('changing supplier protects the saved old key and selecting a profile resets connection/model state', () => {
+    const app = profileApp();
+    const id = app.run('editDraft.activeApiProfileId');
+    app.event('input', '#stsc_dual_api_key', 'ORIGINAL_KEY');
+    app.event('change', '#stsc_dual_provider', 'deepseek');
+    assert.equal(app.run('editDraft.activeApiProfileId'), '');
+    assert.equal(app.run('editDraft.dualApi.apiKey'), '');
+    assert.equal(app.run('editDraft.apiProfiles[0].config.apiKey'), 'ORIGINAL_KEY');
+    app.event('input', '#stsc_dual_api_key', 'NEW_SUPPLIER_KEY');
+    app.run(`createApiProfile('新供应商'); dualApiModels = ['STALE']; dualApiModelsError = 'old error';
+        dualApiConnectionTestResult = { ok: true };`);
+    app.event('change', '#stsc_api_profile_select', id);
+    assert.equal(app.run('editDraft.dualApi.provider'), 'custom');
+    assert.equal(app.run('editDraft.dualApi.apiKey'), 'ORIGINAL_KEY');
+    assert.equal(app.run('dualApiModels.length'), 0);
+    assert.equal(app.run('dualApiConnectionTestResult'), null);
+    assert.equal(app.run('editDirty'), true);
+    assert.equal(app.requestBodies.length, 0);
+});
+
+test('API profile controls create and rename escaped names without displaying keys or accepting duplicates', async () => {
+    const app = profileApp();
+    app.nodes.get('stsc_api_profile_name').value = '<img src=x>';
+    await app.action('create-api-profile');
+    assert.equal(app.run('editDraft.apiProfiles.length'), 2);
+    app.run('renderSettingsTab()');
+    const markup = app.html['#stsc_tab_settings'];
+    assert.ok(markup.includes('&lt;img src=x&gt;'));
+    assert.ok(!markup.includes('<img src=x>'));
+    assert.ok(!markup.slice(markup.indexOf('stsc-api-profiles'), markup.indexOf('for="stsc_dual_provider"')).includes('TEST_SECRET'));
+    await app.action('create-api-profile');
+    assert.equal(app.run('editDraft.apiProfiles.length'), 2, 'duplicate rejected');
+    app.nodes.get('stsc_api_profile_name').value = '新名字';
+    await app.action('rename-api-profile');
+    assert.equal(app.run('editDraft.apiProfiles[1].name'), '新名字');
+    app.nodes.get('stsc_api_profile_name').value = '';
+    await app.action('rename-api-profile');
+    assert.equal(app.run('editDraft.apiProfiles[1].name'), '新名字');
+    assert.ok(!JSON.stringify(app.notices).includes('TEST_SECRET'));
+});
+
+test('API profile deletion requires confirmation and supports cancel/discard, fallback and clearing the last key', async () => {
+    const app = profileApp();
+    app.run(`createApiProfile('备用'); commitEditDraft({ notify: false })`);
+    await app.action('delete-api-profile');
+    assert.equal(app.run('editDraft.apiProfiles.length'), 2);
+    app.run('closeDialog()');
+    assert.equal(app.run('editDraft.apiProfiles.length'), 2);
+    await app.action('delete-api-profile');
+    app.run('pendingDeleteRequest(); closeDialog()');
+    assert.equal(app.run('editDraft.apiProfiles.length'), 1);
+    assert.equal(app.run('editDraft.activeApiProfileId'), app.run('editDraft.apiProfiles[0].id'));
+    app.run('discardEditDraft()');
+    assert.equal(app.run('editDraft.apiProfiles.length'), 2);
+    app.run('deleteApiProfile(editDraft.activeApiProfileId); deleteApiProfile(editDraft.activeApiProfileId); commitEditDraft({ notify: false })');
+    assert.equal(app.run('normalizeSettings().apiProfiles.length'), 0, 'migration must not resurrect deleted profile');
+    assert.equal(app.run('normalizeSettings().dualApi.apiKey'), '');
+    assert.equal(app.run('normalizeSettings().dualApi.endpoint'), '');
+});
+
+test('API profiles normalize malformed storage without collecting unrelated settings or cross-profile keys', () => {
+    const app = profileApp();
+    app.run(`editDraft.apiProfiles = [null, {id:'invalid', config:null},
+        {id:'same', name:'A', config:{...editDraft.dualApi, unknown:'MUST_DROP', references:['PRIVATE']}},
+        {id:'same', name:'B', config:{apiKey:'B_KEY', provider:'not-a-vendor'}}];
+        editDraft.activeApiProfileId = 'missing'; normalizeApiProfiles(editDraft);`);
+    assert.equal(app.run('editDraft.apiProfiles.length'), 2);
+    assert.equal(app.run('new Set(editDraft.apiProfiles.map(p => p.id)).size'), 2);
+    assert.equal(app.run('editDraft.activeApiProfileId'), '');
+    const profiles = app.run('JSON.stringify(editDraft.apiProfiles)');
+    assert.ok(!profiles.includes('MUST_DROP') && !profiles.includes('PRIVATE'));
+    assert.equal(app.run('editDraft.apiProfiles[1].config.apiKey'), 'B_KEY');
+    assert.equal(app.run('editDraft.apiProfiles[1].config.provider'), 'custom');
+    assert.equal(app.run('switchApiProfile("missing")'), false);
+});
+
+test('saved profile generation uses the matching endpoint/key while unsaved switches do not alter runtime', async () => {
+    const app = profileApp();
+    app.run(`firstId = editDraft.activeApiProfileId;
+        editDraft.dualApi.apiKey = 'SECOND_KEY'; editDraft.dualApi.endpoint = 'https://second.example/v1';
+        secondId = createApiProfile('第二套').id; markDirty();`);
+    const bodies = [];
+    app.scope.fetch = async (_url, options) => {
+        bodies.push(JSON.parse(options.body));
+        return new Response(JSON.stringify({choices:[{message:{content:'OK'}}]}));
+    };
+    const generate = () => app.run('callDualApiSelfCheck({chat:[],questions:[],references:[],temporaryInstructions:[],settings:normalizeSettings()})');
+    await generate();
+    app.run('commitEditDraft({ notify: false })');
+    await generate();
+    app.run('switchApiProfile(firstId); commitEditDraft({ notify: false })');
+    await generate();
+    assert.deepEqual(bodies.map(b => b.custom_url), ['https://custom.example/v1', 'https://second.example/v1', 'https://custom.example/v1']);
+    assert.deepEqual(bodies.map(b => JSON.parse(b.custom_include_headers).Authorization), ['Bearer TEST_SECRET', 'Bearer SECOND_KEY', 'Bearer TEST_SECRET']);
+    assert.ok(!app.run('JSON.stringify(normalizeSettings().logs)').includes('SECOND_KEY'));
+    const exported = app.run('JSON.stringify(makeReferenceBundleExportPayload([]))');
+    assert.ok(!exported.includes('TEST_SECRET') && !exported.includes('SECOND_KEY'));
 });
