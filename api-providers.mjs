@@ -118,7 +118,7 @@ export function buildGenerationRequest(config, messages) {
     const { id, provider, endpoint, key, model } = validated(config, true);
     const limit = normalizeMaxTokens(config.maxTokens);
     const params = requestParameters(config);
-    const common = { type: 'quiet', messages, model, stream: false, ...params };
+    const common = { type: 'quiet', messages, model, stream: Boolean(config.stream), ...params };
     if (provider.protocol === 'claude') {
         return { ...common, chat_completion_source: 'claude', reverse_proxy: endpoint,
             proxy_password: key, max_tokens: limit, claude_use_sysprompt: true, include_reasoning: false };
@@ -212,6 +212,22 @@ export function providerError(status, payload = {}) {
         message = '接口限流或繁忙，请稍后再试。';
         transient = true;
         code = 'rate_limit';
+    } else if (/stream(?:ing)?.*(?:not.support|unsupported|disabled|not.allowed)|(?:not.support|unsupported).*stream/.test(detail)) {
+        message = '当前接口不支持流式请求，请关闭“独立自检API使用流式请求”并保存后重试。';
+        code = 'stream_unsupported';
+        transient = false;
+    } else if (/safety|prompt.*block|prohibited_content|content_filter|recitation/.test(detail)) {
+        message = '供应商因内容限制没有返回可用自检答案。';
+        code = 'content_blocked';
+        transient = false;
+    } else if (/max_tokens|max_output_tokens|token.limit|length.limit/.test(detail)) {
+        message = '模型达到回复或思考长度上限，未完整完成自检；请减少题目或调整回复长度。';
+        code = 'output_limit';
+        transient = false;
+    } else if (/candidate text empty|no candidate|empty.*(?:text|response)/.test(detail)) {
+        message = '接口返回了空结果，没有可用的最终自检文本。';
+        code = 'empty';
+        transient = true;
     } else if (status === 404 || /model.not.found|unknown.model/.test(detail)) {
         message = '地址或模型不存在；请核对基础路径和模型 ID。';
         transient = false;
@@ -227,7 +243,134 @@ export function providerError(status, payload = {}) {
     return error;
 }
 
-export async function requestProvider(route, body, { fetchImpl = globalThis.fetch, headers = {}, signal } = {}) {
+function generationError(code, message, transient = false) {
+    return Object.assign(new Error(message), { code, transient });
+}
+
+function checkFinishReason(reason) {
+    if (!reason) return;
+    if (/^(?:MAX_TOKENS|max_tokens|length|CONTINUATION)$/i.test(reason)) {
+        throw generationError('output_limit', '模型达到回复或思考长度上限，未完整完成自检。');
+    }
+    if (/^(?:SAFETY|RECITATION|PROHIBITED_CONTENT|BLOCKLIST|SPII|content_filter|refusal)$/i.test(reason)) {
+        throw generationError('content_blocked', '供应商未返回可用文本；请检查内容限制或更换可用模型。');
+    }
+    if (!/^(?:STOP|end_turn|stop_sequence|tool_calls|tool_use|function_call)$/i.test(reason)) {
+        throw generationError('stream_incomplete', '模型异常结束，未取得完整自检结果。', true);
+    }
+}
+
+function streamText(content) {
+    if (typeof content === 'string') return content;
+    if (!Array.isArray(content)) return '';
+    return content.filter(part => !part?.thought && (!part?.type || ['text', 'output_text'].includes(part.type)))
+        .map(part => typeof part === 'string' ? part : typeof part?.text === 'string' ? part.text : '').join('');
+}
+
+async function readStreamedPayload(response, { signal, onActivity } = {}) {
+    const reader = response.body?.getReader?.();
+    if (!reader) throw generationError('stream_format', '当前浏览器无法读取流式响应，请关闭流式后重试。');
+    const decoder = new TextDecoder();
+    let buffer = '', output = '', dataLines = [], event = '', frameLength = 0;
+    let mode = /text\/event-stream/i.test(response.headers?.get?.('content-type') || '') ? 'sse' : '';
+    let complete = false, ended = false;
+    const abortError = () => Object.assign(new Error('API请求已取消或超时。'), { name: 'AbortError' });
+    const cancel = () => { reader.cancel().catch(() => {}); };
+    signal?.addEventListener('abort', cancel, { once: true });
+    const append = value => {
+        output += value;
+        if (output.length > 2 * 1024 * 1024) throw generationError('stream_format', '自检响应过长，已停止接收。');
+    };
+    const dispatch = () => {
+        const type = event;
+        const raw = dataLines.join('\n').trim();
+        dataLines = []; event = ''; frameLength = 0;
+        if (!raw) return;
+        if (raw === '[DONE]') { complete = true; return; }
+        let payload;
+        try { payload = JSON.parse(raw); } catch {
+            throw generationError('stream_format', '流式响应格式异常，未取得完整自检结果。', true);
+        }
+        if (type === 'error' || payload?.error || payload?.type === 'error') throw providerError(response.status, payload);
+        if (payload?.promptFeedback?.blockReason) throw generationError('content_blocked', '供应商拦截了本轮自检内容。');
+        const choice = payload?.choices?.find(item => item.index === 0 || item.index == null);
+        if (choice) {
+            if (choice.delta?.refusal) throw generationError('content_blocked', '模型未接受本轮自检内容。');
+            append(streamText(choice.delta?.content ?? choice.message?.content ?? choice.text));
+            if (choice.finish_reason) { checkFinishReason(choice.finish_reason); complete = true; }
+        }
+        const candidate = payload?.candidates?.find(item => item.index === 0 || item.index == null);
+        if (candidate) {
+            append(streamText(candidate.content?.parts));
+            if (candidate.finishReason) { checkFinishReason(candidate.finishReason); complete = true; }
+        }
+        const nativeType = payload?.type || type;
+        if (nativeType === 'content_block_start' && payload.content_block?.type === 'text') append(streamText(payload.content_block.text));
+        if (nativeType === 'content_block_delta' && payload.delta?.type === 'text_delta') append(streamText(payload.delta.text));
+        if (nativeType === 'message_delta') checkFinishReason(payload.delta?.stop_reason);
+        if (nativeType === 'message_stop') complete = true;
+        // Reasoning, signatures, tool arguments, ping and future unknown events are not answers.
+    };
+    const consume = final => {
+        if (!mode) {
+            const prefix = buffer.trimStart();
+            if (/^[{\[]/.test(prefix)) mode = 'json';
+            else if (/^(?:(?:data|event|id|retry):|:)/.test(prefix)) mode = 'sse';
+            else if (buffer.length > 1024) throw generationError('stream_format', '接口没有返回可识别的流式或JSON响应。');
+        }
+        if (mode !== 'sse') return;
+        // Legacy ST forwards the body without an SSE Content-Type header: sniff above.
+        while (!complete) {
+            const newline = /\r\n|\r|\n/.exec(buffer);
+            if (!newline || (!final && newline[0] === '\r' && newline.index + 1 === buffer.length)) break;
+            const line = buffer.slice(0, newline.index);
+            buffer = buffer.slice(newline.index + newline[0].length);
+            frameLength += line.length;
+            if (frameLength > 2 * 1024 * 1024) throw generationError('stream_format', '流式事件过长，已停止接收。');
+            if (!line) dispatch();
+            else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
+            else if (line.startsWith('event:')) event = line.slice(6).trim();
+        }
+        if (final && !complete) {
+            if (buffer.startsWith('data:')) dataLines.push(buffer.slice(5).replace(/^ /, ''));
+            buffer = '';
+            dispatch();
+        }
+    };
+    try {
+        while (!complete) {
+            if (signal?.aborted) throw abortError();
+            const chunk = await reader.read();
+            if (signal?.aborted) throw abortError();
+            if (chunk.done) {
+                ended = true;
+                buffer += decoder.decode();
+                consume(true);
+                break;
+            }
+            if (chunk.value?.length) onActivity?.();
+            buffer += decoder.decode(chunk.value, { stream: true });
+            if (buffer.length > 2 * 1024 * 1024) throw generationError('stream_format', '自检响应过长，已停止接收。');
+            consume(false);
+        }
+        if (mode !== 'sse') {
+            let payload;
+            try { payload = JSON.parse(buffer); } catch {
+                throw generationError('stream_format', '接口未返回可识别的JSON或流式响应。');
+            }
+            if (payload?.error || payload?.type === 'error') throw providerError(response.status, payload);
+            return payload; // Providers ignoring stream:true can still return ordinary JSON.
+        }
+        if (!complete) throw generationError('stream_incomplete', '流式连接在完成前中断，未取得完整自检结果。', true);
+        return { choices: [{ message: { content: output } }] };
+    } finally {
+        signal?.removeEventListener('abort', cancel);
+        if (!ended) cancel();
+        reader.releaseLock();
+    }
+}
+
+export async function requestProvider(route, body, { fetchImpl = globalThis.fetch, headers = {}, signal, onActivity } = {}) {
     if (!['generate', 'status'].includes(route)) throw new Error('未知接口操作。');
     let response;
     let raw;
@@ -236,6 +379,9 @@ export async function requestProvider(route, body, { fetchImpl = globalThis.fetc
             method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
             body: JSON.stringify(body), signal,
         });
+        if (signal?.aborted) throw Object.assign(new Error(), { name: 'AbortError' });
+        onActivity?.();
+        if (route === 'generate' && body.stream && response.ok) return await readStreamedPayload(response, { signal, onActivity });
         raw = await response.text();
     } catch (caught) {
         if (signal?.aborted || caught?.name === 'AbortError') {
@@ -243,12 +389,14 @@ export async function requestProvider(route, body, { fetchImpl = globalThis.fetc
             error.name = 'AbortError';
             throw error;
         }
+        if (['auth', 'quota', 'rate_limit', 'provider', 'content_blocked', 'output_limit', 'empty', 'stream_incomplete', 'stream_format', 'stream_unsupported'].includes(caught?.code)) throw caught;
         const error = new Error('无法连接酒馆后端，请检查网络和酒馆服务。');
         error.transient = true;
         throw error;
     }
     let payload;
     try { payload = JSON.parse(raw); } catch {
+        if (!response.ok) throw providerError(response.status);
         const error = new Error('接口未返回 JSON；请检查基础地址，勿填写网页地址。');
         error.transient = response.status >= 500;
         throw error;
@@ -259,11 +407,12 @@ export async function requestProvider(route, body, { fetchImpl = globalThis.fetc
 
 export function readGenerationText(payload) {
     if (payload?.promptFeedback?.blockReason || ['SAFETY', 'RECITATION', 'PROHIBITED_CONTENT'].includes(payload?.candidates?.[0]?.finishReason)) {
-        throw new Error('供应商未返回可用文本；请检查内容限制或更换可用模型。');
+        throw generationError('content_blocked', '供应商未返回可用文本；请检查内容限制或更换可用模型。');
     }
     const text = extractResponseText(payload);
     if (!text) {
         const error = new Error('接口连接成功，但未返回最终文本；请确认模型支持文本回复，并尝试增加最大回复长度。');
+        error.code = 'empty';
         error.transient = true;
         throw error;
     }
@@ -272,7 +421,7 @@ export function readGenerationText(payload) {
 
 export async function testConnection(config, options = {}) {
     // No chat, character, references or self-check state are sent by this probe.
-    const request = buildGenerationRequest(config, [{ role: 'user', content: 'Reply with OK only.' }]);
+    const request = buildGenerationRequest({ ...config, stream: false }, [{ role: 'user', content: 'Reply with OK only.' }]);
     const payload = await requestProvider('generate', request, options);
     readGenerationText(payload);
     return true;

@@ -1,4 +1,22 @@
-# 自检 API 供应商适配设计（正式版 v0.4.3）
+# 自检 API 供应商适配设计
+
+## v0.4.9：独立自检流式接收（2026-10-20）
+
+`dualApi.stream` 默认 true，API配置白名单保存该开关；缺字段的旧配置使用默认值，显式 false 保留。浏览器仍仅请求酒馆同源后端，主API不受该开关影响。连接测试强制非流式，只发简短OK消息。
+
+`buildGenerationRequest` 转发 stream 开关，由酒馆后端处理 OpenAI兼容/两个Plan/DeepSeek/GLM、Claude Messages、Gemini streamGenerateContent（含 alt=sse）。Gemini官方兼容思考档位路线也保留原有路由。原生 SSE 与 OpenAI delta 各自解码，忽略思考、签名、工具参数和非首候选，只积累最终文本。
+
+接收器处理分块UTF-8、CRLF/CR/LF、注释心跳、多行data、结束包及无Content-Type的旧酒馆转发；JSON返回可兼容。HTTP错误、流内错误、空回复、无结束标记的断流、长度截断和内容限制不接受为完整成功。缓冲/输出有2MiB保护。只在完成后交回原XML完整性检查，不边收边注入。
+
+无数据计时在收到响应头或非空字节时重置；默认150秒无数据、450秒绝对总上限。精简重试无数据上限60秒、总上限180秒。总时限避免心跳使请求无限挂起。取消或失败会清理计时器、取消reader；重复请求使用新缓冲区，沿用至多一次补救及原来的停止/回退策略。
+
+兼容层不自动猜测中转协议或付费重试其他端点。不支持流式时给出关闭开关的明确提示；供应商不遵守流式参数而返回普通JSON时仍可读取。请求前长期思考且不回任何数据仍可能超时，流式不能保证所有账户/代理都正常。
+
+错误按结构化code分类，修复此前通用中文文案含“密钥”导致200空回误判认证失败；短错误类别不回显上游payload/密钥。模拟SSE、虚拟时钟、真实本机酒馆后端转发合同及隔离页面测试，不等同真实供应商账户联调。
+
+依据：[OpenAI流式文档](https://developers.openai.com/api/docs/guides/streaming-responses)、[Gemini流式接口](https://ai.google.dev/api/generate-content#method:-models.streamgeneratecontent)、[Claude流式事件](https://platform.claude.com/docs/en/build-with-claude/streaming)。使用 OpenAI Docs 技能核对兼容流格式，不改变旧版本的模型或端点选择。
+
+下文为 v0.4.3 及更早设计记录，涉及“非流式”的旧范围以本节更新为准。
 
 核对日期：2026-09-26。基线：正式版 v0.4.1，提交 `e32802c501a425217e39446c0bbd0bcecc52678e`。
 当前版本为正式版 v0.4.3；实现与模拟测试已完成。发布不等于已完成真实供应商联调或移动端交互验收，详见文末测试范围。

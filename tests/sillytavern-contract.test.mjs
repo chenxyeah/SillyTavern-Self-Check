@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import vm from 'node:vm';
-import { API_PROVIDERS, buildGenerationRequest, buildModelsRequest, extractModelIds, readGenerationText } from '../api-providers.mjs';
+import { API_PROVIDERS, buildGenerationRequest, buildModelsRequest, extractModelIds, readGenerationText, requestProvider } from '../api-providers.mjs';
 
 const stRoot = process.env.ST_SOURCE_ROOT;
 const stripModule = text => text.replace(/^import\s[\s\S]*?;\r?$/gm, '').replace(/^export /gm, '');
@@ -26,6 +26,8 @@ function backend(upstream) {
         color: { red: x => x, blue: x => x, yellow: x => x },
         express: { Router: () => ({ post: (route, handler) => { routes[route] = handler; } }) },
         fetch: upstream,
+        // Capture the raw stream ST forwards, without starting an HTTP server.
+        forwardFetchResponse: (upstreamResponse, response) => response.send({ streamResponse: upstreamResponse }),
     };
     const context = vm.createContext(scope);
     for (const file of ['constants.js', 'prompt-converters.js', 'endpoints/backends/chat-completions.js']) {
@@ -42,6 +44,29 @@ function backend(upstream) {
 }
 
 for (const [id, provider] of Object.entries(API_PROVIDERS)) {
+    test(id + ': installed ST forwards streaming to the right endpoint and preserves native SSE', { skip: !stRoot, timeout: 5000 }, async () => {
+        const config = { provider: id, endpoint: provider.endpoint || 'https://custom.example/v1', apiKey: 'MOCK_KEY',
+            model: id === 'claude' ? 'claude-3-7-sonnet-latest' : id === 'gemini' ? 'gemini-2.5-flash' : 'text-model', stream: true };
+        let outgoing;
+        const send = backend(async (url, options) => {
+            outgoing = { url: String(url), body: JSON.parse(options.body), headers: options.headers };
+            const packets = id === 'gemini' ? [{ candidates: [{ content: { parts: [{ text: 'FINAL' }] }, finishReason: 'STOP' }] }]
+                : id === 'claude' ? [{ type: 'content_block_delta', delta: { type: 'text_delta', text: 'FINAL' } }, { type: 'message_stop' }]
+                    : [{ choices: [{ index: 0, delta: { content: 'FINAL' }, finish_reason: 'stop' }] }];
+            return new Response(packets.map(data => 'data: ' + JSON.stringify(data) + '\n\n').join(''));
+        });
+        const payload = await requestProvider('generate', buildGenerationRequest(config, [{ role: 'user', content: 'TEST' }]), {
+            fetchImpl: async (_url, options) => (await send('generate', JSON.parse(options.body))).body.streamResponse,
+        });
+        assert.equal(readGenerationText(payload), 'FINAL');
+        if (id === 'gemini') {
+            assert.ok(outgoing.url.includes(':streamGenerateContent?'));
+            assert.ok(outgoing.url.includes('alt=sse'));
+        } else {
+            assert.equal(outgoing.body.stream, true);
+        }
+        assert.ok(!JSON.stringify(outgoing).includes('MAIN_API_SECRET'));
+    });
     test(id + ': installed ST produces correct provider wire request', { skip: !stRoot, timeout: 5000 }, async () => {
         const config = { provider: id, endpoint: provider.endpoint || 'https://custom.example/v1',
             apiKey: 'MOCK_KEY', model: id === 'claude' ? 'claude-3-7-sonnet-latest' : id === 'gemini' ? 'gemini-2.5-flash' : 'text-model', maxTokens: 4096 };

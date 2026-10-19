@@ -250,10 +250,10 @@ test('empty floating instructions stay disabled and instruction names remain esc
     assert.equal(app.run("setInstructionActivation('empty', 'always')"), false);
 });
 
-test('version/identity are formal v0.4.8; release metadata and UI stay in sync', () => {
+test('version/identity are formal v0.4.9; release metadata and UI stay in sync', () => {
     const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url)));
     const release = JSON.parse(readFileSync(new URL('../version.json', import.meta.url)));
-    assert.equal(manifest.version, '0.4.8');
+    assert.equal(manifest.version, '0.4.9');
     assert.equal(release.version, manifest.version);
     assert.equal(manifest.homePage, 'https://github.com/chenxyeah/SillyTavern-Self-Check');
     const app = plugin();
@@ -1011,4 +1011,124 @@ test('saved profile generation uses the matching endpoint/key while unsaved swit
     assert.ok(!app.run('JSON.stringify(normalizeSettings().logs)').includes('SECOND_KEY'));
     const exported = app.run('JSON.stringify(makeReferenceBundleExportPayload([]))');
     assert.ok(!exported.includes('TEST_SECRET') && !exported.includes('SECOND_KEY'));
+});
+
+test('streaming defaults on, can be disabled, and persists separately in saved API profiles', () => {
+    const app = profileApp();
+    assert.equal(app.run('normalizeSettings().dualApi.stream'), true);
+    app.run('firstId = editDraft.activeApiProfileId; renderSettingsTab()');
+    assert.match(app.html['#stsc_tab_settings'], /id="stsc_dual_stream"[^>]*checked/);
+    app.event('change', '#stsc_dual_stream', false);
+    app.run(`secondId = createApiProfile('非流式接口').id; commitEditDraft({notify:false}); beginEditSession();`);
+    assert.equal(app.run('editDraft.dualApi.stream'), false);
+    app.run('switchApiProfile(firstId)');
+    assert.equal(app.run('editDraft.dualApi.stream'), true);
+    app.run('switchApiProfile(secondId)');
+    assert.equal(app.run('editDraft.dualApi.stream'), false);
+    app.event('change', '#stsc_dual_stream', true);
+    app.run('discardEditDraft()');
+    assert.equal(app.run('editDraft.dualApi.stream'), false);
+});
+
+function timedStreamApp() {
+    const app = plugin();
+    app.run(`editDraft.dualApi.timeoutSeconds = 60; editDraft.dualApi.retryTransient = false;
+        buildDualApiMessages = () => [{role:'user',content:'TEST'}];`);
+    let now = 0, next = 0;
+    const timers = new Map();
+    app.scope.setTimeout = (fn, delay) => { const id = ++next; timers.set(id, { at: now + delay, fn }); return id; };
+    app.scope.clearTimeout = id => timers.delete(id);
+    let controller, cancelled = false;
+    app.scope.fetch = async () => new Response(new ReadableStream({ start(c) { controller = c; }, cancel() { cancelled = true; } }));
+    const advance = async milliseconds => {
+        const target = now + milliseconds;
+        while (true) {
+            const earliest = [...timers].filter(([,timer]) => timer.at <= target).sort((a,b) => a[1].at-b[1].at)[0];
+            if (!earliest) break;
+            now = earliest[1].at; timers.delete(earliest[0]); earliest[1].fn(); await tick();
+        }
+        now = target; await tick();
+    };
+    return { app, advance, timers,
+        send: data => controller.enqueue(new TextEncoder().encode(data)),
+        cancelled: () => cancelled,
+    };
+}
+
+test('active streams may exceed the old total timeout and all timers clear on success', async () => {
+    const t = timedStreamApp();
+    const pending = t.app.run('callDualApiSelfCheck({settings:getUiSettings()})');
+    await tick();
+    await t.advance(40000); t.send('data: {"choices":[{"delta":{"content":"A "}}]}\n\n'); await tick();
+    await t.advance(40000); t.send(': heartbeat\n\n'); await tick();
+    await t.advance(40000); t.send('data: {"choices":[{"delta":{"content":"B"},"finish_reason":"stop"}]}\n\n');
+    assert.equal((await pending).text, 'A B');
+    assert.equal(t.timers.size, 0);
+});
+
+test('a stream with no activity times out, cancels its reader and clears its total timer', async () => {
+    const t = timedStreamApp();
+    const pending = t.app.run('callDualApiSelfCheck({settings:getUiSettings()})');
+    const check = assert.rejects(pending, error => error.code === 'timeout' && error.message.includes('连续未收到数据'));
+    await tick(); await t.advance(60001); await check;
+    assert.equal(t.cancelled(), true);
+    assert.equal(t.timers.size, 0);
+});
+
+test('heartbeats cannot bypass the streaming overall deadline', async () => {
+    const t = timedStreamApp();
+    const pending = t.app.run('callDualApiSelfCheck({settings:getUiSettings()})');
+    const check = assert.rejects(pending, error => error.code === 'timeout' && error.message.includes('180秒流式总等待上限'));
+    await tick();
+    for (let i = 0; i < 4; i++) { await t.advance(40000); t.send(': heartbeat\n\n'); await tick(); }
+    await t.advance(20001); await check;
+    assert.equal(t.cancelled(), true);
+    assert.equal(t.timers.size, 0);
+});
+
+test('interrupted streams retry only once with a fresh accumulator and compact context', async () => {
+    const app = plugin();
+    app.run(`buildDualApiMessages = () => [{role:'user',content:'TEST'}]; waitForDualApiRetry = async () => {};`);
+    let calls = 0;
+    app.scope.fetch = async () => new Response('data: ' + JSON.stringify({ choices: [{ delta: { content: ++calls === 1 ? 'PARTIAL' : 'FINAL' }, finish_reason: calls === 1 ? null : 'stop' }] }) + '\n\n');
+    const result = await app.run('callDualApiSelfCheck({settings:getUiSettings()})');
+    assert.equal(calls, 2);
+    assert.equal(result.text, 'FINAL');
+    assert.equal(result.compact, true);
+});
+
+test('complete-looking stream XML is not injected into main API before the provider finishes', async () => {
+    const app = plugin();
+    app.run(`testSettings = clone(editDraft); testSettings.dualApi.retryTransient = false; normalizeSettings = () => testSettings;
+        getActiveQuestions = getDualApiQuestions = () => [{id:'q1',text:'问题',requireEvidence:false}];
+        getActiveReferences = getSelectedTemporaryInstructions = () => [];
+        clearRuntimePrompts = applyReferencePrompts = applyTemporaryPrompt = () => {};
+        injected = false; applyDualApiMainPrompt = () => { injected = true; };`);
+    let controller;
+    app.scope.fetch = async () => new Response(new ReadableStream({ start(c) { controller = c; } }));
+    const pending = app.run('sillyTavernSelfCheckInterceptor([],10000,()=>{},"normal")');
+    await tick();
+    const xml = '<stsc_self_check><item id="q1"><answer>结论</answer></item></stsc_self_check>';
+    controller.enqueue(new TextEncoder().encode('data: ' + JSON.stringify({choices:[{delta:{content:xml}}]}) + '\n\n'));
+    await tick();
+    assert.equal(app.run('injected'), false);
+    controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+    await pending;
+    assert.equal(app.run('injected'), true);
+    assert.equal(app.run('pendingRun.mode'), 'dual_api');
+});
+
+test('HTTP200 provider errors and empty/safety results are no longer misreported as key errors', () => {
+    const app = plugin();
+    for (const payload of [
+        {error:{message:'Google AI Studio Candidate text empty'}},
+        {error:{message:'Prompt was blocked due to : SAFETY'}},
+        {error:{message:'Unknown provider failure'}},
+    ]) {
+        app.scope.errorToFormat = adapters.providerError(200, payload);
+        const text = app.run('dualApiFailureMessage(errorToFormat)');
+        assert.ok(!text.includes('通常是API密钥错误'), text);
+    }
+    app.scope.errorToFormat = adapters.providerError(200,{error:{message:'Unauthorized'}});
+    assert.ok(app.run('dualApiFailureMessage(errorToFormat)').includes('密钥错误'));
 });

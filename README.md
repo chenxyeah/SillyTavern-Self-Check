@@ -2,7 +2,17 @@
 
 一个用于 SillyTavern 角色扮演的写作前置自检、预设管理、参考资料注入与临时指令插件。
 
-> 当前正式版本：`0.4.8`
+> 当前正式版本：`0.4.9`
+
+## v0.4.9 更新：副API流式与超时修复
+
+- “插件设置 → 双API设置”新增“独立自检API使用流式请求”，默认开启；可随每套 API 配置单独保存。不支持流式的接口可以关闭。测试连接仍是简短非流式探测，不能代替实际自检测试。
+- 支持 OpenAI 兼容、Gemini/Claude 原生 SSE；收到的最终文本会先拼接完整，再按既有题目/XML要求校验后交给正文 API。不会逐字显示自检答案，也不会将推理片段、工具参数或半截回答当作结论。
+- 流式使用“无数据超时”：默认连续150秒无数据才停止，每次收到数据会重新计时；总等待最多450秒。修改无数据超时后，总上限为该值3倍。精简重试最多再等60秒无数据/180秒总时长。关闭流式时保留原来的单次总时长计时。
+- 流式有助于减少持续输出的慢请求被提前回退，但无法消除模型长期不回数据、代理缓冲、限流或网络故障。断流/超时仍按既有设置精简重试或回退；不支持流式时提示关闭开关，不额外自动尝试其他协议。
+- 修复HTTP200错误包被笼统误报“密钥错误”。空结果、内容限制、输出上限和流式格式异常会显示对应的简短原因，不回显密钥或上游私密文本。
+
+协议实现参考 [OpenAI官方流式说明](https://developers.openai.com/api/docs/guides/streaming-responses)、[Gemini streamGenerateContent](https://ai.google.dev/api/generate-content#method:-models.streamgeneratecontent)、[Claude流式消息](https://platform.claude.com/docs/en/build-with-claude/streaming)。
 
 ## v0.4.8 更新：保存并切换API配置
 

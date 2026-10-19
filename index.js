@@ -7,7 +7,7 @@ import {
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.8';
+const STSC_VERSION = '0.4.9';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -43,13 +43,13 @@ const STSC_REMOTE_RELEASE_URLS = Object.freeze([
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-10-14',
-    title: 'API配置保存与切换',
+    releasedAt: '2026-10-20',
+    title: '独立自检API流式与超时修复',
     changes: Object.freeze([
-        '双API设置新增可命名的API配置，保存接口、Key、模型和请求参数，切换后自动恢复。',
-        '升级时保留原有API配置，支持另存、重命名和删除，同一供应商也可保存多套Key。',
-        '修改或切换后点击顶部保存更改长期保留，放弃更改可恢复原配置；切换不自动发起API请求。',
-        '116项自动测试通过，并完成桌面及手机宽度的配置保存、回切和删除交互验证。',
+        '独立自检API默认使用流式请求，支持OpenAI兼容、Gemini与Claude原生流格式，可在设置中关闭并随API配置保存。',
+        '流式接收数据时重新计算无数据超时，并保留三倍总时限，减少慢请求被过早回退到单API。',
+        '完整接收并校验后才提交自检；断流、截断、内容限制和空回复分别提示，不将半截结果发给正文API。',
+        '修复返回200的通用错误被误报为密钥错误，测试连接仍使用独立的简短非流式探测。',
     ]),
 });
 
@@ -97,7 +97,7 @@ const ROLE_MAP = Object.freeze({
 
 const API_PROFILE_FIELDS = Object.freeze([
     'provider', 'endpoint', 'apiKey', 'model', 'maxTokens', 'temperature', 'topP',
-    'reasoningEffort', 'preamble', 'timeoutSeconds', 'retryTransient',
+    'reasoningEffort', 'preamble', 'timeoutSeconds', 'retryTransient', 'stream',
 ]);
 
 const DEFAULT_SETTINGS = Object.freeze({
@@ -124,6 +124,7 @@ const DEFAULT_SETTINGS = Object.freeze({
         preamble: '',
         timeoutSeconds: 150,
         retryTransient: true,
+        stream: true,
         contextMode: 'recent5',
         customTurns: 5,
         transformFormat: false,
@@ -407,6 +408,7 @@ function normalizeSettings() {
     settings.dualApi.preamble = String(settings.dualApi.preamble || '');
     settings.dualApi.timeoutSeconds = clampNumber(settings.dualApi.timeoutSeconds, 60, 300, 150);
     settings.dualApi.retryTransient = Boolean(settings.dualApi.retryTransient);
+    settings.dualApi.stream = settings.dualApi.stream !== false;
     // beta.3：聊天范围只保留“默认最近5轮 / 自定义 / 全部”。旧界面的跟随、10轮、20轮统一迁移为最近5轮。
     settings.dualApi.contextMode = ['recent5', 'custom', 'all'].includes(settings.dualApi.contextMode) ? settings.dualApi.contextMode : 'recent5';
     settings.dualApi.customTurns = clampNumber(settings.dualApi.customTurns, 1, 100, 5);
@@ -1188,6 +1190,7 @@ function apiProfileConfig(dual = {}) {
     config.maxTokens = normalizeMaxTokens(config.maxTokens);
     config.timeoutSeconds = clampNumber(config.timeoutSeconds, 60, 300, 150);
     config.retryTransient = Boolean(config.retryTransient);
+    config.stream = config.stream !== false;
     return config;
 }
 
@@ -2336,7 +2339,16 @@ async function callDualApiSelfCheck(
         const attemptTimeoutSeconds = retrying ? Math.min(configuredTimeout, 60) : configuredTimeout;
         const controller = new AbortController();
         const startedAt = Date.now();
-        const timeout = setTimeout(() => controller.abort(), attemptTimeoutSeconds * 1000);
+        const streaming = dual.stream !== false;
+        const totalSeconds = attemptTimeoutSeconds * 3;
+        let timeout, timeoutKind = 'idle';
+        const armIdleTimeout = () => {
+            clearTimeout(timeout);
+            timeout = setTimeout(() => { timeoutKind = 'idle'; controller.abort(); }, attemptTimeoutSeconds * 1000);
+        };
+        armIdleTimeout();
+        // Heartbeats keep an active stream alive, but cannot make a request wait forever.
+        const totalTimeout = streaming ? setTimeout(() => { timeoutKind = 'total'; controller.abort(); }, totalSeconds * 1000) : null;
 
         try {
             const headers = {
@@ -2344,16 +2356,19 @@ async function callDualApiSelfCheck(
                 ...(context?.getRequestHeaders?.() || {}),
             };
             const messages = buildDualApiMessages(chat, questions, references, temporaryInstructions, settings, { compact: attemptCompact });
-            const payload = await requestProvider('generate', buildGenerationRequest(dual, messages), {
+            const payload = await requestProvider('generate', buildGenerationRequest({ ...dual, stream: streaming }, messages), {
                 headers,
                 signal: controller.signal,
+                onActivity: streaming ? armIdleTimeout : undefined,
             });
             const text = readGenerationText(payload);
             return { text, attempts: attempt + 1, compact: attemptCompact };
         } catch (caught) {
             let error = caught instanceof Error ? caught : new Error(String(caught || '未知错误'));
             if (error.name === 'AbortError') {
-                error = new Error(`自检API等待超过${attemptTimeoutSeconds}秒，已超时。`);
+                error = new Error(timeoutKind === 'total'
+                    ? `自检API已达到${totalSeconds}秒流式总等待上限，已超时。`
+                    : `自检API${streaming ? '连续未收到数据' : '等待'}超过${attemptTimeoutSeconds}秒，已超时。`);
                 error.code = 'timeout';
                 error.transient = true;
             } else if (error.name === 'TypeError') {
@@ -2367,6 +2382,7 @@ async function callDualApiSelfCheck(
             await waitForDualApiRetry(error.httpStatus === 429 ? 1500 : 800);
         } finally {
             clearTimeout(timeout);
+            clearTimeout(totalTimeout);
         }
     }
 
@@ -2470,11 +2486,15 @@ function dualApiFailureMessage(error) {
     const retried = Number(error?.attempts) > 1 || /重试/.test(raw);
     let message = '';
 
-    if (/格式不完整|识别到\s*\d+\/\d+|缺少回答|必要依据/.test(raw)) {
+    if (['empty', 'content_blocked', 'output_limit', 'stream_incomplete', 'stream_format', 'stream_unsupported', 'timeout'].includes(error?.code)) {
+        message = raw;
+    } else if (error?.code === 'provider' && status === 200) {
+        message = '接口返回了200，但结果中包含错误，未取得自检答案；这不能直接判断为密钥错误。';
+    } else if (/格式不完整|识别到\s*\d+\/\d+|缺少回答|必要依据/.test(raw)) {
         message = '自检API有返回内容，但题目没有答全，或缺少必须提供的依据。';
     } else if (/超时|timeout|timed out|AbortError|超过\s*\d+\s*秒/i.test(raw)) {
         message = `等待自检API${seconds ? `约 ${seconds} 秒` : '很久'}仍没有收到回答，通常是接口太慢或网络不稳定。`;
-    } else if (status === 401 || status === 403 || /密钥|认证|授权|unauthori|forbidden/i.test(raw)) {
+    } else if (error?.code === 'auth' || status === 401 || status === 403 || (!error?.code && /密钥|认证|授权|unauthori|forbidden/i.test(raw))) {
         message = `自检API拒绝了请求${status ? `（返回 ${status}）` : ''}，通常是API密钥错误、已经失效，或账号没有使用该模型的权限。`;
     } else if (status === 404) {
         message = '没有找到自检API地址（返回 404），请检查接口地址是否填对，以及地址末尾是否需要 /v1。';
@@ -3856,11 +3876,17 @@ function renderSettingsTab() {
                 </div>
             </div>
 
+            <label class="checkbox_label" style="margin-top:12px">
+                <input id="stsc_dual_stream" type="checkbox" ${dual.stream !== false ? 'checked' : ''}>
+                独立自检API使用流式请求（推荐）
+            </label>
+            <div class="stsc-muted">默认开启，可随API配置保存。边接收边等待，完整接收后才提交自检结论；不是逐字显示答案。不支持流式的接口可关闭。</div>
+
             <div class="stsc-grid-2" style="margin-top:10px">
                 <div class="stsc-field">
-                    <label>单次请求超时</label>
+                    <label>${dual.stream !== false ? '流式无数据超时' : '单次请求超时'}</label>
                     <input id="stsc_dual_timeout_seconds" class="text_pole" type="number" min="60" max="300" step="10" value="${Math.round(dual.timeoutSeconds)}">
-                    <div class="stsc-muted">单位：秒，默认150秒。自动重试会改用精简上下文，并最多再等待60秒。</div>
+                    <div class="stsc-muted">单位：秒，默认150秒。流式每次收到数据会重新计时，总等待最多为此值的3倍。精简重试的无数据等待最多60秒、流式总等待最多180秒；关闭流式时按单次总时长计时。</div>
                 </div>
                 <div class="stsc-field">
                     <label>瞬时错误补救</label>
@@ -5230,6 +5256,11 @@ function bindUiEvents() {
         getUiSettings().dualApi.timeoutSeconds = clampNumber(this.value, 60, 300, 150);
         this.value = Math.round(getUiSettings().dualApi.timeoutSeconds);
         markDirty();
+    });
+    $('#stsc_manager_overlay').on('change', '#stsc_dual_stream', function () {
+        getUiSettings().dualApi.stream = this.checked;
+        markDirty();
+        renderSettingsTab();
     });
     $('#stsc_manager_overlay').on('change', '#stsc_dual_retry_transient', function () {
         getUiSettings().dualApi.retryTransient = this.checked;
