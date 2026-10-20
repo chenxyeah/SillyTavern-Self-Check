@@ -2245,6 +2245,17 @@ body.stsc-modal-open {
 .stsc-log-head { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 7px; }
 .stsc-log-head time { color: var(--stsc-muted); font-size: 12px; }
 
+/* Reference plans share the dialog scroll container, without parent scroll locks. */
+.stsc-reference-plans { min-width: 0; }
+.stsc-reference-plans .stsc-field { margin: 12px 0; }
+.stsc-reference-plans .stsc-toolbar { flex-wrap: wrap; gap: 7px; margin: 10px 0; }
+.stsc-plan-entries { display: flex; flex-direction: column; gap: 9px; margin: 12px 0; }
+.stsc-plan-entry { min-width: 0; padding: 11px; border: 1px solid var(--stsc-border); border-radius: 10px; }
+.stsc-plan-entry > b { display: block; overflow-wrap: anywhere; margin-bottom: 8px; }
+.stsc-plan-entry-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.stsc-plan-entry-controls .checkbox_label { margin: 0; }
+.stsc-reference-plans .menu_button { white-space: normal; }
+
 .stsc-batch-reference-tools {
   display: flex;
   align-items: center;

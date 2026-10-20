@@ -7,7 +7,7 @@ import {
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.9';
+const STSC_VERSION = '0.4.10';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -44,12 +44,12 @@ const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
     releasedAt: '2026-10-20',
-    title: '独立自检API流式与超时修复',
+    title: '资料方案与角色绑定',
     changes: Object.freeze([
-        '独立自检API默认使用流式请求，支持OpenAI兼容、Gemini与Claude原生流格式，可在设置中关闭并随API配置保存。',
-        '流式接收数据时重新计算无数据超时，并保留三倍总时限，减少慢请求被过早回退到单API。',
-        '完整接收并校验后才提交自检；断流、截断、内容限制和空回复分别提示，不将半截结果发给正文API。',
-        '修复返回200的通用错误被误报为密钥错误，测试连接仍使用独立的简短非流式探测。',
+        '参考资料库新增资料方案，可组合多份资料并绑定角色，切换角色自动使用对应组合。',
+        '方案独立保存资料开关、自检问答与排序；加号添加、减号移出，不复制或删除总库原资料。',
+        '资料内容统一在总资料库编辑并同步到所有引用方案；支持重命名、删除、默认方案及解除绑定。',
+        '角色绑定优先于默认方案，未使用方案时保留原资料配置；所有修改均需保存，支持放弃更改。',
     ]),
 });
 
@@ -138,6 +138,9 @@ const DEFAULT_SETTINGS = Object.freeze({
     logLastViewedAt: 0,
     presets: [],
     references: [],
+    referencePlans: [],
+    referencePlanBindings: [],
+    defaultReferencePlanId: '',
     temporaryInstructions: [],
     pendingInstructionIds: [],
     persistentInstructionIds: [],
@@ -195,6 +198,7 @@ let pendingUnsavedAction = null;
 let floatingDragState = null;
 let suppressFloatingClickUntil = 0;
 let expandedReferenceIds = new Set();
+let referencePlanDialogState = null;
 let expandedQuestionIds = new Set();
 let expandedInstructionIds = new Set();
 let floatingPanelPage = 'check';
@@ -570,6 +574,7 @@ function normalizeSettings() {
     }
 
     for (const reference of settings.references) normalizeReference(reference);
+    normalizeReferencePlans(settings);
     for (const instruction of settings.temporaryInstructions) normalizeTemporaryInstruction(instruction);
     const validInstructionIds = new Set(settings.temporaryInstructions.map(instruction => instruction.id));
     settings.persistentInstructionIds = [...new Set(settings.persistentInstructionIds.filter(id => validInstructionIds.has(id)))];
@@ -1745,7 +1750,97 @@ function referenceApplies(reference) {
     return Boolean(entity.key && reference.characterKey === entity.key);
 }
 
+// Plans own selection/state/order, while the library remains the only source of content.
+function normalizeReferencePlans(settings) {
+    const references = new Map(settings.references.map(reference => [reference.id, reference]));
+    const seen = new Set();
+    settings.referencePlans = (Array.isArray(settings.referencePlans) ? settings.referencePlans : [])
+        .filter(plan => plan && typeof plan === 'object' && !Array.isArray(plan))
+        .map(plan => {
+            let id = typeof plan.id === 'string' ? plan.id : '';
+            if (!id || seen.has(id)) id = uid('refplan');
+            seen.add(id);
+            const entries = [];
+            const used = new Set();
+            for (const entry of Array.isArray(plan.entries) ? plan.entries : []) {
+                if (!entry || !references.has(entry.referenceId) || used.has(entry.referenceId)) continue;
+                used.add(entry.referenceId);
+                entries.push({ referenceId: entry.referenceId, enabled: entry.enabled !== false,
+                    addToCheck: Boolean(entry.addToCheck) });
+            }
+            return { id, name: String(plan.name || '未命名资料方案').trim().slice(0, 80) || '未命名资料方案', entries };
+        });
+    const bound = new Set();
+    settings.referencePlanBindings = (Array.isArray(settings.referencePlanBindings) ? settings.referencePlanBindings : [])
+        .filter(binding => {
+            if (!binding || typeof binding.characterKey !== 'string' || !binding.characterKey.startsWith('character:')
+                || !seen.has(binding.planId) || bound.has(binding.characterKey)) return false;
+            bound.add(binding.characterKey);
+            return true;
+        }).map(binding => ({ characterKey: binding.characterKey, characterName: String(binding.characterName || ''), planId: binding.planId }));
+    if (!seen.has(settings.defaultReferencePlanId)) settings.defaultReferencePlanId = '';
+}
+
+function getReferencePlan(id, settings = getUiSettings()) {
+    return settings.referencePlans?.find(plan => plan.id === id) || null;
+}
+
+function getEffectiveReferencePlan(settings = normalizeSettings()) {
+    const character = getCurrentCharacterEntity();
+    const binding = settings.referencePlanBindings?.find(item => item.characterKey === character.key);
+    return getReferencePlan(binding?.planId, settings) || getReferencePlan(settings.defaultReferencePlanId, settings);
+}
+
+function referencePlanName(name, excludeId = '', settings = getUiSettings()) {
+    const value = String(name || '').trim();
+    if (!value || value.length > 80) throw new Error('资料方案名称需为1—80字。');
+    if (settings.referencePlans.some(plan => plan.id !== excludeId && normalizePresetName(plan.name) === normalizePresetName(value))) {
+        throw new Error('已经存在同名资料方案，请换一个名称。');
+    }
+    return value;
+}
+
+function addReferencePlanEntries(plan, ids, settings = getUiSettings()) {
+    const used = new Set(plan.entries.map(entry => entry.referenceId));
+    for (const id of ids) {
+        const reference = settings.references.find(item => item.id === id);
+        if (!reference || used.has(id)) continue;
+        used.add(id);
+        plan.entries.push({ referenceId: id, enabled: true, addToCheck: Boolean(reference.addToCheck) });
+    }
+}
+
+function createReferencePlan(name, ids, settings = getUiSettings()) {
+    const plan = { id: uid('refplan'), name: referencePlanName(name, '', settings), entries: [] };
+    addReferencePlanEntries(plan, ids, settings);
+    settings.referencePlans.push(plan);
+    return plan;
+}
+
+function bindReferencePlan(id, settings = getUiSettings()) {
+    const character = getCurrentCharacterEntity();
+    if (!character.key) throw new Error('请先进入一个角色卡聊天，再绑定资料方案。');
+    if (!getReferencePlan(id, settings)) throw new Error('资料方案已不存在。');
+    settings.referencePlanBindings = settings.referencePlanBindings.filter(item => item.characterKey !== character.key);
+    settings.referencePlanBindings.push({ characterKey: character.key, characterName: character.name, planId: id });
+}
+
+function deleteReferencePlan(id, settings = getUiSettings()) {
+    settings.referencePlans = settings.referencePlans.filter(plan => plan.id !== id);
+    settings.referencePlanBindings = settings.referencePlanBindings.filter(binding => binding.planId !== id);
+    if (settings.defaultReferencePlanId === id) settings.defaultReferencePlanId = '';
+}
+
 function getActiveReferences(settings = normalizeSettings()) {
+    const plan = getEffectiveReferencePlan(settings);
+    if (plan) {
+        const references = new Map(settings.references.map(reference => [reference.id, reference]));
+        // Membership/binding replaces the library's legacy enabled/scope flags for this plan only.
+        return plan.entries.filter(entry => entry.enabled).map(entry => {
+            const reference = references.get(entry.referenceId);
+            return reference ? { ...reference, enabled: true, addToCheck: entry.addToCheck } : null;
+        }).filter(reference => reference && reference.content.trim());
+    }
     return settings.references.filter(referenceApplies);
 }
 
@@ -3518,6 +3613,137 @@ function renderPresetsTab() {
     initializePresetSearch(selectId);
 }
 
+function renderReferencePlansDialog(id = '') {
+    const settings = getUiSettings();
+    const plan = getReferencePlan(id, settings) || getEffectiveReferencePlan(settings) || settings.referencePlans[0];
+    const previous = referencePlanDialogState;
+    const scroll = previous?.mode === 'edit' && previous.id === plan?.id ? $('#stsc_dialog_body').scrollTop() : 0;
+    const character = getCurrentCharacterEntity();
+    const currentBinding = settings.referencePlanBindings.find(item => item.characterKey === character.key);
+    const effective = getEffectiveReferencePlan(settings);
+    const options = settings.referencePlans.map(item => `<option value="${escapeHtml(item.id)}" ${item.id === plan?.id ? 'selected' : ''}>${escapeHtml(item.name)}</option>`).join('');
+    const boundNames = plan ? settings.referencePlanBindings.filter(item => item.planId === plan.id)
+        .map(item => findCharacterEntity(item.characterKey)?.name || item.characterName || '原绑定角色') : [];
+    const entries = plan?.entries.map((entry, index) => {
+        const reference = settings.references.find(item => item.id === entry.referenceId);
+        if (!reference) return '';
+        return `<div class="stsc-plan-entry" data-plan-reference-id="${escapeHtml(reference.id)}">
+            <b>${escapeHtml(reference.name)}</b>
+            <div class="stsc-plan-entry-controls">
+                <label class="checkbox_label"><input type="checkbox" data-plan-field="enabled" ${entry.enabled ? 'checked' : ''}>启用资料</label>
+                <label class="checkbox_label"><input type="checkbox" data-plan-field="addToCheck" ${entry.addToCheck ? 'checked' : ''} ${entry.enabled ? '' : 'disabled'}>启用自检问答</label>
+                <button class="menu_button stsc-small-button" type="button" data-plan-action="up" aria-label="上移资料" ${index ? '' : 'disabled'}>↑</button>
+                <button class="menu_button stsc-small-button" type="button" data-plan-action="down" aria-label="下移资料" ${index === plan.entries.length - 1 ? 'disabled' : ''}>↓</button>
+                <button class="menu_button stsc-small-button" type="button" data-plan-action="remove" aria-label="移出方案" title="仅移出方案，不删除原资料">− 移出</button>
+                <button class="menu_button stsc-small-button" type="button" data-plan-action="edit-source">前往编辑</button>
+            </div>
+        </div>`;
+    }).join('') || '<div class="stsc-empty">方案内还没有资料，可用下方加号添加。空方案生效时不发送任何参考资料。</div>';
+    openDialog('资料方案', `<div class="stsc-reference-plans" data-editing-plan-id="${escapeHtml(plan?.id || '')}">
+        <div class="stsc-muted">当前角色：${escapeHtml(character.name)}｜当前实际使用：${escapeHtml(effective?.name || '总资料库原有配置')}（按草稿预览）</div>
+        <div class="stsc-field"><label for="stsc_reference_plan_select">正在编辑的资料方案</label>
+            <select id="stsc_reference_plan_select" class="text_pole" ${plan ? '' : 'disabled'}>${options || '<option>暂无方案</option>'}</select></div>
+        <div class="stsc-toolbar"><button class="menu_button" type="button" data-plan-action="new">＋ 创建资料方案</button></div>
+        ${plan ? `<div class="stsc-field"><label for="stsc_reference_plan_name">方案名称</label>
+            <input id="stsc_reference_plan_name" class="text_pole" maxlength="80" value="${escapeHtml(plan.name)}"></div>
+            <div class="stsc-toolbar">
+                <button class="menu_button" type="button" data-plan-action="rename">重命名</button>
+                <button class="menu_button" type="button" data-plan-action="bind" ${character.key ? '' : 'disabled'}>绑定到当前角色</button>
+                <button class="menu_button" type="button" data-plan-action="unbind" ${currentBinding?.planId === plan.id ? '' : 'disabled'}>解除当前角色绑定</button>
+                <button class="menu_button" type="button" data-plan-action="default" ${settings.defaultReferencePlanId === plan.id ? 'disabled' : ''}>设为默认方案</button>
+                <button class="menu_button stsc-danger-button" type="button" data-plan-action="delete">删除方案</button>
+            </div>
+            <div class="stsc-muted">本方案已绑定：${escapeHtml(boundNames.join('、') || '无')}。${settings.defaultReferencePlanId === plan.id ? '本方案也是默认方案。' : ''}</div>
+            <div class="stsc-plan-entries">${entries}</div>
+            <button class="menu_button" type="button" data-plan-action="add">＋ 添加资料</button>` : '<div class="stsc-empty">创建方案后，可以组合资料并绑定角色。</div>'}
+        <div class="stsc-toolbar"><button class="menu_button" type="button" data-plan-action="clear-default" ${settings.defaultReferencePlanId ? '' : 'disabled'}>取消默认方案，恢复总库配置</button></div>
+        <div class="stsc-muted">角色绑定优先于默认方案；没有方案时沿用总库原有配置。选择方案只切换编辑，不自动应用。方案内开关、排序及自检问答独立于总库的启停和角色范围；内容仍共用原资料，请到总库编辑。</div>
+        <div class="stsc-muted">共享同一方案的角色会共用其勾选配置；需要不同配置请另建方案。所有修改（含绑定）点击“保存全部更改”或管理器顶部“保存更改”后生效，关闭弹窗不会自动保存。</div>
+    </div>`, '<button class="menu_button" type="button" data-dialog-action="cancel">返回资料库</button><button class="menu_button stsc-primary-button" type="button" data-plan-action="save">保存全部更改</button>');
+    referencePlanDialogState = { mode: 'edit', id: plan?.id || '' };
+    $('#stsc_dialog_body').scrollTop(scroll || 0);
+}
+
+function openReferencePlanPicker(id = '') {
+    const settings = getUiSettings();
+    const plan = getReferencePlan(id, settings);
+    const used = new Set(plan?.entries.map(entry => entry.referenceId));
+    const choices = settings.references.filter(reference => !used.has(reference.id)).map(reference => `
+        <label class="stsc-batch-reference-item"><input type="checkbox" data-plan-pick-id="${escapeHtml(reference.id)}">
+            <span class="stsc-batch-reference-main"><b>${escapeHtml(reference.name)}</b><span>${escapeHtml(referenceTypeLabel(reference.type))}</span></span></label>`).join('');
+    openDialog(plan ? '添加资料到方案' : '创建资料方案', `
+        ${plan ? '' : '<div class="stsc-field"><label for="stsc_new_reference_plan_name">方案名称</label><input id="stsc_new_reference_plan_name" class="text_pole" maxlength="80" placeholder="请输入资料方案名称"></div>'}
+        <div class="stsc-muted">从总资料库勾选要加入的资料。只保存引用，不复制或删除原资料；添加后默认启用，可在方案里分别关闭。</div>
+        <div class="stsc-toolbar"><button class="menu_button" type="button" data-plan-action="pick-all">全选</button><button class="menu_button" type="button" data-plan-action="pick-none">清空选择</button></div>
+        <div class="stsc-batch-reference-list">${choices || '<div class="stsc-empty">没有可添加的资料，请先在总资料库新建或导入。</div>'}</div>`,
+        '<button class="menu_button" type="button" data-plan-action="back">返回方案</button><button class="menu_button stsc-primary-button" type="button" data-plan-action="confirm-pick">确认选择</button>');
+    referencePlanDialogState = { mode: 'pick', id: plan?.id || '' };
+}
+
+function handleReferencePlanAction(action, referenceId = '') {
+    const settings = getUiSettings();
+    const plan = getReferencePlan(referencePlanDialogState?.id, settings);
+    if (action === 'new') return openReferencePlanPicker();
+    if (action === 'back') return renderReferencePlansDialog(plan?.id);
+    if (action === 'pick-all' || action === 'pick-none') {
+        $('#stsc_dialog_body [data-plan-pick-id]').prop('checked', action === 'pick-all');
+        return;
+    }
+    if (action === 'save') {
+        closeDialog();
+        commitEditDraft();
+        return;
+    }
+    if (action === 'confirm-pick') {
+        const ids = $('#stsc_dialog_body [data-plan-pick-id]:checked').map((_, element) => String($(element).data('plan-pick-id'))).get();
+        const target = plan || createReferencePlan(document.getElementById('stsc_new_reference_plan_name')?.value, ids, settings);
+        if (plan) addReferencePlanEntries(plan, ids, settings);
+        markDirty();
+        renderReferencesTab();
+        return renderReferencePlansDialog(target.id);
+    }
+    if (action === 'clear-default') {
+        settings.defaultReferencePlanId = '';
+    } else {
+        if (!plan) return;
+        if (action === 'add') return openReferencePlanPicker(plan.id);
+        if (action === 'rename') plan.name = referencePlanName(document.getElementById('stsc_reference_plan_name')?.value, plan.id, settings);
+        else if (action === 'bind') bindReferencePlan(plan.id, settings);
+        else if (action === 'unbind') {
+            const key = getCurrentCharacterEntity().key;
+            settings.referencePlanBindings = settings.referencePlanBindings.filter(item => item.characterKey !== key || item.planId !== plan.id);
+        } else if (action === 'default') settings.defaultReferencePlanId = plan.id;
+        else if (action === 'delete') {
+            openDeleteConfirmation({ title: '删除资料方案', message: `确定删除方案“${plan.name}”吗？`,
+                detail: '只删除方案及它的角色/默认绑定，不会删除总资料库的任何资料。绑定角色将改用默认方案或总库原有配置。',
+                perform: () => { deleteReferencePlan(plan.id, settings); markDirty(); renderReferencesTab(); renderReferencePlansDialog(); } });
+            return;
+        } else {
+            const index = plan.entries.findIndex(entry => entry.referenceId === referenceId);
+            if (index < 0) return;
+            if (action === 'edit-source') {
+                closeDialog();
+                expandedReferenceIds.add(referenceId);
+                renderReferencesTab();
+                // Native scrolling, no lock handlers or changes to other plugin menus.
+                document.getElementById('stsc_tab_references')?.querySelectorAll('[data-reference-id]').forEach(card => {
+                    if (card.dataset.referenceId === referenceId) card.scrollIntoView({ block: 'start' });
+                });
+                return;
+            }
+            if (action === 'remove') plan.entries.splice(index, 1);
+            else if (action === 'up' || action === 'down') {
+                const next = index + (action === 'up' ? -1 : 1);
+                if (next < 0 || next >= plan.entries.length) return;
+                [plan.entries[index], plan.entries[next]] = [plan.entries[next], plan.entries[index]];
+            } else return;
+        }
+    }
+    markDirty();
+    renderReferencesTab();
+    renderReferencePlansDialog(plan?.id);
+}
+
 function renderReferencesTab() {
     const settings = getUiSettings();
     const entity = getCurrentEntity();
@@ -3638,8 +3864,11 @@ function renderReferencesTab() {
     $('#stsc_tab_references').html(`
         <div class="stsc-section">
             <div class="stsc-section-title">参考资料库</div>
+            <div class="stsc-toolbar"><button class="menu_button" type="button" data-action="open-reference-plans">资料方案</button>
+                <span class="stsc-muted">当前使用：${escapeHtml(getEffectiveReferencePlan(settings)?.name || '总资料库原有配置')}</span></div>
             <div class="stsc-muted">像世界书一样保存文风、强制限制或其他长期资料。所有资料默认折叠；只有启用资料库后，才能开启它对应的自检问题。</div>
             <div class="stsc-muted">使用每条资料右侧的上移／下移调整顺序，关联自检问题会同步排序；点击“保存更改”后生效。不改变通用、角色与资料问题的分组顺序。</div>
+            <div class="stsc-muted">绑定资料方案后，资料启停、顺序与自检问答按方案配置生效；下面总库的启停与角色范围仅在未使用方案时生效，内容编辑仍会同步到所有方案。</div>
             <div class="stsc-toolbar stsc-reference-action-toolbar" style="margin-top:9px">
                 <button class="menu_button stsc-compact-action" type="button" data-action="open-create-reference" title="新建资料库" aria-label="新建资料库"><i class="fa-solid fa-plus"></i><span class="stsc-action-label">新建资料库</span></button>
                 <button class="menu_button stsc-compact-action" type="button" data-action="batch-export-references" title="批量导出资料库" aria-label="批量导出资料库" ${settings.references.length ? '' : 'disabled'}><i class="fa-solid fa-box-archive"></i><span class="stsc-action-label">批量导出</span></button>
@@ -4299,6 +4528,12 @@ function renderFloating() {
     if (panelOpen && floatingPanelPage === 'check') void markLatestIssueViewed();
 }
 
+function onReferencePlanChatChanged() {
+    const state = referencePlanDialogState;
+    renderAll();
+    if (state?.mode === 'edit') renderReferencePlansDialog(state.id);
+}
+
 function renderAll() {
     if (!initialized) return;
     removeLegacyMessageBadges();
@@ -4353,6 +4588,7 @@ function closeManager() {
 }
 
 function openDialog(title, bodyHtml, footerHtml = '') {
+    referencePlanDialogState = null;
     $('#stsc_dialog_title').text(title || '操作');
     $('#stsc_dialog_body').html(bodyHtml || '');
     $('#stsc_dialog_footer').html(footerHtml || '');
@@ -4361,6 +4597,7 @@ function openDialog(title, bodyHtml, footerHtml = '') {
 }
 
 function closeDialog() {
+    referencePlanDialogState = null;
     const hadPendingUnsavedAction = Boolean(pendingUnsavedAction);
     bulkDraft = null;
     pendingUnsavedAction = null;
@@ -4934,6 +5171,26 @@ ${questionText}
 }
 
 function bindUiEvents() {
+    $('#stsc_dialog_overlay').on('change', '#stsc_reference_plan_select', function () {
+        renderReferencePlansDialog(this.value);
+    });
+    $('#stsc_dialog_overlay').on('change', '[data-plan-field]', function () {
+        const plan = getReferencePlan(referencePlanDialogState?.id);
+        const id = $(this).closest('[data-plan-reference-id]').data('plan-reference-id');
+        const entry = plan?.entries.find(item => item.referenceId === id);
+        const field = $(this).data('plan-field');
+        if (!entry || !['enabled', 'addToCheck'].includes(field) || (field === 'addToCheck' && !entry.enabled)) return;
+        entry[field] = this.checked;
+        markDirty();
+        renderReferencePlansDialog(plan.id);
+    });
+    $('#stsc_dialog_overlay').on('click', '[data-plan-action]', function () {
+        try {
+            handleReferencePlanAction($(this).data('plan-action'), $(this).closest('[data-plan-reference-id]').data('plan-reference-id'));
+        } catch (error) {
+            toastr.warning(error.message, '墨提斯之镜');
+        }
+    });
     $('#stsc_manager_overlay').on('change', '#stsc_update_notices_enabled', function () {
         getUiSettings().updateNotice.enabled = this.checked;
         markDirty();
@@ -5412,6 +5669,9 @@ function bindUiEvents() {
         } else if (action === 'open-create-preset') {
             openCreatePresetDialog($(this).data('kind'));
             return;
+        } else if (action === 'open-reference-plans') {
+            renderReferencePlansDialog();
+            return;
         } else if (action === 'open-create-reference') {
             openCreateReferenceDialog();
             return;
@@ -5574,9 +5834,10 @@ function bindUiEvents() {
             openDeleteConfirmation({
                 title: '确认删除资料库',
                 message: `确定删除资料库“${reference.name}”吗？`,
-                detail: `类型：${referenceTypeLabel(reference.type)}。资料内容与关联的自动自检问题都会一起删除。`,
+                detail: `类型：${referenceTypeLabel(reference.type)}。资料内容与关联的自动自检问题都会一起删除，并从所有资料方案中移除。只想移出方案时，请使用方案内的“移出”。`,
                 perform: () => {
                     settings.references = settings.references.filter(item => item.id !== id);
+                    for (const plan of settings.referencePlans) plan.entries = plan.entries.filter(entry => entry.referenceId !== id);
                     expandedReferenceIds.delete(id);
                     markDirty();
                     renderAll();
@@ -6322,7 +6583,7 @@ async function initialize() {
     addExtensionsMenuButton();
     const events = context.eventTypes || context.event_types;
     context.eventSource.on(events.MESSAGE_RECEIVED, handleMessageReceived);
-    context.eventSource.on(events.CHAT_CHANGED, renderAll);
+    context.eventSource.on(events.CHAT_CHANGED, onReferencePlanChatChanged);
     context.eventSource.on(events.GENERATION_ENDED, onGenerationEnded);
     context.eventSource.on(events.GENERATION_STOPPED, onGenerationStopped);
 

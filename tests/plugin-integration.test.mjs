@@ -57,7 +57,10 @@ function plugin() {
     return { run, scope, st, html, nodes, notices, requestBodies, updateToasts, clearedToasts, classes,
         toggleUpdateNotice(checked) { return events.get('change:#stsc_update_notices_enabled').call({ checked }); },
         event(type, id, value) { return events.get(type + ':' + id).call({ value, checked: value }, { type }); },
-        action(action, referenceId) { return events.get('click:[data-action]').call({ data: { action, 'reference-id': referenceId } }); } };
+        action(action, referenceId) { return events.get('click:[data-action]').call({ data: { action, 'reference-id': referenceId } }); },
+        planAction(action, referenceId) { return events.get('click:[data-plan-action]').call({ data: { 'plan-action': action, 'plan-reference-id': referenceId } }); },
+        planField(field, referenceId, checked) { return events.get('change:[data-plan-field]').call({ checked, data: { 'plan-field': field, 'plan-reference-id': referenceId } }); }
+    };
 }
 
 test('settings UI renders all eight providers and manual model/connection controls', async () => {
@@ -250,10 +253,10 @@ test('empty floating instructions stay disabled and instruction names remain esc
     assert.equal(app.run("setInstructionActivation('empty', 'always')"), false);
 });
 
-test('version/identity are formal v0.4.9; release metadata and UI stay in sync', () => {
+test('version/identity are formal v0.4.10; release metadata and UI stay in sync', () => {
     const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url)));
     const release = JSON.parse(readFileSync(new URL('../version.json', import.meta.url)));
-    assert.equal(manifest.version, '0.4.9');
+    assert.equal(manifest.version, '0.4.10');
     assert.equal(release.version, manifest.version);
     assert.equal(manifest.homePage, 'https://github.com/chenxyeah/SillyTavern-Self-Check');
     const app = plugin();
@@ -380,6 +383,191 @@ function referenceApp() {
     renderAll = renderReferencesTab;`);
     return app;
 }
+
+function referencePlanApp() {
+    const app = referenceApp();
+    app.st.characters = [{ name: '角色A', avatar: 'A.png' }, { name: '角色B', avatar: 'B.png' }, { name: '角色C', avatar: 'C.png' }];
+    app.st.characterId = 0;
+    app.run(`planA = createReferencePlan('A方案', ['a', 'b']);
+        planB = createReferencePlan('B方案', ['b', 'c']);
+        planC = createReferencePlan('C方案', ['a', 'b', 'c']);
+        bindReferencePlan(planA.id);`);
+    return app;
+}
+
+test('legacy libraries migrate without changing their active selection, content or order', () => {
+    const app = referenceApp();
+    app.run(`delete editDraft.referencePlans; delete editDraft.referencePlanBindings; delete editDraft.defaultReferencePlanId;
+        editDraft.references[1].enabled = false;
+        ctx().extensionSettings[STSC_MODULE] = clone(editDraft);`);
+    assert.equal(app.run("getActiveReferences().map(x => x.id).join(',')"), 'a,c');
+    assert.equal(app.run('normalizeSettings().referencePlans.length'), 0);
+    assert.equal(app.run('normalizeSettings().defaultReferencePlanId'), '');
+    assert.equal(app.run("normalizeSettings().references[1].content"), 'CONTENT-b');
+});
+
+test('reference plans support overlapping A/B/C selections and switch by stable character card identity', () => {
+    const app = referencePlanApp();
+    app.run('commitEditDraft({notify:false})');
+    assert.equal(app.run("getActiveReferences().map(x=>x.id).join(',')"), 'a,b');
+    app.st.characterId = 1;
+    app.run('bindReferencePlan(planB.id); commitEditDraft({notify:false})');
+    assert.equal(app.run("getActiveReferences().map(x=>x.id).join(',')"), 'b,c');
+    app.st.characterId = 2;
+    app.run('bindReferencePlan(planC.id); commitEditDraft({notify:false})');
+    assert.equal(app.run("getActiveReferences().map(x=>x.id).join(',')"), 'a,b,c');
+    app.st.characterId = 0;
+    app.st.characters[0].name = '角色改名但卡未换';
+    assert.equal(app.run("getActiveReferences().map(x=>x.id).join(',')"), 'a,b');
+    assert.equal(app.run('normalizeSettings().references.length'), 3);
+    assert.equal(app.requestBodies.length, 0);
+});
+
+test('character binding wins over default; unbound/no-character/group safely use default or legacy config', () => {
+    const app = referencePlanApp();
+    app.run('editDraft.defaultReferencePlanId = planB.id; commitEditDraft({notify:false})');
+    assert.equal(app.run('getEffectiveReferencePlan().id'), app.run('planA.id'));
+    app.st.characterId = 1;
+    assert.equal(app.run('getEffectiveReferencePlan().id'), app.run('planB.id'));
+    app.st.groupId = 'group1';
+    assert.equal(app.run('getEffectiveReferencePlan().id'), app.run('planB.id'));
+    app.st.groupId = null;
+    app.st.characterId = undefined;
+    assert.equal(app.run('getEffectiveReferencePlan().id'), app.run('planB.id'));
+    app.run('editDraft.defaultReferencePlanId = ""; commitEditDraft({notify:false})');
+    assert.equal(app.run('getEffectiveReferencePlan()'), null);
+    assert.equal(app.run("getActiveReferences().map(x=>x.id).join(',')"), 'a,b,c');
+});
+
+test('empty and all-disabled bound plans mean no references, never fall back to full library', () => {
+    const app = referencePlanApp();
+    app.run('empty = createReferencePlan("空方案", []); bindReferencePlan(empty.id); commitEditDraft({notify:false})');
+    assert.equal(app.run('getActiveReferences().length'), 0);
+    app.run('bindReferencePlan(planA.id); editDraft.referencePlans.find(x=>x.id===planA.id).entries.forEach(x=>x.enabled=false); commitEditDraft({notify:false})');
+    assert.equal(app.run('getActiveReferences().length'), 0);
+});
+
+test('plan enable/check/order are independent of library and other plans, shared source updates stay live', () => {
+    const app = referencePlanApp();
+    app.run(`editDraft.references[0].enabled = false; editDraft.references[0].scope = 'character'; editDraft.references[0].characterKey = 'character:other';
+        planA.entries[1].enabled = false; planA.entries[0].addToCheck = false; commitEditDraft({notify:false});`);
+    assert.equal(app.run("getActiveReferences().map(x=>x.id).join(',')"), 'a', 'explicit plan membership owns scope/enable');
+    assert.equal(app.run("getActiveQuestions().filter(x=>x.id.startsWith('ref_')).length"), 0);
+    assert.equal(app.run('editDraft.referencePlans.find(x=>x.id===planB.id).entries[0].enabled'), true);
+    app.run(`editDraft.references[0].content = 'UPDATED'; editDraft.references[0].name = '新名称';
+        editDraft.references[0].autoQuestion = '新问题'; commitEditDraft({notify:false});`);
+    assert.equal(app.run('getActiveReferences()[0].content'), 'UPDATED');
+    app.run('bindReferencePlan(planC.id); commitEditDraft({notify:false})');
+    assert.equal(app.run('getActiveReferences()[0].name'), '新名称');
+    assert.equal(app.run('getActiveReferences()[0].autoQuestion'), '新问题');
+    assert.equal(app.run('Object.hasOwn(normalizeSettings().referencePlans[0].entries[0], "content")'), false);
+});
+
+test('plan ordering drives both API question lists and reference prompt order without changing library', () => {
+    const app = referencePlanApp();
+    app.run('renderReferencePlansDialog(planA.id)');
+    app.planAction('up', 'b');
+    app.planField('addToCheck', 'a', false);
+    app.run('commitEditDraft({notify:false})');
+    assert.equal(app.run("getActiveReferences().map(x=>x.id).join(',')"), 'b,a');
+    assert.equal(app.run("normalizeSettings().references.map(x=>x.id).join(',')"), 'a,b,c');
+    for (const method of ['getActiveQuestions', 'getDualApiQuestions']) {
+        assert.equal(app.run(`${method}().filter(x=>x.id.startsWith('ref_')).map(x=>x.id).join(',')`), 'ref_b');
+    }
+    const prompt = app.run('buildDualApiReferenceContext(getActiveReferences())');
+    assert.ok(prompt.indexOf('CONTENT-b') < prompt.indexOf('CONTENT-a'));
+    assert.ok(!prompt.includes('CONTENT-c'));
+    app.run('seenRefs=[]; setRuntimePrompt=(key, text)=>seenRefs.push(key); applyReferencePrompts(getActiveReferences())');
+    assert.equal(app.run("seenRefs.join(',')"), 'stsc_ref_b,stsc_ref_a');
+});
+
+test('plan create/select/modify/bind remain draft-only until save; discard and reopen restore settings', () => {
+    const app = referencePlanApp();
+    assert.equal(app.run('normalizeSettings().referencePlans.length'), 0);
+    assert.equal(app.run('getEffectiveReferencePlan()'), null);
+    app.run('commitEditDraft({notify:false}); beginEditSession(); renderReferencePlansDialog(planB.id)');
+    app.planAction('bind');
+    assert.equal(app.run('getEffectiveReferencePlan().id'), app.run('planA.id'));
+    app.planField('enabled', 'b', false);
+    assert.equal(app.run('editDirty'), true);
+    app.run('discardEditDraft(); beginEditSession()');
+    assert.equal(app.run('getEffectiveReferencePlan(editDraft).id'), app.run('planA.id'));
+    assert.equal(app.run('editDraft.referencePlans.find(x=>x.id===planB.id).entries[0].enabled'), true);
+    app.run('bindReferencePlan(planB.id); commitEditDraft({notify:false}); beginEditSession()');
+    assert.equal(app.run('getEffectiveReferencePlan().id'), app.run('planB.id'));
+    assert.equal(app.run('getEffectiveReferencePlan(editDraft).id'), app.run('planB.id'));
+});
+
+test('minus removes only membership; plus de-duplicates and only adds existing references', () => {
+    const app = referencePlanApp();
+    const original = app.run('JSON.stringify(editDraft.references)');
+    app.run('renderReferencePlansDialog(planA.id)');
+    app.planAction('remove', 'a');
+    assert.equal(app.run('JSON.stringify(editDraft.references)'), original);
+    assert.equal(app.run('planA.entries.map(x=>x.referenceId).join(",")'), 'b');
+    assert.equal(app.run('planC.entries.length'), 3);
+    app.run('addReferencePlanEntries(planA, ["b","a","a","missing"])');
+    assert.equal(app.run('planA.entries.map(x=>x.referenceId).join(",")'), 'b,a');
+    assert.equal(app.run('JSON.stringify(editDraft.references)'), original);
+});
+
+test('deleting a plan cleans all its bindings/default without deleting any library content', () => {
+    const app = referencePlanApp();
+    app.st.characterId = 1;
+    app.run('bindReferencePlan(planA.id); editDraft.defaultReferencePlanId=planA.id');
+    const original = app.run('JSON.stringify(editDraft.references)');
+    app.run('deleteReferencePlan(planA.id)');
+    assert.equal(app.run('editDraft.referencePlanBindings.length'), 0);
+    assert.equal(app.run('editDraft.defaultReferencePlanId'), '');
+    assert.equal(app.run('editDraft.referencePlans.length'), 2);
+    assert.equal(app.run('JSON.stringify(editDraft.references)'), original);
+});
+
+test('source deletion prunes stale plan entries safely; corrupted/duplicate bindings normalize deterministically', () => {
+    const app = referencePlanApp();
+    app.run(`editDraft.references.splice(1,1);
+        editDraft.referencePlans.push(null, {...clone(planA)}, {id:'bad', name:'', entries:[null, {referenceId:'a',enabled:false}, {referenceId:'a'}, {referenceId:'missing'}]});
+        editDraft.referencePlanBindings.push(null, {characterKey:'character:A.png',planId:planB.id}, {characterKey:'group:1',planId:planB.id}, {characterKey:'character:X',planId:'missing'});
+        editDraft.defaultReferencePlanId='missing';
+        normalizeReferencePlans(editDraft);`);
+    assert.equal(app.run('editDraft.referencePlans[0].entries.map(x=>x.referenceId).join(",")'), 'a');
+    assert.equal(app.run('new Set(editDraft.referencePlans.map(x=>x.id)).size'), 5);
+    assert.equal(app.run('editDraft.referencePlanBindings.length'), 1);
+    assert.equal(app.run('editDraft.referencePlanBindings[0].planId'), app.run('planA.id'));
+    assert.equal(app.run('editDraft.referencePlans.at(-1).entries.length'), 1);
+    assert.equal(app.run('editDraft.referencePlans.at(-1).entries[0].enabled'), false);
+    assert.equal(app.run('editDraft.defaultReferencePlanId'), '');
+});
+
+test('plan names validate, escape markup and never become duplicated content/config exports', () => {
+    const app = referencePlanApp();
+    for (const name of ['', '  ', 'x'.repeat(81), 'A方案']) assert.throws(() => app.run(`createReferencePlan(${JSON.stringify(name)}, [])`));
+    app.run(`special=createReferencePlan('<img src=x onerror=alert(1)>', ['a']); renderReferencePlansDialog(special.id)`);
+    const html = app.html['#stsc_dialog_body'];
+    assert.ok(html.includes('&lt;img'));
+    assert.ok(!html.includes('<img'));
+    assert.ok(!html.includes('data-reference-field="content"'));
+    const payload = app.run('JSON.stringify(makeReferenceBundleExportPayload(editDraft.references))');
+    assert.ok(!payload.includes('referencePlans'));
+    assert.ok(!payload.includes('TEST_SECRET'));
+    app.st.groupId='g';
+    assert.throws(() => app.run('bindReferencePlan(special.id)'));
+});
+
+test('plan UI only lists members and picker lists only non-members; edit selection never applies a plan', () => {
+    const app = referencePlanApp();
+    app.run('renderReferencePlansDialog(planA.id)');
+    let markup=app.html['#stsc_dialog_body'];
+    assert.equal((markup.match(/data-plan-reference-id=/g)||[]).length, 2);
+    assert.ok(!markup.includes('data-plan-reference-id="c"'));
+    app.event('change', '#stsc_reference_plan_select', app.run('planB.id'));
+    assert.equal(app.run('getEffectiveReferencePlan(editDraft).id'), app.run('planA.id'));
+    app.planAction('add');
+    markup=app.html['#stsc_dialog_body'];
+    assert.ok(markup.includes('data-plan-pick-id="a"'));
+    assert.ok(!markup.includes('data-plan-pick-id="b"'));
+    assert.ok(!markup.includes('data-plan-pick-id="c"'));
+});
 
 test('reference ordering controls are visible when collapsed and disabled at list boundaries', () => {
     const app = referenceApp();
