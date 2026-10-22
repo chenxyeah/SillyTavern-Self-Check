@@ -63,6 +63,113 @@ function plugin() {
     };
 }
 
+function promptSourceApp() {
+    const app = plugin();
+    app.st.characters = [{name:'角色本人',avatar:'character.png',description:'真实角色设定'}];
+    app.st.characterId=0;
+    app.run(`general=createPreset('默认通用自检_SOURCE_GENERAL','general');
+        general.questions=[createQuestion('本轮是否替用户做决定？','open','standard',true)];
+        character=createPreset('角色自检预设_SOURCE_CHARACTER','character');
+        character.boundCharacterKey='character:character.png';
+        character.questions=[createQuestion('角色本轮应如何回应？','open','detailed',false)];
+        editDraft.presets=[general,character]; editDraft.generalPresetId=general.id;
+        questions=getActiveQuestions(editDraft);
+        parsed=parseModelOutput('<stsc_self_check><item id="q1"><answer>不得替用户做决定。</answer><evidence>用户没有选择行动。</evidence></item><item id="q2"><answer>角色应平静回应。</answer></item></stsc_self_check>',questions);`);
+    return app;
+}
+
+function assertNoPresetSources(text) {
+    assert.ok(!/<source\b/i.test(text));
+    for (const label of ['默认通用自检_SOURCE_GENERAL','角色自检预设_SOURCE_CHARACTER','通用自检预设-','角色自检预设-']) {
+        assert.ok(!text.includes(label), 'model prompt must omit generated provenance: '+label);
+    }
+}
+
+test('question serialization omits preset source metadata but preserves task text, numbering and requirements', () => {
+    const app=promptSourceApp();
+    const before=app.run('JSON.stringify(questions)');
+    const xml=app.run('buildQuestionXml(questions)');
+    assertNoPresetSources(xml);
+    assert.ok(xml.includes('<question id="q1" index="1" evidence_required="true">'));
+    assert.ok(xml.includes('<question id="q2" index="2" evidence_required="false">'));
+    assert.ok(xml.includes('<text>本轮是否替用户做决定？</text>'));
+    assert.ok(xml.includes('<required_fields>answer,evidence</required_fields>'));
+    assert.ok(xml.includes('<required_fields>answer</required_fields>'));
+    assert.ok(xml.includes('<type>'));
+    assert.ok(xml.includes('<length>'));
+    assert.equal(app.run('JSON.stringify(questions)'),before);
+    assertNoPresetSources(app.run('buildSinglePrompt(questions)'));
+});
+
+for (const transform of [false,true]) for (const compact of [false,true]) {
+    test(`actual secondary API request omits preset metadata: strong=${transform}, compact=${compact}`, async () => {
+        const app=promptSourceApp();
+        app.run(`editDraft.dualApi.transformFormat=${transform};
+            ctx().name1='用户本人';ctx().powerUserSettings={persona_description:'真实用户身份'};`);
+        const sent=[];
+        app.scope.fetch=async (_url,options)=>{
+            sent.push(JSON.parse(options.body));
+            return new Response(JSON.stringify({choices:[{message:{content:'<stsc_self_check><item id="q1"><answer>不得替用户行动。</answer><evidence>本轮未选择。</evidence></item><item id="q2"><answer>平静回应。</answer></item></stsc_self_check>'}}]}));
+        };
+        await app.run(`callDualApiSelfCheck({chat:[],questions,references:[],temporaryInstructions:[],settings:editDraft},{compact:${compact}})`);
+        assert.equal(sent.length,1);
+        const text=sent[0].messages.map(message=>message.content).join('\n');
+        assertNoPresetSources(text);
+        for(const value of ['本轮是否替用户做决定？','角色本轮应如何回应？','真实角色设定','真实用户身份','<stsc_self_check>','evidence_required="true"']) assert.ok(text.includes(value));
+    });
+}
+
+test('both primary API injection formats ignore provenance while internal result sources remain available', () => {
+    const app=promptSourceApp();
+    for(const fn of ['buildDualApiRawInjection','buildDualApiContractInjection']) {
+        const text=app.run(`${fn}(questions,parsed)`);
+        assertNoPresetSources(text);
+        assert.ok(text.includes('不得替用户做决定。'));
+        assert.ok(text.includes('用户没有选择行动。'));
+        app.run('differentSources=questions.map(question=>({...question,source:"SHOULD_NEVER_APPEAR"}))');
+        assert.equal(app.run(`${fn}(differentSources,parsed)`),text);
+    }
+    app.run('captured=[];ctx().setExtensionPrompt=(...args)=>captured.push(args)');
+    for(const strong of [false,true]) {
+        app.run(`editDraft.dualApi.transformFormat=${strong};applyDualApiMainPrompt(questions,parsed,'',editDraft)`);
+        assertNoPresetSources(app.run('captured.at(-1)[1]'));
+        assert.equal(app.run('captured.at(-1)[5]'),strong?0:2,'system vs assistant role unchanged');
+    }
+    assert.equal(app.run('parsed.answers[0].source'),'通用自检预设-默认通用自检_SOURCE_GENERAL');
+    assert.equal(app.run('parsed.answers[1].source'),'角色自检预设-角色自检预设_SOURCE_CHARACTER');
+});
+
+test('actual single API and dual-to-single fallback prompts both omit preset provenance', async () => {
+    for(const mode of ['single','dual_api']) {
+        const app=promptSourceApp();
+        app.run(`editDraft.mode=${JSON.stringify(mode)};
+            ctx().extensionSettings[STSC_MODULE]=clone(editDraft);
+            captured=[];ctx().setExtensionPrompt=(...args)=>captured.push(args);
+            callDualApiSelfCheck=async()=>{throw new Error('TEST_FAILURE')};`);
+        await app.run('sillyTavernSelfCheckInterceptor([],10000,()=>{throw new Error("unexpected abort")},"normal")');
+        const prompt=app.run('captured.find(args=>args[0]==="stsc_main")[1]');
+        assertNoPresetSources(prompt);
+        assert.ok(prompt.includes('本轮是否替用户做决定？'));
+        assert.ok(prompt.includes('角色本轮应如何回应？'));
+        assert.equal(app.run('pendingRun.mode'),'single');
+    }
+});
+
+test('review omits provenance while UI/preset exports retain metadata without keyword-scrubbing real content', () => {
+    const app=promptSourceApp();
+    app.run(`reviewFixture={latest:{answers:parsed.answers},output:'上一轮真实正文'};
+        reviewPrompt=buildPreviousReviewRequest(editDraft,{source:reviewFixture});`);
+    assertNoPresetSources(app.run('reviewPrompt'));
+    assert.ok(app.run('reviewPrompt').includes('上一轮真实正文'));
+    assert.ok(app.run('reviewPrompt').includes('不得替用户做决定。'));
+    app.run(`authored=[{...questions[0],text:'请解释“默认通用自检”和 <source> 是什么意思。'}];`);
+    assert.ok(app.run('buildQuestionXml(authored)').includes('请解释“默认通用自检”和 &lt;source&gt; 是什么意思。'));
+    assert.ok(app.run('general.name').includes('SOURCE_GENERAL'));
+    assert.ok(app.run('questions[0].source').includes('SOURCE_GENERAL'));
+    assert.ok(app.run('renderAnswerCard(parsed.answers[0],0)').includes('问题来源：通用自检预设-默认通用自检_SOURCE_GENERAL'));
+    assert.equal(app.run('makePresetExportPayload(general).preset.name'),'默认通用自检_SOURCE_GENERAL');
+});
+
 test('settings UI renders all eight providers and manual model/connection controls', async () => {
     const app = plugin();
     app.run('renderSettingsTab()');
@@ -253,10 +360,10 @@ test('empty floating instructions stay disabled and instruction names remain esc
     assert.equal(app.run("setInstructionActivation('empty', 'always')"), false);
 });
 
-test('version/identity are formal v0.4.10; release metadata and UI stay in sync', () => {
+test('version/identity are formal v0.4.11; release metadata and UI stay in sync', () => {
     const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url)));
     const release = JSON.parse(readFileSync(new URL('../version.json', import.meta.url)));
-    assert.equal(manifest.version, '0.4.10');
+    assert.equal(manifest.version, '0.4.11');
     assert.equal(release.version, manifest.version);
     assert.equal(manifest.homePage, 'https://github.com/chenxyeah/SillyTavern-Self-Check');
     const app = plugin();

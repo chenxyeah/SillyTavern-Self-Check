@@ -7,7 +7,7 @@ import {
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.10';
+const STSC_VERSION = '0.4.11';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -43,13 +43,12 @@ const STSC_REMOTE_RELEASE_URLS = Object.freeze([
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-10-20',
-    title: '资料方案与角色绑定',
+    releasedAt: '2026-10-22',
+    title: '精简自检问题来源信息',
     changes: Object.freeze([
-        '参考资料库新增资料方案，可组合多份资料并绑定角色，切换角色自动使用对应组合。',
-        '方案独立保存资料开关、自检问答与排序；加号添加、减号移出，不复制或删除总库原资料。',
-        '资料内容统一在总资料库编辑并同步到所有引用方案；支持重命名、删除、默认方案及解除绑定。',
-        '角色绑定优先于默认方案，未使用方案时保留原资料配置；所有修改均需保存，支持放弃更改。',
+        '发给模型的自检问题不再附带通用/角色预设名称及来源字段，减少无关管理信息。',
+        '同时覆盖副API、单API与双API失败回退；强力规范及普通主API注入继续不附带来源。',
+        '插件界面、结果记录与预设导出保留原有名称和来源；题目正文、题号、依据要求与答案识别不变。',
     ]),
 });
 
@@ -1953,6 +1952,8 @@ function lengthInstruction(length) {
 }
 
 function buildQuestionXml(questions) {
+    // Preset provenance is UI metadata, not part of the model's task.
+    // Keep it on the internal question/result objects; never serialize it here.
     return questions.map((question, index) => {
         const requestId = `q${index + 1}`;
         const typeRule = question.type === 'boolean'
@@ -1965,7 +1966,6 @@ function buildQuestionXml(questions) {
         return [
             `<question id="${requestId}" index="${index + 1}" evidence_required="${question.requireEvidence ? 'true' : 'false'}">`,
             `<text>${escapeXml(question.text)}</text>`,
-            `<source>${escapeXml(question.source || '')}</source>`,
             `<type>${typeRule}</type>`,
             `<length>${lengthInstruction(question.length)}</length>`,
             `<evidence_rule>${evidenceRule}</evidence_rule>`,
@@ -2495,7 +2495,6 @@ function dualApiAnswerRows(questions, parsed) {
             index: index + 1,
             id: question.id,
             question: question.text,
-            source: question.source || '',
             answer: compactPromptText(answer.answer),
             evidence: compactPromptText(answer.evidence),
         };
