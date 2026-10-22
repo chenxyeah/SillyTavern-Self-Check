@@ -2244,6 +2244,22 @@ body.stsc-modal-open {
 .stsc-log-item.is-warning { border-left-color: #e2a93b; }
 .stsc-log-head { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 7px; }
 .stsc-log-head time { color: var(--stsc-muted); font-size: 12px; }
+.stsc-log-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.stsc-log-actions .menu_button { width: auto; }
+.stsc-error-help { min-width: 0; }
+.stsc-error-help-search { position: sticky; top: 0; z-index: 1; padding: 8px 0; background: var(--stsc-panel, #222); border-bottom: 1px solid var(--stsc-border); }
+.stsc-error-help-search label { display: block; font-weight: 700; margin-bottom: 7px; }
+.stsc-error-help-search input { width: 100%; min-width: 0; margin-bottom: 7px; }
+.stsc-help-notice { margin: 12px 0; padding: 10px; border: 1px solid var(--stsc-border); border-radius: 8px; line-height: 1.6; }
+.stsc-help-notes { margin: 12px 0; }
+.stsc-help-notes summary { cursor: pointer; }
+.stsc-help-notes p { line-height: 1.65; }
+.stsc-error-help-card { margin: 12px 0; border: 1px solid var(--stsc-border); border-radius: 10px; overflow-wrap: anywhere; }
+.stsc-error-help-card summary { cursor: pointer; padding: 12px; line-height: 1.6; }
+.stsc-help-number { display: inline-block; margin-right: 8px; font-weight: 700; color: var(--stsc-muted); }
+.stsc-error-help-card dl { margin: 0; padding: 0 14px 14px; }
+.stsc-error-help-card dt { margin-top: 12px; font-weight: 700; }
+.stsc-error-help-card dd { margin: 5px 0 0; line-height: 1.75; white-space: pre-wrap; }
 
 /* Reference plans share the dialog scroll container, without parent scroll locks. */
 .stsc-reference-plans { min-width: 0; }

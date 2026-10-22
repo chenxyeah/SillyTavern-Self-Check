@@ -3,11 +3,14 @@ import {
     buildGenerationRequest, buildModelsRequest, extractModelIds, readGenerationText,
     requestProvider, testConnection, DEFAULT_MAX_TOKENS, normalizeMaxTokens, reasoningOptions, requestParameters,
 } from './api-providers.mjs';
+import {
+    COMMON_ERROR_HELP, searchErrorHelp, normalizeHelpIds, getApiErrorHelpIds, getResultHelpIds, getLogHelpIds,
+} from './error-help.mjs';
 
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.11';
+const STSC_VERSION = '0.4.12';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -44,11 +47,11 @@ const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
     releasedAt: '2026-10-22',
-    title: '精简自检问题来源信息',
+    title: '常见报错查询与日志定位',
     changes: Object.freeze([
-        '发给模型的自检问题不再附带通用/角色预设名称及来源字段，减少无关管理信息。',
-        '同时覆盖副API、单API与双API失败回退；强力规范及普通主API注入继续不附带来源。',
-        '插件界面、结果记录与预设导出保留原有名称和来源；题目正文、题号、依据要求与答案识别不变。',
+        '运行日志新增查看常见报错，内置52条说明，分开展示适用模式、影响、原因与处理方式。',
+        '支持按编号或标题关键词搜索，不检索说明正文；异常日志旁可直接查看对应原因与处理。',
+        '新日志保存对应帮助编号，旧日志保守匹配；未知问题明确提示无法精确匹配，不擅自认定原因。',
     ]),
 });
 
@@ -198,6 +201,7 @@ let floatingDragState = null;
 let suppressFloatingClickUntil = 0;
 let expandedReferenceIds = new Set();
 let referencePlanDialogState = null;
+let errorHelpState = null;
 let expandedQuestionIds = new Set();
 let expandedInstructionIds = new Set();
 let floatingPanelPage = 'check';
@@ -251,11 +255,13 @@ function compactRuntimeLogMessage(level, stage, message, handling = '') {
     return source.length > 600 ? `${source.slice(0, 600)}…` : source;
 }
 
-function addRuntimeLog(level, stage, message, handling = '') {
+function addRuntimeLog(level, stage, message, handling = '', helpIds = []) {
     const settings = normalizeSettings();
     if (!settings) return;
     const compactMessage = compactRuntimeLogMessage(level, stage, message, handling);
-    settings.logs.unshift({ id: uid('log'), timestamp: Date.now(), level, stage: sanitizeLogText(stage), message: sanitizeLogText(compactMessage), handling: sanitizeLogText(handling).slice(0, 240) });
+    const explicitIds = normalizeHelpIds(helpIds);
+    const resolvedIds = explicitIds.length ? explicitIds : getLogHelpIds({ level, stage, message, handling });
+    settings.logs.unshift({ id: uid('log'), timestamp: Date.now(), level, stage: sanitizeLogText(stage), message: sanitizeLogText(compactMessage), handling: sanitizeLogText(handling).slice(0, 240), helpIds: resolvedIds });
     settings.logs = settings.logs.slice(0, STSC_LOG_LIMIT);
     saveSettings();
     renderLogBadge();
@@ -325,7 +331,7 @@ function addGenerationResultLog(latest, visibleBody = '') {
         handlingParts.push('上一轮复盘也已完成，没有发现明显问题。');
     }
 
-    addRuntimeLog(level, '本轮结果', message, handlingParts.join(' '));
+    addRuntimeLog(level, '本轮结果', message, handlingParts.join(' '), getResultHelpIds(latest, visibleBody));
 }
 
 function ctx() {
@@ -3240,13 +3246,13 @@ globalThis.sillyTavernSelfCheckInterceptor = async function (_chat, _contextSize
             const reason = dualApiFailureMessage(error);
             const character = runtimeCharacterLabel({ characterName: getCurrentEntity()?.name || '' });
             if (settings.dualApi.failureMode === 'fallback_single') {
-                addRuntimeLog('warning', '自检API', `${character}：${reason}`, '插件已经自动改用单API继续生成，本轮不会直接中断。');
+                addRuntimeLog('warning', '自检API', `${character}：${reason}`, '插件已经自动改用单API继续生成，本轮不会直接中断。', [...getApiErrorHelpIds(error), 34]);
                 pendingRun.mode = 'single';
                 pendingRun.questions = clone(questions);
                 setRuntimePrompt('stsc_main', buildSinglePrompt(questions), settings.injection);
                 toastr.warning(`独立自检API调用失败，已自动退回单API模式。原因：${reason}`, '墨提斯之镜', { timeOut: 9000 });
             } else {
-                addRuntimeLog('error', '自检API', `${character}：${reason}`, '当前设置要求双API失败时停止，因此本轮生成已经停止。');
+                addRuntimeLog('error', '自检API', `${character}：${reason}`, '当前设置要求双API失败时停止，因此本轮生成已经停止。', [...getApiErrorHelpIds(error), 35]);
                 abort?.(true);
                 pendingRun = null;
                 clearRuntimePrompts();
@@ -4356,10 +4362,13 @@ function openVersionDialog() {
 
 function runtimeLogHtml(item) {
     const labels = { error: '失败', warning: '需要留意', info: '正常' };
+    const helpIds = getLogHelpIds(item);
+    const canView = ['warning', 'error'].includes(item.level) || helpIds.length;
     return `<article class="stsc-log-item is-${escapeHtml(item.level || 'info')}" data-log-id="${escapeHtml(item.id)}">
-        <div class="stsc-log-head"><b>${escapeHtml(labels[item.level] || '记录')}｜${escapeHtml(item.stage || '运行')}</b><time>${new Date(item.timestamp).toLocaleString()}</time></div>
+        <div class="stsc-log-head"><b>${escapeHtml(item.level === 'info' && helpIds.length ? '提示' : labels[item.level] || '记录')}｜${escapeHtml(item.stage || '运行')}</b><time>${new Date(item.timestamp).toLocaleString()}</time></div>
         <div>${escapeHtml(item.message || '')}</div>${item.handling ? `<div class="stsc-muted">处理：${escapeHtml(item.handling)}</div>` : ''}
-        <button class="menu_button stsc-small-button" type="button" data-dialog-action="delete-log" data-log-id="${escapeHtml(item.id)}">删除</button>
+        <div class="stsc-log-actions">${canView ? `<button class="menu_button stsc-small-button" type="button" data-dialog-action="view-log-help" data-log-id="${escapeHtml(item.id)}">查看原因与处理</button>` : ''}
+        <button class="menu_button stsc-small-button" type="button" data-dialog-action="delete-log" data-log-id="${escapeHtml(item.id)}">删除</button></div>
     </article>`;
 }
 
@@ -4370,7 +4379,53 @@ function openLogDialog() {
     renderLogBadge();
     const list = settings.logs.length ? settings.logs.map(runtimeLogHtml).join('') : '<div class="stsc-empty">还没有运行记录。完成一次角色回复或手动检查更新后，这里会显示结果。</div>';
     openDialog('运行日志', `<div class="stsc-log-summary">成功、部分完成和失败都会记录。日志会写明时间、角色卡、运行模式、完成题数、正文与API情况；本地最多保留最近 ${STSC_LOG_LIMIT} 条，且不会记录API密钥。</div><div class="stsc-log-list">${list}</div>`,
-        '<button class="menu_button" type="button" data-dialog-action="clear-runtime-cache">清理缓存</button><button class="menu_button" type="button" data-dialog-action="export-logs">导出日志</button><button class="menu_button stsc-danger-button" type="button" data-dialog-action="ask-clear-logs">清除日志</button>');
+        '<button class="menu_button" type="button" data-dialog-action="open-error-help">查看常见报错</button><button class="menu_button" type="button" data-dialog-action="clear-runtime-cache">清理缓存</button><button class="menu_button" type="button" data-dialog-action="export-logs">导出日志</button><button class="menu_button stsc-danger-button" type="button" data-dialog-action="ask-clear-logs">清除日志</button>');
+}
+
+function renderErrorHelpResults() {
+    if (!errorHelpState) return;
+    const { query, targetIds } = errorHelpState;
+    const entries = query.trim() ? searchErrorHelp(query)
+        : targetIds.length ? COMMON_ERROR_HELP.filter(item => targetIds.includes(item.id)) : searchErrorHelp('');
+    const expanded = Boolean(query.trim() || targetIds.length);
+    $('#stsc_error_help_count').text(`找到 ${entries.length} 条／共 ${COMMON_ERROR_HELP.length} 条`);
+    $('#stsc_error_help_results').html(entries.length ? entries.map(item => `
+        <details class="stsc-error-help-card" data-help-id="${item.id}" ${expanded ? 'open' : ''}>
+            <summary><span class="stsc-help-number">${String(item.id).padStart(2, '0')}</span><b>${escapeHtml(item.title)}</b></summary>
+            <dl><dt>适用</dt><dd>${escapeHtml(item.mode)}</dd>
+                <dt>影响</dt><dd>${escapeHtml(item.impact)}</dd>
+                <dt>原因</dt><dd>${escapeHtml(item.cause)}</dd>
+                <dt>处理</dt><dd>${escapeHtml(item.action)}</dd></dl>
+        </details>`).join('') : '<div class="stsc-empty">没有匹配的标题。请输入编号（如47）或标题关键词。适用、影响、原因、处理内容不参与搜索。</div>');
+}
+
+function openErrorHelpDialog(logId = '') {
+    const item = logId ? normalizeSettings().logs.find(log => log.id === logId) : null;
+    const ids = item ? getLogHelpIds(item) : [];
+    const query = ids.length === 1 ? String(ids[0]) : '';
+    const notice = logId ? item
+        ? ids.length ? `已定位本条日志的相关说明：${ids.map(id => String(id).padStart(2, '0')).join('、')}。多个编号可能分别说明原因与回退/停止结果，不代表唯一诊断。`
+            : '这条日志的信息不足，无法精确匹配。请按下方编号或标题搜索；不会替你猜定原因。'
+        : '这条日志已不存在，请按编号或标题查找。' : '';
+    openDialog('常见报错与处理', `<div class="stsc-error-help">
+        <div class="stsc-error-help-search">
+            <label for="stsc_error_help_search">搜索编号或标题关键词</label>
+            <input id="stsc_error_help_search" class="text_pole" type="search" value="${escapeHtml(query)}" placeholder="例如：47、检查更新、没有自检标签" autocomplete="off">
+            <div class="stsc-muted">只搜索编号和标题，不搜索说明正文；可用下方按钮查看全部。点击标题展开。</div>
+            <div id="stsc_error_help_count" class="stsc-muted" aria-live="polite"></div>
+        </div>
+        ${notice ? `<div class="stsc-help-notice">${escapeHtml(notice)}</div>` : ''}
+        <details class="stsc-help-notes"><summary>阅读须知：这些提示不全是严重故障</summary>
+            <p>52条是排查分类，不是52种严重故障。原因是可能性，不是已确定的诊断；设置修改后需保存。</p>
+            <p>副API失败时，选择回退会由主API继续尝试自检和正文；选择停止则本轮不继续正文。连接测试通过不保证实际自检一定成功。</p>
+            <p>格式修复后答案和正文正常，或重复自检已经清理干净时，通常可以继续使用。复盘缺失只影响复盘，不能一概说自检也失败。</p>
+            <p>接口类主要指插件副API；单API主接口的同类故障通常由酒馆提示。反馈请附插件版本、模式、供应商选项、模型和报错截图；不要发送密钥，私密聊天请遮挡。重装前先备份，不要直接清空数据。</p>
+        </details>
+        <div id="stsc_error_help_results"></div>
+    </div>`, '<button class="menu_button" type="button" data-dialog-action="return-to-logs">返回日志</button><button class="menu_button" type="button" data-dialog-action="show-all-error-help">清空搜索／查看全部</button><button class="menu_button" type="button" data-dialog-action="cancel">关闭</button>');
+    errorHelpState = { query, targetIds: ids, logId };
+    $('#stsc_dialog_body').scrollTop(0);
+    renderErrorHelpResults();
 }
 
 function exportRuntimeLogs() {
@@ -4587,6 +4642,7 @@ function closeManager() {
 }
 
 function openDialog(title, bodyHtml, footerHtml = '') {
+    errorHelpState = null;
     referencePlanDialogState = null;
     $('#stsc_dialog_title').text(title || '操作');
     $('#stsc_dialog_body').html(bodyHtml || '');
@@ -4596,6 +4652,7 @@ function openDialog(title, bodyHtml, footerHtml = '') {
 }
 
 function closeDialog() {
+    errorHelpState = null;
     referencePlanDialogState = null;
     const hadPendingUnsavedAction = Boolean(pendingUnsavedAction);
     bulkDraft = null;
@@ -5170,6 +5227,12 @@ ${questionText}
 }
 
 function bindUiEvents() {
+    $('#stsc_dialog_overlay').on('input', '#stsc_error_help_search', function () {
+        if (!errorHelpState) return;
+        errorHelpState.query = this.value;
+        errorHelpState.targetIds = [];
+        renderErrorHelpResults();
+    });
     $('#stsc_dialog_overlay').on('change', '#stsc_reference_plan_select', function () {
         renderReferencePlansDialog(this.value);
     });
@@ -5984,6 +6047,32 @@ function bindUiEvents() {
         if (action === 'open-sillytavern-extensions') {
             closeDialog();
             openExtensionManagerForUpdate();
+            return;
+        }
+        if (action === 'open-error-help') {
+            openErrorHelpDialog();
+            return;
+        }
+        if (action === 'view-log-help') {
+            openErrorHelpDialog(String($(this).data('log-id') || ''));
+            return;
+        }
+        if (action === 'return-to-logs') {
+            const logId = errorHelpState?.logId;
+            openLogDialog();
+            if (logId) document.getElementById('stsc_dialog_body')?.querySelectorAll('.stsc-log-item').forEach(card => {
+                if (card.dataset.logId === logId) card.scrollIntoView({ block: 'nearest' });
+            });
+            return;
+        }
+        if (action === 'show-all-error-help') {
+            if (errorHelpState) {
+                errorHelpState.query = '';
+                errorHelpState.targetIds = [];
+                $('#stsc_error_help_search').val('');
+                renderErrorHelpResults();
+                $('#stsc_dialog_body').scrollTop(0);
+            }
             return;
         }
         if (action === 'export-logs') {

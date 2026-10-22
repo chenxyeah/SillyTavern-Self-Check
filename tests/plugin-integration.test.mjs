@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import * as adapters from '../api-providers.mjs';
+import * as errorHelp from '../error-help.mjs';
 
-const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8').replace(/^import[\s\S]*?;\r?\n/, '');
+const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8').replace(/^import[\s\S]*?;\r?\n/gm, '');
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
 function plugin() {
@@ -36,7 +37,7 @@ function plugin() {
     for (const id of ['stsc_dual_model', 'stsc_refresh_models', 'stsc_dual_model_status', 'stsc_dual_model_manual', 'stsc_test_api_connection', 'stsc_api_profile_name']) {
         nodes.set(id, { innerHTML: '', disabled: false, value: '', textContent: '', classList: { toggle() {} } });
     }
-    const scope = { ...adapters, $, jQuery() {}, URL, AbortController, structuredClone, Error, TypeError,
+    const scope = { ...adapters, ...errorHelp, $, jQuery() {}, URL, AbortController, structuredClone, Error, TypeError,
         setTimeout: (fn, delay) => { const timer = setTimeout(fn, delay); timer.unref(); return timer; }, clearTimeout,
         document: { getElementById: id => nodes.get(id) || null },
         window: { addEventListener() {} },
@@ -58,6 +59,7 @@ function plugin() {
         toggleUpdateNotice(checked) { return events.get('change:#stsc_update_notices_enabled').call({ checked }); },
         event(type, id, value) { return events.get(type + ':' + id).call({ value, checked: value }, { type }); },
         action(action, referenceId) { return events.get('click:[data-action]').call({ data: { action, 'reference-id': referenceId } }); },
+        dialogAction(action, data = {}) { return events.get('click:[data-dialog-action]').call({ data: { 'dialog-action': action, ...data } }); },
         planAction(action, referenceId) { return events.get('click:[data-plan-action]').call({ data: { 'plan-action': action, 'plan-reference-id': referenceId } }); },
         planField(field, referenceId, checked) { return events.get('change:[data-plan-field]').call({ checked, data: { 'plan-field': field, 'plan-reference-id': referenceId } }); }
     };
@@ -77,6 +79,69 @@ function promptSourceApp() {
         parsed=parseModelOutput('<stsc_self_check><item id="q1"><answer>不得替用户做决定。</answer><evidence>用户没有选择行动。</evidence></item><item id="q2"><answer>角色应平静回应。</answer></item></stsc_self_check>',questions);`);
     return app;
 }
+
+test('log dialog includes guide entry, normal logs have no view button, and problems do', () => {
+    const app=plugin();
+    app.run(`openLogDialog(); normalLog={id:'ok',level:'info',stage:'本轮结果',message:'正常完成'};
+        problemLog={id:'bad',level:'warning',stage:'本轮结果',message:'自检格式不完整',helpIds:[7]};`);
+    assert.ok(app.html['#stsc_dialog_footer'].includes('open-error-help'));
+    assert.ok(!app.run('runtimeLogHtml(normalLog)').includes('view-log-help'));
+    assert.ok(app.run('runtimeLogHtml(problemLog)').includes('view-log-help'));
+    assert.ok(app.run('runtimeLogHtml(problemLog)').includes('delete-log'));
+    assert.ok(app.run('runtimeLogHtml({id:"unknown",level:"error",stage:"unknown"})').includes('view-log-help'));
+});
+
+test('guide opens, searches title/number only and resets without modifying logs/settings', () => {
+    const app=plugin();
+    app.run('normalizeSettings()');
+    const before=app.run('JSON.stringify(normalizeSettings())');
+    app.dialogAction('open-error-help');
+    assert.equal((app.html['#stsc_error_help_results'].match(/data-help-id=/g)||[]).length,52);
+    app.event('input','#stsc_error_help_search','47');
+    assert.match(app.html['#stsc_error_help_results'],/data-help-id="47" open/);
+    assert.equal((app.html['#stsc_error_help_results'].match(/data-help-id=/g)||[]).length,1);
+    for(const label of ['适用','影响','原因','处理']) assert.ok(app.html['#stsc_error_help_results'].includes('<dt>'+label+'</dt>'));
+    app.event('input','#stsc_error_help_search','检查更新');
+    assert.ok(app.html['#stsc_error_help_results'].includes('data-help-id="47"'));
+    app.event('input','#stsc_error_help_search','稍后重试');
+    assert.ok(app.html['#stsc_error_help_results'].includes('没有匹配的标题'));
+    app.dialogAction('show-all-error-help');
+    assert.equal((app.html['#stsc_error_help_results'].match(/data-help-id=/g)||[]).length,52);
+    assert.equal(app.run('JSON.stringify(normalizeSettings())'),before);
+    assert.equal(app.requestBodies.length,0);
+});
+
+test('view button opens exact stored entry, multiple causes, and unknown legacy help safely', () => {
+    const app=plugin();
+    app.run(`normalizeSettings().logs=[{id:'matched',level:'warning',helpIds:[7]}, {id:'multi',level:'error',helpIds:[23,34]}, {id:'unknown',level:'error',stage:'unknown',message:'UNKNOWN'}, {id:'xss',level:'warning',stage:'unknown',message:'<img src=x>'}];`);
+    app.dialogAction('view-log-help',{'log-id':'matched'});
+    assert.match(app.html['#stsc_error_help_results'],/data-help-id="7" open/);
+    assert.equal((app.html['#stsc_error_help_results'].match(/data-help-id=/g)||[]).length,1);
+    app.dialogAction('view-log-help',{'log-id':'multi'});
+    assert.equal((app.html['#stsc_error_help_results'].match(/data-help-id=/g)||[]).length,2);
+    assert.ok(app.html['#stsc_error_help_results'].includes('data-help-id="23"'));
+    assert.ok(app.html['#stsc_error_help_results'].includes('data-help-id="34"'));
+    app.dialogAction('view-log-help',{'log-id':'unknown'});
+    assert.ok(app.html['#stsc_dialog_body'].includes('无法精确匹配'));
+    app.dialogAction('view-log-help',{'log-id':'removed'});
+    assert.ok(app.html['#stsc_dialog_body'].includes('日志已不存在'));
+    app.dialogAction('return-to-logs');
+    assert.ok(app.html['#stsc_dialog_body'].includes('&lt;img'));
+    assert.ok(!app.html['#stsc_dialog_body'].includes('<img'));
+    assert.equal(app.run('errorHelpState'),null);
+    assert.equal(app.run('normalizeSettings().logs.length'),4);
+});
+
+test('new logs save safe help IDs before compacting/truncation; result mapping keeps source of warning', () => {
+    const app=plugin();
+    app.run(`addRuntimeLog('warning','自检API','TEST_MESSAGE','TEST_HANDLING',[23,34,999]);`);
+    assert.equal(app.run('JSON.stringify(normalizeSettings().logs[0].helpIds)'),'[23,34]');
+    app.run(`addGenerationResultLog({mode:'dual_api',status:'format_error',answeredCount:2,expectedCount:2,formatIssues:['酒馆主API意外重复输出了自检内容，插件已自动移除。']},'正文');`);
+    assert.equal(app.run('JSON.stringify(normalizeSettings().logs[0].helpIds)'),'[7]');
+    app.run(`addGenerationResultLog({mode:'dual_api',status:'dual_ok',answeredCount:2,expectedCount:2,formatIssues:[],previousReview:{status:'content_missing'}},'正文');`);
+    assert.equal(app.run('JSON.stringify(normalizeSettings().logs[0].helpIds)'),'[11]');
+    assert.ok(app.run('runtimeLogHtml(normalizeSettings().logs[0])').includes('view-log-help'));
+});
 
 function assertNoPresetSources(text) {
     assert.ok(!/<source\b/i.test(text));
@@ -360,10 +425,10 @@ test('empty floating instructions stay disabled and instruction names remain esc
     assert.equal(app.run("setInstructionActivation('empty', 'always')"), false);
 });
 
-test('version/identity are formal v0.4.11; release metadata and UI stay in sync', () => {
+test('version/identity are formal v0.4.12; release metadata and UI stay in sync', () => {
     const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url)));
     const release = JSON.parse(readFileSync(new URL('../version.json', import.meta.url)));
-    assert.equal(manifest.version, '0.4.11');
+    assert.equal(manifest.version, '0.4.12');
     assert.equal(release.version, manifest.version);
     assert.equal(manifest.homePage, 'https://github.com/chenxyeah/SillyTavern-Self-Check');
     const app = plugin();
