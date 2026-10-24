@@ -166,6 +166,106 @@ test('question serialization omits preset source metadata but preserves task tex
     assertNoPresetSources(app.run('buildSinglePrompt(questions)'));
 });
 
+test('single API prompt asks for visible final answers before unchanged story formatting, not internal reasoning', () => {
+    const app = promptSourceApp();
+    const prompt = app.run('buildSinglePrompt(questions)');
+    for (const rule of ['自检答案 → 正文', '不能只在内部完成检查后直接输出正文',
+        '正文应落实这些结论', '不要求展示内部推理', '先按原规则完整闭合',
+        'think/thinking/reasoning/analysis', '正文保留原有格式', '不加入说明文字或代码围栏']) {
+        assert.ok(prompt.includes(rule), rule);
+    }
+    assert.ok(!prompt.includes('输出任何角色扮演正文、对白、动作描写、状态栏、HTML、XML'));
+    assert.ok(!prompt.includes('无需依据：<item'));
+    assert.ok(!prompt.includes('需要依据：<item'));
+    assertNoPresetSources(prompt);
+    assert.equal(app.requestBodies.length, 0);
+});
+
+test('single API template matches every actual item ID and evidence flag for one, six and many questions', () => {
+    const app = plugin();
+    for (const count of [1, 6, 32]) for (const evidenceMode of ['none', 'all', 'mixed']) {
+        app.run(`templateQuestions = Array.from({length:${count}}, (_,i) => ({
+            ...createQuestion('题目'+(i+1),'open','standard',false),
+            id:'saved-id-'+(100+i), source:'SHOULD_NOT_BE_SENT',
+            requireEvidence:${evidenceMode === 'all' ? 'true' : evidenceMode === 'mixed' ? 'i%2===0' : 'false'}
+        }));`);
+        const prompt = app.run('buildSinglePrompt(templateQuestions)');
+        const template = prompt.match(/^<stsc_self_check>\n[\s\S]*?^<\/stsc_self_check>/m)?.[0];
+        assert.ok(template);
+        assert.equal((template.match(/<item\b/g) || []).length, count);
+        for (let i = 0; i < count; i++) {
+            const item = template.match(new RegExp('<item id="q' + (i + 1) + '">([\\s\\S]*?)</item>'))?.[1];
+            assert.ok(item);
+            assert.equal(item.includes('<evidence>'), evidenceMode === 'all' || (evidenceMode === 'mixed' && i % 2 === 0));
+        }
+        assert.ok(prompt.includes('全部' + count + '题'));
+        assert.ok(!prompt.includes('saved-id-'));
+        assert.ok(!prompt.includes('SHOULD_NOT_BE_SENT'));
+        assert.ok(!template.includes('id="q' + (count + 1) + '"'));
+        assert.ok(prompt.indexOf('本轮问题：') < prompt.indexOf('自检格式模板'));
+        assert.ok(prompt.endsWith('正文保留原有格式，不套用新的插件标签。'));
+    }
+});
+
+test('compact single questions preserve exact text, type, length, order and evidence without mutating saved questions', () => {
+    const app = plugin();
+    app.run(`singleQuestions = ['brief','standard','detailed'].flatMap(length => [false,true].map(requireEvidence => ({
+        ...createQuestion('原文 & <tag> "引号"\\n第二行',requireEvidence?'boolean':'open',length,requireEvidence),
+        source:'PRIVATE_PRESET_NAME'
+    })));`);
+    const before = app.run('JSON.stringify(singleQuestions)');
+    const prompt = app.run('buildSinglePrompt(singleQuestions)');
+    for (let i = 0; i < 6; i++) {
+        const question = prompt.match(new RegExp('<question id="q' + (i + 1) + '"[^>]*>[\\s\\S]*?</question>'))?.[0];
+        assert.ok(question);
+        assert.ok(question.includes('type="' + (i % 2 ? 'boolean' : 'open') + '"'));
+        assert.ok(question.includes('evidence_required="' + Boolean(i % 2) + '"'));
+        assert.ok(question.includes(app.run('escapeXml(singleQuestions[' + i + '].text)')));
+        assert.ok(question.includes('<length>' + app.run('lengthInstruction(singleQuestions[' + i + '].length)') + '</length>'));
+    }
+    for (const rule of ['answer以“是”或“否”开头', '不得只写“已注意”“会遵守”', '同一item内必须另写非空evidence']) {
+        assert.ok(prompt.includes(rule));
+    }
+    assert.ok(!prompt.includes('<required_fields>'), 'shared field rules should not be repeated in each single-call question');
+    assert.ok(!prompt.includes('PRIVATE_PRESET_NAME'));
+    assert.equal(app.run('JSON.stringify(singleQuestions)'), before);
+});
+
+test('single answer template stays compatible with existing parser and preserves roleplay body formatting', () => {
+    const app = promptSourceApp();
+    app.run(`singlePrompt = buildSinglePrompt(questions);
+        template = singlePrompt.match(/^<stsc_self_check>\\n[\\s\\S]*?^<\\/stsc_self_check>/m)[0];
+        answerText = template.replaceAll('本题的具体结论','本轮不替用户做决定，保持角色边界。')
+            .replaceAll('支持本题结论的具体依据','用户本轮只提出问题，未选择行动。');
+        storyText = '<content><div class="story">正文 & 原有HTML</div></content>\\n<status>状态栏</status>\\n\\x60\\x60\\x60html\\n<div>保留正文代码块</div>\\n\\x60\\x60\\x60';
+        singleParsed = parseModelOutput(answerText + '\\n' + storyText, questions);`);
+    assert.equal(app.run('singleParsed.status'), 'ok');
+    assert.equal(app.run('singleParsed.answers.filter(answer => answer.answer.trim()).length'), 2);
+    assert.equal(app.run('singleParsed.body.trim()'), app.run('storyText'));
+    assert.equal(app.run('singleParsed.formatIssues.length'), 0);
+    assert.equal(app.run('singleParsed.answers[0].source'), app.run('questions[0].source'));
+});
+
+test('optimized single and fallback injection keep saved position/role, one prompt and no added API calls', async () => {
+    for (const mode of ['single', 'dual_api']) for (const customPosition of [false, true]) {
+        const app = promptSourceApp();
+        app.run(`editDraft.mode=${JSON.stringify(mode)};
+            editDraft.injection=${customPosition ? "{position:'chat',depth:3,role:'user'}" : "{position:'before',depth:0,role:'system'}"};
+            ctx().extensionSettings[STSC_MODULE]=clone(editDraft);
+            captured=[];secondaryCalls=0;ctx().setExtensionPrompt=(...args)=>captured.push(args);
+            callDualApiSelfCheck=async()=>{secondaryCalls++;throw new Error('TEST_FAILURE')};`);
+        await app.run('sillyTavernSelfCheckInterceptor([],10000,()=>{throw new Error("unexpected abort")},"normal")');
+        assert.equal(app.run('pendingRun.mode'), 'single');
+        assert.equal(app.run('secondaryCalls'), mode === 'dual_api' ? 1 : 0);
+        assert.equal(app.run('captured.filter(args=>args[0]==="stsc_main" && args[1]).length'), 1);
+        assert.equal(app.run('captured.find(args=>args[0]==="stsc_main" && args[1])[1]'), app.run('buildSinglePrompt(questions)'));
+        assert.equal(app.run('captured.find(args=>args[0]==="stsc_main" && args[1])[2]'), customPosition ? 1 : 2);
+        assert.equal(app.run('captured.find(args=>args[0]==="stsc_main" && args[1])[3]'), customPosition ? 3 : 0);
+        assert.equal(app.run('captured.find(args=>args[0]==="stsc_main" && args[1])[5]'), customPosition ? 1 : 0);
+        assert.equal(app.requestBodies.length, 0);
+    }
+});
+
 for (const transform of [false,true]) for (const compact of [false,true]) {
     test(`actual secondary API request omits preset metadata: strong=${transform}, compact=${compact}`, async () => {
         const app=promptSourceApp();
@@ -374,6 +474,84 @@ test('formal v0.4.1 greeting fence behavior is preserved and imported messages a
     }
 });
 
+const fenceCheckFixture = '<stsc_self_check><item id="q1"><answer>不替用户选择。</answer><evidence>用户没有选择行动。</evidence></item><item id="q2"><answer>保持角色边界。</answer></item></stsc_self_check>';
+
+test('self-check normalization does not remove body-only trailing, leading or independent code fences', () => {
+    const app = plugin();
+    const bodies = [
+        fenceCheckFixture + '\n```html\n<div>末尾代码块</div>\n```',
+        fenceCheckFixture + '\n末尾反引号不是外层围栏```',
+        '```xml\n<prefix>保留前面的代码块</prefix>\n```\n' + fenceCheckFixture,
+        '```xml\n<prefix>第一块</prefix>\n```\n' + fenceCheckFixture + '\n```html\n<div>第二块</div>\n```',
+        '```html\n<div>' + fenceCheckFixture + '</div>\n```',
+        '```javascript\nconst literal = ' + JSON.stringify(fenceCheckFixture) + ';\n```',
+        '```xml\n' + fenceCheckFixture,
+        '````xml\n' + fenceCheckFixture + '\n```',
+        '~~~xml\n' + fenceCheckFixture + '\n~~~',
+    ];
+    for (const original of bodies) {
+        app.scope.fenceOriginal = original;
+        assert.equal(app.run('normalizeModelXmlText(fenceOriginal).source'), original);
+    }
+});
+
+test('only complete whole-response XML or untyped fences are unwrapped, including longer delimiters and CRLF', () => {
+    const app = plugin();
+    for (const [opening, closing, newline] of [
+        ['```xml', '```', '\n'], ['```', '```', '\n'], ['```XML', '```', '\r\n'],
+        ['```` xml', '`````', '\n'], ['```xml', '```', '\r'],
+    ]) {
+        app.scope.fenceOriginal = ' \n' + opening + newline + fenceCheckFixture + newline + closing + '\n ';
+        assert.equal(app.run('normalizeModelXmlText(fenceOriginal).source'), fenceCheckFixture);
+    }
+});
+
+test('outer four-backtick wrapper preserves an inner triple-backtick body and escaped protocol compatibility', () => {
+    const app = promptSourceApp();
+    const body = '<content>正文</content>\n```html\n<div>保留内部代码块</div>\n```';
+    for (const escaped of [false, true]) {
+        app.scope.fenceInner = fenceCheckFixture + '\n' + body;
+        const inner = escaped ? app.run('escapeXml(fenceInner)') : app.scope.fenceInner;
+        app.scope.fenceOriginal = '````xml\n' + inner + '\n````';
+        const parsed = app.run('parseModelOutput(fenceOriginal,questions)');
+        assert.equal(parsed.status, escaped ? 'recovered' : 'ok');
+        assert.equal(parsed.body, body);
+        assert.equal(parsed.answers.length, 2);
+        assert.equal(parsed.formatIssues.length, 0);
+    }
+});
+
+test('first closing fence must finish the whole message; separate XML blocks cannot become a false outer wrapper', () => {
+    const app = promptSourceApp();
+    const original = '```xml\n<prefix>第一块</prefix>\n```\n' + fenceCheckFixture + '\n```\n第二块\n```';
+    app.scope.fenceOriginal = original;
+    assert.equal(app.run('normalizeModelXmlText(fenceOriginal).source'), original);
+    assert.equal(app.run('parseModelOutput(fenceOriginal,questions).body'), original.replace(fenceCheckFixture, ''));
+    app.scope.fenceOriginal = '```xml\n' + fenceCheckFixture + '\n```\n围栏后的正文';
+    assert.equal(app.run('normalizeModelXmlText(fenceOriginal).source'), app.scope.fenceOriginal);
+});
+
+test('single and dual reply processing preserve trailing code fences in message and swipe without touching reasoning', async () => {
+    for (const mode of ['single', 'dual_api']) {
+        const app = promptSourceApp();
+        const body = '<content>正文</content>\n```html\n<div>末尾代码块</div>\n```';
+        app.scope.fenceCheck = fenceCheckFixture;
+        app.scope.fenceBody = body;
+        app.run(`ctx().extensionSettings[STSC_MODULE] = clone(editDraft);
+            pendingRun = {mode:${JSON.stringify(mode)},targetMessageFloor:0,questions,
+                dualCheck:fenceCheck,dualParsed:parseModelOutput(fenceCheck,questions)};
+            refreshMessageDom=()=>{};saveLatestResult=async latest=>{receivedLatest=latest};
+            ctx().chat=[{is_user:false,mes:fenceCheck+'\\n'+fenceBody,
+                swipes:[fenceCheck+'\\n'+fenceBody],swipe_id:0,extra:{reasoning:'DO_NOT_CHANGE'}}];`);
+        await app.run('handleMessageReceived(0)');
+        assert.equal(app.st.chat[0].mes, body);
+        assert.equal(app.st.chat[0].swipes[0], body);
+        assert.equal(app.st.chat[0].extra.reasoning, 'DO_NOT_CHANGE');
+        assert.equal(app.run('receivedLatest.mode'), mode);
+        assert.equal(app.run('pendingRun'), null);
+    }
+});
+
 test('floating instruction cards reflect saved activation states, not an unsaved draft', () => {
     const app = plugin();
     app.run(`runtimeForFloating = clone(DEFAULT_SETTINGS);
@@ -425,10 +603,10 @@ test('empty floating instructions stay disabled and instruction names remain esc
     assert.equal(app.run("setInstructionActivation('empty', 'always')"), false);
 });
 
-test('version/identity are formal v0.4.12; release metadata and UI stay in sync', () => {
+test('version/identity are formal v0.4.13; release metadata and UI stay in sync', () => {
     const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url)));
     const release = JSON.parse(readFileSync(new URL('../version.json', import.meta.url)));
-    assert.equal(manifest.version, '0.4.12');
+    assert.equal(manifest.version, '0.4.13');
     assert.equal(release.version, manifest.version);
     assert.equal(manifest.homePage, 'https://github.com/chenxyeah/SillyTavern-Self-Check');
     const app = plugin();

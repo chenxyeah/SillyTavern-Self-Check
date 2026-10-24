@@ -10,7 +10,7 @@ import {
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.12';
+const STSC_VERSION = '0.4.13';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -46,12 +46,12 @@ const STSC_REMOTE_RELEASE_URLS = Object.freeze([
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-10-22',
-    title: '常见报错查询与日志定位',
+    releasedAt: '2026-10-24',
+    title: '单API提示词与代码块保护',
     changes: Object.freeze([
-        '运行日志新增查看常见报错，内置52条说明，分开展示适用模式、影响、原因与处理方式。',
-        '支持按编号或标题关键词搜索，不检索说明正文；异常日志旁可直接查看对应原因与处理。',
-        '新日志保存对应帮助编号，旧日志保守匹配；未知问题明确提示无法精确匹配，不擅自认定原因。',
+        '精简单API及失败回退提示，明确先实际输出逐题自检答案，再按原格式生成正文。',
+        '自检格式模板按本轮题数与依据要求生成，保留题型、长度、顺序及原有注入设置，不增加API请求。',
+        '修复含自检回复末尾代码块的反引号被误删；仅拆除确实包裹整段插件输出的完整外层围栏。',
     ]),
 });
 
@@ -1982,36 +1982,39 @@ function buildQuestionXml(questions) {
 }
 
 function buildSinglePrompt(questions) {
+    // Keep the single-call task concise without changing the secondary API protocol.
+    // Match the example to the actual IDs/evidence requirements, not two fictional items.
+    const questionXml = questions.map((question, index) => [
+        `<question id="q${index + 1}" type="${question.type === 'boolean' ? 'boolean' : 'open'}" evidence_required="${question.requireEvidence ? 'true' : 'false'}">`,
+        `<text>${escapeXml(question.text)}</text>`,
+        `<length>${lengthInstruction(question.length)}</length>`,
+        '</question>',
+    ].join('\n')).join('\n');
+    const answerTemplate = questions.map((question, index) =>
+        `<item id="q${index + 1}"><answer>本题的具体结论</answer>${question.requireEvidence ? '<evidence>支持本题结论的具体依据</evidence>' : ''}</item>`
+    ).join('\n');
     return `
-[墨提斯之镜 插件｜强制执行]
-你必须在输出任何角色扮演正文、对白、动作描写、状态栏、HTML、XML或其他正常正文格式之前，完成下面全部自检问题。
+[本轮输出要求]
+本次回复需要实际输出两部分，顺序为：自检答案 → 正文。
+自检答案是回复中必须提交的最终结果，不能只在内部完成检查后直接输出正文。
+自检区闭合后，继续按当前角色卡、预设和用户要求输出正文、对白、状态栏及原有HTML/XML格式；这些正文格式不替代自检区。
 
-输出边界（必须严格遵守）：
-- 本插件不要求你新增、展示或改写任何模型内部推理。
-- 仅当当前接口或预设原本明确要求输出可见推理区时，才按其原规则输出；必须在插件自检开始前完整关闭全部推理标签。
-- <stsc_self_check> 和最终可见正文必须位于 <think>、<thinking>、<reasoning>、<analysis> 及同类推理标签之外，绝不能被这些标签包裹。
-- 固定顺序只能是：原规则要求的可见推理区（如有且已闭合）→ 插件自检 → 最终可见正文。
-
-执行规则：
-1. 先依据当前角色卡、世界观、聊天记录和用户最后一条消息，逐题形成最终写作结论。
-2. 检查你准备输出的正文是否与任一答案冲突；如有冲突，先修正写作方案，再重新核对。
-3. 自检区只输出最终可供核对的简洁答案，不得把插件问答放入任何推理区。
-4. 不得漏题、合并题目或改变题目编号。
-5. 自检完成前不得开始角色扮演正文；自检结束后直接开始可见正文，不得再用推理标签包住正文。
-6. 对标记 evidence_required="true" 的问题，必须在同一个<item>中同时输出非空的<answer>与<evidence>；缺少<evidence>即视为格式错误。
-7. <answer>只写最终结论与本轮演绎方案；<evidence>单独写支撑该结论的具体剧情、角色设定或世界观依据。
-
-你必须严格输出以下结构：
-（仅当原规则明确要求时：先输出并完整闭合其可见推理区；否则不要新增）
-<stsc_self_check>
-无需依据：<item id="q1"><answer>最终回答</answer></item>
-需要依据：<item id="q2"><answer>最终回答</answer><evidence>具体依据</evidence></item>
-</stsc_self_check>
-紧接着在全部推理标签之外直接输出正文、状态栏以及用户要求的全部正常输出格式。
-正文不得再包裹在任何由本插件添加的标签中。
+答案规则：
+- 根据当前角色设定、世界观、聊天记录及用户最新消息，按顺序回答全部${questions.length}题；每题对应一个同编号的item，不漏题、不合并、不改编号。
+- answer写本轮具体结论与写作方案，并遵守题目的length要求；不得只写“已注意”“会遵守”。正文应落实这些结论。
+- type="boolean"：answer以“是”或“否”开头，用标点分隔后补充具体说明；type="open"：直接给出具体结论。
+- evidence_required="true"：同一item内必须另写非空evidence，给出可核对的剧情、角色设定或世界观依据，不要只把依据混在answer里。false时不强制evidence。
+- 自检仅提交最终答案，不要求展示内部推理。若原预设已有可见思考区，先按原规则完整闭合，再输出自检与正文；二者均放在think/thinking/reasoning/analysis等思考标签之外。
 
 本轮问题：
-${buildQuestionXml(questions)}
+${questionXml}
+
+自检格式模板（将占位文字替换为本轮实际答案；不是照抄模板）：
+<stsc_self_check>
+${answerTemplate}
+</stsc_self_check>
+
+请先完整输出上述自检区，再直接开始正文。自检区内只放item/answer/evidence，不加入说明文字或代码围栏；正文保留原有格式，不套用新的插件标签。
 `.trim();
 }
 
@@ -2665,12 +2668,20 @@ function normalizeModelXmlText(text) {
     const containsPluginProtocol = /<\/?stsc_(?:self_check|previous_review|response)\b/i.test(original)
         || /&lt;\s*\/?\s*stsc_(?:self_check|previous_review|response)\b/i.test(original);
     // 普通Markdown代码块属于用户正文。只有插件协议确实位于整段围栏内时，才移除外层围栏以兼容模型输出。
-    let source = containsPluginProtocol
-        ? original
-            .replace(/^\s*```(?:xml)?\s*/i, '')
-            .replace(/\s*```\s*$/i, '')
-            .trim()
-        : original;
+    let source = original;
+    if (containsPluginProtocol) {
+        const trimmed = original.trim();
+        const opening = /^(`{3,})[ \t]*(?:xml)?[ \t]*(?:\r\n|\n|\r)/i.exec(trimmed);
+        if (opening) {
+            const inner = trimmed.slice(opening[0].length);
+            // The FIRST matching closing line must end the entire response.
+            // Otherwise these fences belong to ordinary body blocks, not one outer wrapper.
+            const closing = new RegExp('^[ \\t]*`{' + opening[1].length + ',}[ \\t]*(?=\\r?$)', 'm').exec(inner);
+            if (closing && !inner.slice(closing.index + closing[0].length).trim()) {
+                source = inner.slice(0, closing.index).trim();
+            }
+        }
+    }
     let decodedOuterXml = false;
     if (!STSC_CHECK_OPEN_RE.test(source) && /&lt;\s*stsc_self_check\b/i.test(source)) {
         source = decodeXmlEntities(source).trim();
