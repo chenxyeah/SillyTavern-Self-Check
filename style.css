@@ -1510,6 +1510,17 @@ body.stsc-modal-open {
   margin-top: 10px;
 }
 
+.stsc-reference-group { min-width: 0; border: 1px solid var(--stsc-border); border-radius: 10px; overflow: hidden; }
+.stsc-reference-group-header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px; background: var(--stsc-panel-bg, rgba(128,128,128,.08)); }
+.stsc-reference-group-toggle { flex: 1 1 160px; min-width: 0; text-align: left; overflow-wrap: anywhere; color: inherit; background: transparent; border: 0; cursor: pointer; font: inherit; font-weight: 700; }
+.stsc-reference-group-actions { display: flex; flex-wrap: wrap; gap: 5px; }
+.stsc-reference-group-content { display: grid; gap: 10px; padding: 10px; min-width: 0; }
+.stsc-reference-group-content[hidden] { display: none; }
+.stsc-reference-group-picker { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 0 12px 10px; font-size: .9em; }
+.stsc-reference-group-picker select { flex: 1 1 120px; min-width: 0; max-width: 100%; }
+.stsc-reference-group-filter { margin: 12px 0; }
+.stsc-reference-group-filter select { width: 100%; }
+
 .stsc-reference-card {
   margin-top: 0;
   padding: 0;
@@ -2102,6 +2113,10 @@ body.stsc-modal-open {
 
   .stsc-reference-danger-row {
     justify-content: flex-end;
+  }
+
+  .stsc-reference-action-toolbar {
+    flex-wrap: wrap;
   }
 }
 

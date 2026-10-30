@@ -61,9 +61,148 @@ function plugin() {
         action(action, referenceId) { return events.get('click:[data-action]').call({ data: { action, 'reference-id': referenceId } }); },
         dialogAction(action, data = {}) { return events.get('click:[data-dialog-action]').call({ data: { 'dialog-action': action, ...data } }); },
         planAction(action, referenceId) { return events.get('click:[data-plan-action]').call({ data: { 'plan-action': action, 'plan-reference-id': referenceId } }); },
+        groupAction(action, id = '') { return events.get('click:[data-reference-group-action]').call({data:{'reference-group-action':action,'group-id':id}}); },
         planField(field, referenceId, checked) { return events.get('change:[data-plan-field]').call({ checked, data: { 'plan-field': field, 'plan-reference-id': referenceId } }); }
     };
 }
+
+function groupApp() {
+    const app = plugin();
+    app.run(`editDraft.references=['a','b','c'].map(id=>({...createReference('资料'+id),id,content:'CONTENT-'+id,addToCheck:true}));`);
+    return app;
+}
+
+test('legacy library and malformed groups normalize to safe default membership without losing content', () => {
+    const app = groupApp();
+    app.run(`legacy=clone(editDraft);delete legacy.referenceGroups; delete legacy.references[0].groupId;
+        legacy.references[1].groupId='missing';ctx().extensionSettings[STSC_MODULE]=legacy;normalizeSettings();`);
+    assert.equal(app.run('JSON.stringify(normalizeSettings().references.map(x=>[x.id,x.groupId,x.content]))'),
+        JSON.stringify([['a','','CONTENT-a'],['b','','CONTENT-b'],['c','','CONTENT-c']]));
+    app.run(`legacy.referenceGroups=[null,[],{id:'g',name:'有效'},{id:'g',name:'重复ID'},
+        {id:'x',name:' 有效 '},{id:'*',name:'保留ID'},{id:'d',name:'默认分组'},{id:'bad',name:{}}];
+        legacy.references[0].groupId='g';legacy.references[1].groupId='x';normalizeSettings();`);
+    assert.equal(app.run('JSON.stringify(legacy.referenceGroups)'),JSON.stringify([{id:'g',name:'有效'}]));
+    assert.equal(app.run('legacy.references[0].groupId'),'g');
+    assert.equal(app.run('legacy.references[1].groupId'),'');
+    assert.equal(app.run('legacy.references.length'),3);
+});
+
+test('group names validate create/rename, reserve default and keep IDs stable', () => {
+    const app = groupApp();
+    for (const name of ['', ' ', '默认分组', 'a'.repeat(81)]) assert.throws(()=>app.run(`setReferenceGroupName(${JSON.stringify(name)})`));
+    app.run(`g=setReferenceGroupName(' 文风 ');id=g.id;setReferenceGroupName('文风改名',g.id)`);
+    assert.equal(app.run('g.name'),'文风改名');
+    assert.equal(app.run('g.id===id'),true);
+    assert.throws(()=>app.run("setReferenceGroupName(' 文风改名 ')") );
+    assert.throws(()=>app.run("setReferenceGroupName('默认分组',g.id)"));
+    assert.throws(()=>app.run("setReferenceGroupName('不能改默认','')"));
+    assert.equal(app.run("deleteReferenceGroup('')"),false);
+});
+
+test('bulk group movement only changes membership, never activation, content, question order or plan binding', () => {
+    const app = groupApp();
+    app.run(`g=setReferenceGroupName('PRIVATE_FOLDER_LABEL');
+        plan=createReferencePlan('方案',['c','a']);editDraft.defaultReferencePlanId=plan.id;
+        editDraft.referencePlanBindings=[{characterKey:'character:a.png',planId:plan.id,characterName:'角色'}];
+        beforePlans=JSON.stringify([editDraft.referencePlans,editDraft.referencePlanBindings]);
+        beforeOrder=getActiveReferences(editDraft).map(x=>x.id).join(',');
+        beforePrompt=buildDualApiReferenceContext(getActiveReferences(editDraft));
+        beforeFields=JSON.stringify(editDraft.references.map(({groupId,...rest})=>rest));
+        moved=moveReferencesToGroup(['a','b','a','missing'],g.id);`);
+    assert.equal(app.run('moved'),2);
+    assert.equal(app.run('JSON.stringify(editDraft.references.map(({groupId,...rest})=>rest))'),app.run('beforeFields'));
+    assert.equal(app.run('JSON.stringify([editDraft.referencePlans,editDraft.referencePlanBindings])'),app.run('beforePlans'));
+    assert.equal(app.run("getActiveReferences(editDraft).map(x=>x.id).join(',')"),app.run('beforeOrder'));
+    assert.equal(app.run('buildDualApiReferenceContext(getActiveReferences(editDraft))'),app.run('beforePrompt'));
+    assert.equal(app.run("moveReferencesToGroup(['a'],g.id)"),0);
+    assert.throws(()=>app.run("moveReferencesToGroup(['c'],'unknown')"));
+    assert.equal(app.requestBodies.length,0);
+});
+
+test('delete group moves all members to default without deleting references, plans or content', () => {
+    const app = groupApp();
+    app.run(`g=setReferenceGroupName('待删除');moveReferencesToGroup(['a','c'],g.id);
+        p=createReferencePlan('引用方案',['a','c']);beforePlan=JSON.stringify(p);
+        referenceGroupFilter=g.id;collapsedReferenceGroupIds.add(g.id);deleted=deleteReferenceGroup(g.id);`);
+    assert.equal(app.run('deleted'),true);
+    assert.equal(app.run('editDraft.references.length'),3);
+    assert.equal(app.run('editDraft.references.every(x=>x.groupId==="")'),true);
+    assert.equal(app.run('JSON.stringify(p)'),app.run('beforePlan'));
+    assert.equal(app.run('referenceGroupFilter'),'');
+    assert.equal(app.run('collapsedReferenceGroupIds.has(g.id)'),false);
+});
+
+test('group changes remain drafts, survive save/reopen and are restored by discard', () => {
+    const app = groupApp();
+    app.run(`ctx().extensionSettings[STSC_MODULE]=clone(editDraft);
+        applyTheme=renderAll=refreshPluginUpdateNotice=()=>{};
+        g=setReferenceGroupName('已保存');moveReferencesToGroup(['b'],g.id);markDirty();`);
+    assert.equal(app.run('normalizeSettings().referenceGroups.length'),0);
+    app.run('commitEditDraft({notify:false});beginEditSession()');
+    assert.equal(app.run('editDraft.referenceGroups[0].name'),'已保存');
+    assert.equal(app.run('editDraft.references[1].groupId'),app.run('g.id'));
+    app.run('deleteReferenceGroup(g.id);markDirty();discardEditDraft()');
+    assert.equal(app.run('editDraft.referenceGroups.length'),1);
+    assert.equal(app.run('editDraft.references[1].groupId'),app.run('g.id'));
+    assert.equal(app.run('editDirty'),false);
+});
+
+test('group filter/collapse are display-only, escape names and reveal hidden library source from plans', () => {
+    const app = groupApp();
+    app.run(`g=setReferenceGroupName('<img onerror=x>');moveReferencesToGroup(['b'],g.id);renderReferencesTab()`);
+    assert.ok(app.html['#stsc_tab_references'].includes('&lt;img onerror=x&gt;'));
+    assert.ok(!app.html['#stsc_tab_references'].includes('<img onerror=x>'));
+    app.event('change','#stsc_reference_group_filter',app.run('g.id'));
+    assert.ok(app.html['#stsc_tab_references'].includes('data-reference-id="b"'));
+    assert.ok(!app.html['#stsc_tab_references'].includes('data-reference-id="a"'));
+    app.groupAction('toggle',app.run('g.id'));
+    assert.ok(app.html['#stsc_tab_references'].includes('stsc-reference-group-content" hidden'));
+    app.run("revealReferenceGroup('b');renderReferencesTab()");
+    assert.equal(app.run('referenceGroupFilter'),null);
+    assert.equal(app.run('collapsedReferenceGroupIds.has(g.id)'),false);
+    assert.equal(app.run('editDirty'),false);
+    assert.equal(app.requestBodies.length,0);
+});
+
+test('group-aware ordering only swaps same-group peers and preserves other slots and plan order', () => {
+    const app = groupApp();
+    app.run(`g=setReferenceGroupName('另一组');moveReferencesToGroup(['b'],g.id);
+        p=createReferencePlan('固定顺序',['a','b','c']);before=JSON.stringify(p);renderReferencesTab();`);
+    assert.equal(app.run("moveReferenceInGroup('b',-1)"),false);
+    assert.equal(app.run("moveReferenceInGroup('b',1)"),false);
+    app.action('move-reference-up','c');
+    assert.equal(app.run('editDraft.references.map(x=>x.id).join(",")'),'c,b,a');
+    assert.equal(app.run('JSON.stringify(p)'),app.run('before'));
+    assert.equal(app.run("moveReferenceInGroup('c',-1)"),false);
+});
+
+test('group actions create/rename in draft; deletion needs confirmation and cancel is safe', () => {
+    const app = groupApp();
+    app.nodes.set('stsc_reference_group_name',{value:'新分组'});
+    app.groupAction('confirm-new');
+    const id=app.run('editDraft.referenceGroups[0].id');
+    app.nodes.get('stsc_reference_group_name').value='改名后';
+    app.groupAction('confirm-rename',id);
+    assert.equal(app.run('editDraft.referenceGroups[0].name'),'改名后');
+    app.groupAction('delete',id);
+    assert.equal(app.run('editDraft.referenceGroups.length'),1);
+    app.dialogAction('cancel');
+    assert.equal(app.run('editDraft.referenceGroups.length'),1);
+    app.groupAction('delete',id);
+    app.dialogAction('confirm-delete');
+    assert.equal(app.run('editDraft.referenceGroups.length'),0);
+});
+
+test('library exports never leak local group identifiers and imported reference records retain old format', () => {
+    const app = groupApp();
+    app.run(`g=setReferenceGroupName('PRIVATE_GROUP');moveReferencesToGroup(['a'],g.id);
+        payload=makeReferenceExportPayload(editDraft.references[0]);
+        imported=validateImportedReferencePayload(payload);`);
+    assert.ok(!app.run('JSON.stringify(payload)').includes('groupId'));
+    assert.ok(!app.run('JSON.stringify(payload)').includes('PRIVATE_GROUP'));
+    assert.equal(app.run('createReference().groupId'),'');
+    assert.equal(app.run('imported.references[0].content'),'CONTENT-a');
+});
 
 function promptSourceApp() {
     const app = plugin();
@@ -603,10 +742,10 @@ test('empty floating instructions stay disabled and instruction names remain esc
     assert.equal(app.run("setInstructionActivation('empty', 'always')"), false);
 });
 
-test('version/identity are formal v0.4.13; release metadata and UI stay in sync', () => {
+test('version/identity are formal v0.4.14; release metadata and UI stay in sync', () => {
     const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url)));
     const release = JSON.parse(readFileSync(new URL('../version.json', import.meta.url)));
-    assert.equal(manifest.version, '0.4.13');
+    assert.equal(manifest.version, '0.4.14');
     assert.equal(release.version, manifest.version);
     assert.equal(manifest.homePage, 'https://github.com/chenxyeah/SillyTavern-Self-Check');
     const app = plugin();

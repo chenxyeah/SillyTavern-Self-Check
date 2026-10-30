@@ -10,7 +10,7 @@ import {
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.13';
+const STSC_VERSION = '0.4.14';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -46,12 +46,12 @@ const STSC_REMOTE_RELEASE_URLS = Object.freeze([
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-10-24',
-    title: '单API提示词与代码块保护',
+    releasedAt: '2026-10-31',
+    title: '参考资料库分组管理',
     changes: Object.freeze([
-        '精简单API及失败回退提示，明确先实际输出逐题自检答案，再按原格式生成正文。',
-        '自检格式模板按本轮题数与依据要求生成，保留题型、长度、顺序及原有注入设置，不增加API请求。',
-        '修复含自检回复末尾代码块的反引号被误删；仅拆除确实包裹整段插件输出的完整外层围栏。',
+        '参考资料库新增默认分组与自定义分组，支持创建、改名、筛选和折叠。',
+        '支持批量移入及单条切换分组；删除分组只将资料移回默认分组，不删除原资料。',
+        '分组操作不改变启用状态、发送顺序或资料方案与角色绑定，点击保存更改后长期保留。',
     ]),
 });
 
@@ -140,6 +140,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     logLastViewedAt: 0,
     presets: [],
     references: [],
+    referenceGroups: [],
     referencePlans: [],
     referencePlanBindings: [],
     defaultReferencePlanId: '',
@@ -200,6 +201,8 @@ let pendingUnsavedAction = null;
 let floatingDragState = null;
 let suppressFloatingClickUntil = 0;
 let expandedReferenceIds = new Set();
+let collapsedReferenceGroupIds = new Set();
+let referenceGroupFilter = null; // null = all groups; '' = the permanent default group.
 let referencePlanDialogState = null;
 let errorHelpState = null;
 let expandedQuestionIds = new Set();
@@ -579,6 +582,7 @@ function normalizeSettings() {
     }
 
     for (const reference of settings.references) normalizeReference(reference);
+    normalizeReferenceGroups(settings);
     normalizeReferencePlans(settings);
     for (const instruction of settings.temporaryInstructions) normalizeTemporaryInstruction(instruction);
     const validInstructionIds = new Set(settings.temporaryInstructions.map(instruction => instruction.id));
@@ -808,6 +812,7 @@ function createReference(name = '新参考资料', type = 'other') {
     return {
         id: uid('ref'),
         name,
+        groupId: '',
         type: Object.hasOwn(REFERENCE_TYPE_CONFIG, type) ? type : 'other',
         content: '',
         enabled: true,
@@ -1753,6 +1758,86 @@ function referenceApplies(reference) {
     if (reference.scope === 'global') return true;
     const entity = getCurrentEntity();
     return Boolean(entity.key && reference.characterKey === entity.key);
+}
+
+// Library folders are organizational only: never filter/reorder runtime references or plan entries.
+function normalizeReferenceGroups(settings) {
+    const ids = new Set();
+    const names = new Set([normalizePresetName('默认分组')]);
+    settings.referenceGroups = (Array.isArray(settings.referenceGroups) ? settings.referenceGroups : []).filter(group => {
+        if (!group || typeof group !== 'object' || Array.isArray(group)) return false;
+        if (typeof group.id !== 'string' || !group.id || group.id === '*' || ids.has(group.id)) return false;
+        if (typeof group.name !== 'string') return false;
+        const name = group.name.trim().slice(0, 80);
+        if (!name || names.has(normalizePresetName(name))) return false;
+        ids.add(group.id); names.add(normalizePresetName(name));
+        return true;
+    }).map(group => ({id: group.id, name: String(group.name).trim().slice(0, 80)}));
+    for (const reference of settings.references) {
+        if (!ids.has(reference.groupId)) reference.groupId = '';
+    }
+}
+
+function referenceGroupsForUi(settings = getUiSettings()) {
+    return [{id: '', name: '默认分组'}, ...(settings.referenceGroups || [])];
+}
+
+function referenceGroupOptions(selected = '', settings = getUiSettings()) {
+    return referenceGroupsForUi(settings).map(group => `<option value="${escapeHtml(group.id)}" ${group.id === selected ? 'selected' : ''}>${escapeHtml(group.name)}</option>`).join('');
+}
+
+function setReferenceGroupName(name, id = null, settings = getUiSettings()) {
+    const value = String(name || '').trim();
+    if (!value || value.length > 80) throw new Error('请输入1～80字的分组名称。');
+    if (referenceGroupsForUi(settings).some(group => group.id !== id && normalizePresetName(group.name) === normalizePresetName(value))) {
+        throw new Error('已经存在同名分组，请换一个名称。');
+    }
+    if (id === null) {
+        const group = {id: uid('refgroup'), name: value};
+        settings.referenceGroups.push(group);
+        return group;
+    }
+    const group = settings.referenceGroups.find(group => group.id === id);
+    if (!group) throw new Error('没有找到这个分组；默认分组不能改名。');
+    group.name = value;
+    return group;
+}
+
+function moveReferencesToGroup(ids, groupId, settings = getUiSettings()) {
+    if (!referenceGroupsForUi(settings).some(group => group.id === groupId)) throw new Error('目标分组不存在。');
+    const selected = new Set(ids);
+    let count = 0;
+    for (const reference of settings.references) {
+        if (selected.has(reference.id) && (reference.groupId || '') !== groupId) { reference.groupId = groupId; count++; }
+    }
+    return count;
+}
+
+function deleteReferenceGroup(id, settings = getUiSettings()) {
+    if (!id || !settings.referenceGroups.some(group => group.id === id)) return false;
+    moveReferencesToGroup(settings.references.filter(reference => reference.groupId === id).map(reference => reference.id), '', settings);
+    settings.referenceGroups = settings.referenceGroups.filter(group => group.id !== id);
+    collapsedReferenceGroupIds.delete(id);
+    if (referenceGroupFilter === id) referenceGroupFilter = '';
+    return true;
+}
+
+function moveReferenceInGroup(id, direction, settings = getUiSettings()) {
+    const index = settings.references.findIndex(reference => reference.id === id);
+    if (index < 0) return false;
+    const groupId = settings.references[index].groupId || '';
+    const peers = settings.references.filter(reference => (reference.groupId || '') === groupId);
+    const next = peers.findIndex(reference => reference.id === id) + direction;
+    if (next < 0 || next >= peers.length) return false;
+    const other = settings.references.findIndex(reference => reference.id === peers[next].id);
+    [settings.references[index], settings.references[other]] = [settings.references[other], settings.references[index]];
+    return true;
+}
+
+function revealReferenceGroup(referenceId, settings = getUiSettings()) {
+    referenceGroupFilter = null;
+    const reference = settings.references.find(reference => reference.id === referenceId);
+    collapsedReferenceGroupIds.delete(reference?.groupId || '');
 }
 
 // Plans own selection/state/order, while the library remains the only source of content.
@@ -3739,6 +3824,7 @@ function handleReferencePlanAction(action, referenceId = '') {
             if (index < 0) return;
             if (action === 'edit-source') {
                 closeDialog();
+                revealReferenceGroup(referenceId, settings);
                 expandedReferenceIds.add(referenceId);
                 renderReferencesTab();
                 // Native scrolling, no lock handlers or changes to other plugin menus.
@@ -3760,11 +3846,71 @@ function handleReferencePlanAction(action, referenceId = '') {
     renderReferencePlansDialog(plan?.id);
 }
 
+function openReferenceGroupDialog(action, id = '') {
+    const settings = getUiSettings();
+    const group = referenceGroupsForUi(settings).find(group => group.id === id);
+    if (action !== 'new' && !group) return;
+    if (action === 'delete') {
+        if (!id) return;
+        openDeleteConfirmation({title: '删除资料分组', message: `确定删除分组“${group.name}”吗？`,
+            detail: '组内资料全部移回默认分组，不删除资料，也不改变资料方案或角色绑定。点击保存更改后生效。',
+            perform: () => { if (deleteReferenceGroup(id, getUiSettings())) { markDirty(); renderReferencesTab(); } }});
+        return;
+    }
+    if (action === 'move') {
+        const choices = settings.references.filter(reference => (reference.groupId || '') !== id).map(reference => `
+            <label class="stsc-batch-reference-item"><input type="checkbox" data-group-pick-id="${escapeHtml(reference.id)}">
+            <span class="stsc-batch-reference-main"><b>${escapeHtml(reference.name)}</b><span>${escapeHtml(referenceGroupsForUi(settings).find(group => group.id === (reference.groupId || ''))?.name || '默认分组')}</span></span></label>`).join('');
+        openDialog(`移入资料：${group.name}`, `<div class="stsc-muted">勾选要移入的资料，只调整所属分组，不复制资料、不改变启用和自检设置。</div>
+            <div class="stsc-toolbar"><button class="menu_button" type="button" data-reference-group-action="pick-all">全选</button><button class="menu_button" type="button" data-reference-group-action="pick-none">清空选择</button></div>
+            <div class="stsc-batch-reference-list">${choices || '<div class="stsc-empty">没有其他分组的资料可移入。</div>'}</div>`,
+            `<button class="menu_button" type="button" data-dialog-action="cancel">取消</button><button class="menu_button stsc-primary-button" type="button" data-reference-group-action="confirm-move" data-group-id="${escapeHtml(id)}">确认移入</button>`);
+        return;
+    }
+    openDialog(action === 'new' ? '新建资料分组' : '重命名资料分组',
+        `<div class="stsc-field"><label for="stsc_reference_group_name">分组名称</label><input id="stsc_reference_group_name" class="text_pole" type="text" maxlength="80" value="${escapeHtml(action === 'new' ? '' : group.name)}"></div><div class="stsc-muted">只整理总资料库，不改变资料方案、启用状态和发送顺序。完成后请点击顶部“保存更改”。</div><div id="stsc_reference_group_error" class="stsc-dialog-error"></div>`,
+        `<button class="menu_button" type="button" data-dialog-action="cancel">取消</button><button class="menu_button stsc-primary-button" type="button" data-reference-group-action="${action === 'new' ? 'confirm-new' : 'confirm-rename'}" data-group-id="${escapeHtml(id)}">确认</button>`);
+}
+
+function handleReferenceGroupAction(action, id = '') {
+    const settings = getUiSettings();
+    if (['new', 'rename', 'delete', 'move'].includes(action)) return openReferenceGroupDialog(action, id);
+    if (action === 'toggle') {
+        if (collapsedReferenceGroupIds.has(id)) collapsedReferenceGroupIds.delete(id);
+        else collapsedReferenceGroupIds.add(id);
+        renderReferencesTab();
+        return;
+    }
+    if (action === 'pick-all' || action === 'pick-none') {
+        $('#stsc_dialog_body [data-group-pick-id]').prop('checked', action === 'pick-all');
+        return;
+    }
+    try {
+        if (action === 'confirm-new' || action === 'confirm-rename') {
+            const group = setReferenceGroupName(document.getElementById('stsc_reference_group_name')?.value, action === 'confirm-new' ? null : id, settings);
+            referenceGroupFilter = group.id;
+            collapsedReferenceGroupIds.delete(group.id);
+        } else if (action === 'confirm-move') {
+            const ids = $('#stsc_dialog_body [data-group-pick-id]:checked').map((_, element) => String($(element).data('group-pick-id'))).get();
+            if (!ids.length) { toastr.warning('请至少选择一条资料。', '墨提斯之镜'); return; }
+            if (!moveReferencesToGroup(ids, id, settings)) return;
+            referenceGroupFilter = id;
+            collapsedReferenceGroupIds.delete(id);
+        } else return;
+        markDirty(); closeDialog(); renderReferencesTab();
+    } catch (error) {
+        $('#stsc_reference_group_error').text(error.message);
+        toastr.warning(error.message, '墨提斯之镜');
+    }
+}
+
 function renderReferencesTab() {
     const settings = getUiSettings();
     const entity = getCurrentEntity();
-    const references = settings.references.length
-        ? settings.references.map((reference, index) => {
+    const groups = referenceGroupsForUi(settings);
+    if (referenceGroupFilter !== null && !groups.some(group => group.id === referenceGroupFilter)) referenceGroupFilter = null;
+    const renderCards = items => items.length
+        ? items.map((reference, index) => {
             const expanded = expandedReferenceIds.has(reference.id);
             const config = referenceTypeConfig(reference.type);
             const questionDisabled = !reference.enabled;
@@ -3785,10 +3931,11 @@ function renderReferencesTab() {
                     </label>
                     <div class="stsc-reference-order-actions">
                         <button class="menu_button stsc-small-button stsc-icon-action" type="button" data-action="move-reference-up" title="上移资料及自检问题" aria-label="上移资料及自检问题" ${index === 0 ? 'disabled' : ''}><i class="fa-solid fa-arrow-up" aria-hidden="true"></i><span class="stsc-action-label">上移</span></button>
-                        <button class="menu_button stsc-small-button stsc-icon-action" type="button" data-action="move-reference-down" title="下移资料及自检问题" aria-label="下移资料及自检问题" ${index === settings.references.length - 1 ? 'disabled' : ''}><i class="fa-solid fa-arrow-down" aria-hidden="true"></i><span class="stsc-action-label">下移</span></button>
+                        <button class="menu_button stsc-small-button stsc-icon-action" type="button" data-action="move-reference-down" title="下移资料及自检问题" aria-label="下移资料及自检问题" ${index === items.length - 1 ? 'disabled' : ''}><i class="fa-solid fa-arrow-down" aria-hidden="true"></i><span class="stsc-action-label">下移</span></button>
                     </div>
                 </div>
 
+                <label class="stsc-reference-group-picker">所属分组 <select class="text_pole" data-reference-field="groupId" aria-label="移动${escapeHtml(reference.name)}到分组">${referenceGroupOptions(reference.groupId || '', settings)}</select></label>
                 <div class="stsc-reference-body">
                     <div class="stsc-grid-2">
                         <div class="stsc-field">
@@ -3875,7 +4022,16 @@ function renderReferencesTab() {
                 </div>
             </div>`;
         }).join('')
-        : '<div class="stsc-empty">资料库还是空的。</div>';
+        : '<div class="stsc-empty">此分组还没有资料，可点击“移入资料”，或新建资料后选择此分组。</div>';
+    const references = groups.filter(group => referenceGroupFilter === null || group.id === referenceGroupFilter).map(group => {
+        const members = settings.references.filter(reference => (reference.groupId || '') === group.id);
+        const collapsed = collapsedReferenceGroupIds.has(group.id);
+        return `<section class="stsc-reference-group" data-library-group-id="${escapeHtml(group.id)}">
+            <div class="stsc-reference-group-header"><button class="stsc-reference-group-toggle" type="button" data-reference-group-action="toggle" data-group-id="${escapeHtml(group.id)}" aria-expanded="${!collapsed}">${collapsed ? '▸' : '▾'} ${escapeHtml(group.name)} <span>（${members.length}条）</span></button>
+                <div class="stsc-reference-group-actions"><button class="menu_button stsc-small-button" type="button" data-reference-group-action="move" data-group-id="${escapeHtml(group.id)}">移入资料</button>
+                ${group.id ? `<button class="menu_button stsc-small-button" type="button" data-reference-group-action="rename" data-group-id="${escapeHtml(group.id)}">改名</button><button class="menu_button stsc-small-button stsc-danger-button" type="button" data-reference-group-action="delete" data-group-id="${escapeHtml(group.id)}">删除分组</button>` : ''}</div></div>
+            <div class="stsc-reference-group-content" ${collapsed ? 'hidden' : ''}>${renderCards(members)}</div></section>`;
+    }).join('');
 
     $('#stsc_tab_references').html(`
         <div class="stsc-section">
@@ -3886,12 +4042,15 @@ function renderReferencesTab() {
             <div class="stsc-muted">使用每条资料右侧的上移／下移调整顺序，关联自检问题会同步排序；点击“保存更改”后生效。不改变通用、角色与资料问题的分组顺序。</div>
             <div class="stsc-muted">绑定资料方案后，资料启停、顺序与自检问答按方案配置生效；下面总库的启停与角色范围仅在未使用方案时生效，内容编辑仍会同步到所有方案。</div>
             <div class="stsc-toolbar stsc-reference-action-toolbar" style="margin-top:9px">
+                <button class="menu_button" type="button" data-reference-group-action="new">新建分组</button>
                 <button class="menu_button stsc-compact-action" type="button" data-action="open-create-reference" title="新建资料库" aria-label="新建资料库"><i class="fa-solid fa-plus"></i><span class="stsc-action-label">新建资料库</span></button>
                 <button class="menu_button stsc-compact-action" type="button" data-action="batch-export-references" title="批量导出资料库" aria-label="批量导出资料库" ${settings.references.length ? '' : 'disabled'}><i class="fa-solid fa-box-archive"></i><span class="stsc-action-label">批量导出</span></button>
                 <button class="menu_button stsc-compact-action" type="button" data-action="import-reference" title="导入资料库或资料库合集" aria-label="导入资料库或资料库合集"><i class="fa-solid fa-file-import"></i><span class="stsc-action-label">导入资料库</span></button>
                 <input id="stsc_reference_import_file" class="stsc-file-input" type="file" accept=".json,.stsc-reference.json,.stsc-references.json,application/json" aria-label="选择要导入的参考资料库文件或合集文件">
             </div>
             <div class="stsc-muted" style="margin-top:8px">支持导入单个资料库或一次导入整个资料库合集。导入内容默认保持关闭，角色绑定不会随文件导入；请展开检查后再手动启用。</div>
+            <div class="stsc-field stsc-reference-group-filter"><label for="stsc_reference_group_filter">查看分组</label><select id="stsc_reference_group_filter" class="text_pole"><option value="*" ${referenceGroupFilter === null ? 'selected' : ''}>全部分组</option>${referenceGroupOptions(referenceGroupFilter, settings)}</select></div>
+            <div class="stsc-muted">分组仅用于整理，不决定启用状态或发送顺序。条目上移／下移在组内调整；资料方案仍使用自己的顺序。删除分组只把资料移回默认分组。分组修改需点击顶部“保存更改”。</div>
             <div class="stsc-reference-list">${references}</div>
         </div>
     `);
@@ -5075,6 +5234,7 @@ async function importReferenceFile(file) {
             if (imported.scope === 'character') containsCharacterScope = true;
         }
 
+        revealReferenceGroup(created[0]?.id, settings);
         markDirty();
         renderAll();
 
@@ -5110,6 +5270,10 @@ function openCreateReferenceDialog() {
         `<div class="stsc-field">
             <label>资料库名称</label>
             <input id="stsc_new_reference_name" class="text_pole" type="text" maxlength="80" placeholder="请输入不重复的资料库名称">
+        </div>
+        <div class="stsc-field" style="margin-top:10px">
+            <label for="stsc_new_reference_group">所属分组</label>
+            <select id="stsc_new_reference_group" class="text_pole">${referenceGroupOptions(referenceGroupFilter || '', getUiSettings())}</select>
         </div>
         <div class="stsc-field" style="margin-top:10px">
             <label>资料类型</label>
@@ -5264,6 +5428,13 @@ function bindUiEvents() {
             toastr.warning(error.message, '墨提斯之镜');
         }
     });
+    $('#stsc_manager_overlay, #stsc_dialog_overlay').on('click', '[data-reference-group-action]', function () {
+        handleReferenceGroupAction($(this).data('reference-group-action'), String($(this).data('group-id') ?? ''));
+    });
+    $('#stsc_manager_overlay').on('change', '#stsc_reference_group_filter', function () {
+        referenceGroupFilter = this.value === '*' ? null : this.value;
+        renderReferencesTab();
+    });
     $('#stsc_manager_overlay').on('change', '#stsc_update_notices_enabled', function () {
         getUiSettings().updateNotice.enabled = this.checked;
         markDirty();
@@ -5398,6 +5569,17 @@ function bindUiEvents() {
         const reference = getUiSettings().references.find(x => x.id === id);
         if (!reference) return;
         const field = $(this).data('reference-field');
+
+        if (field === 'groupId') {
+            if (event.type !== 'change') return;
+            try {
+                if (moveReferencesToGroup([id], this.value)) {
+                    markDirty();
+                    renderReferencesTab();
+                }
+            } catch (error) { toastr.warning(error.message, '墨提斯之镜'); }
+            return;
+        }
 
         if (field === 'name') {
             const nextName = String(this.value || '').trim();
@@ -5891,10 +6073,7 @@ function bindUiEvents() {
             if (index >= 0 && index < preset.questions.length - 1 && action === 'move-question-down') [preset.questions[index + 1], preset.questions[index]] = [preset.questions[index], preset.questions[index + 1]];
         } else if (action === 'move-reference-up' || action === 'move-reference-down') {
             const id = $(this).closest('[data-reference-id]').data('reference-id');
-            const index = settings.references.findIndex(item => item.id === id);
-            const next = index + (action === 'move-reference-up' ? -1 : 1);
-            if (index < 0 || next < 0 || next >= settings.references.length) return;
-            [settings.references[index], settings.references[next]] = [settings.references[next], settings.references[index]];
+            if (!moveReferenceInGroup(id, action === 'move-reference-up' ? -1 : 1, settings)) return;
         } else if (action === 'export-reference') {
             const id = $(this).closest('[data-reference-id]').data('reference-id');
             const reference = settings.references.find(item => item.id === id);
@@ -6172,7 +6351,10 @@ function bindUiEvents() {
                 return;
             }
             const reference = createReference(name, type);
+            const groupId = String($('#stsc_new_reference_group').val() || '');
+            if (referenceGroupsForUi(settings).some(group => group.id === groupId)) reference.groupId = groupId;
             settings.references.push(reference);
+            revealReferenceGroup(reference.id, settings);
             markDirty();
             closeDialog();
             renderAll();
