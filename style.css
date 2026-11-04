@@ -1874,6 +1874,22 @@ body.stsc-modal-open {
   font-size: 0.78rem;
 }
 
+#stsc_manager_overlay .stsc-manager-instruction-mode {
+  flex: 0 0 112px;
+  width: 112px;
+  min-width: 0;
+  max-width: 42%;
+  margin: 0;
+  padding: 5px 4px;
+  font-size: .82rem;
+  cursor: pointer;
+}
+
+#stsc_manager_overlay .stsc-manager-instruction-mode option {
+  color: var(--SmartThemeBodyColor, #ddd);
+  background: var(--SmartThemeBlurTintColor, #26282c);
+}
+
 .stsc-instruction-mode-always {
   color: #8ee0a7;
 }

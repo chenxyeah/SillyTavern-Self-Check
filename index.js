@@ -10,7 +10,7 @@ import {
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.14';
+const STSC_VERSION = '0.4.15';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -46,12 +46,12 @@ const STSC_REMOTE_RELEASE_URLS = Object.freeze([
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-10-31',
-    title: '参考资料库分组管理',
+    releasedAt: '2026-11-04',
+    title: '快捷指令管理器直接开关',
     changes: Object.freeze([
-        '参考资料库新增默认分组与自定义分组，支持创建、改名、筛选和折叠。',
-        '支持批量移入及单条切换分组；删除分组只将资料移回默认分组，不删除原资料。',
-        '分组操作不改变启用状态、发送顺序或资料方案与角色绑定，点击保存更改后长期保留。',
+        '快捷指令库右侧可直接切换关闭、临时一轮或常开，无需打开悬浮窗。',
+        '管理器中的切换点击保存更改后生效；悬浮窗仍支持立即切换并保存。',
+        '保留临时一轮的自动关闭与草稿保护，不改变已经开始的请求，也不增加API调用。',
     ]),
 });
 
@@ -915,6 +915,20 @@ function setInstructionActivation(id, mode) {
     renderStatusTab();
     renderTemporaryTab();
     renderFloating();
+    return true;
+}
+
+function setDraftInstructionActivation(id, mode) {
+    const settings = getUiSettings();
+    const instruction = settings.temporaryInstructions.find(item => item.id === id);
+    if (!instruction || !['off', 'once', 'always'].includes(mode)) return false;
+    if (mode !== 'off' && !String(instruction.content || '').trim()) {
+        toastr.warning('请先填写这条快捷指令的内容，再选择启用方式。', '墨提斯之镜');
+        return false;
+    }
+    if (instructionActivationMode(id, settings) === mode) return true;
+    applyInstructionActivation(settings, id, mode);
+    markDirty();
     return true;
 }
 
@@ -2017,8 +2031,10 @@ function getSelectedTemporaryInstructions({ consume = false, settings = null } =
         }));
 
     if (consume && settings.pendingInstructionIds.length) {
+        const consumed = new Set(settings.pendingInstructionIds);
         settings.pendingInstructionIds = [];
-        if (editDraft) editDraft.pendingInstructionIds = [];
+        // A saved one-shot may finish while unrelated one-shots are still being drafted.
+        if (editDraft) editDraft.pendingInstructionIds = editDraft.pendingInstructionIds.filter(id => !consumed.has(id));
         saveSettings();
         renderAll();
     }
@@ -4069,12 +4085,16 @@ function renderTemporaryTab() {
                         <span class="stsc-collapse-chevron" aria-hidden="true">${expanded ? '▾' : '▸'}</span>
                         <span class="stsc-temp-summary-text"><b>${escapeHtml(instruction.name)}</b><span>${escapeHtml(preview)}</span></span>
                     </button>
-                    <span class="stsc-status-pill stsc-instruction-mode-${mode}">${escapeHtml(instructionActivationLabel(mode))}</span>
+                    <select class="text_pole stsc-manager-instruction-mode stsc-instruction-mode-${mode}" data-manager-instruction-mode aria-label="${escapeHtml(instruction.name)}的启用方式（保存后生效）" title="保存更改后生效">
+                        <option value="off" ${mode === 'off' ? 'selected' : ''}>关闭</option>
+                        <option value="once" ${mode === 'once' ? 'selected' : ''}>临时一轮</option>
+                        <option value="always" ${mode === 'always' ? 'selected' : ''}>常开</option>
+                    </select>
                 </div>
                 <div class="stsc-temp-body stsc-collapsible-body">
                     <div class="stsc-field"><label>指令名称</label><input class="text_pole" data-temp-field="name" type="text" value="${escapeHtml(instruction.name)}"></div>
                     <div class="stsc-field" style="margin-top:8px"><label>发送给 AI 的指令内容</label><textarea class="text_pole stsc-textarea" data-temp-field="content">${escapeHtml(instruction.content)}</textarea></div>
-                    <div class="stsc-muted" style="margin-top:8px">启用方式请在悬浮窗的“快捷指令”页面选择：临时一轮会在下一次生成开始后自动关闭，常开会每轮持续注入。</div>
+                    <div class="stsc-muted" style="margin-top:8px">可在本条右侧直接选择关闭、临时一轮或常开，点击顶部“保存更改”后生效。临时一轮在下一次生成开始后自动关闭；常开持续用于之后的生成，不改变已经开始的本轮请求。</div>
                     <div class="stsc-card-actions stsc-collapsible-actions">
                         <button class="menu_button stsc-small-button stsc-danger-button stsc-icon-action" type="button" data-action="delete-temp" title="删除指令" aria-label="删除指令"><i class="fa-solid fa-trash-can"></i><span class="stsc-action-label">删除指令</span></button>
                     </div>
@@ -4086,7 +4106,7 @@ function renderTemporaryTab() {
     $('#stsc_tab_temporary').html(`
         <div class="stsc-section">
             <div class="stsc-section-title">快捷指令库</div>
-            <div class="stsc-muted">在完整管理器中创建和编辑指令；在悬浮窗的“快捷指令”页面选择关闭、临时一轮或常开。所有指令默认折叠，点击横条即可展开。</div>
+            <div class="stsc-muted">直接在每条指令右侧选择关闭、临时一轮或常开，无需打开悬浮窗；修改后点击顶部“保存更改”。悬浮窗仍可快捷切换并立即保存状态。点击横条展开编辑内容。</div>
             <div class="stsc-toolbar" style="margin-top:9px">
                 <button class="menu_button" data-action="add-temp">＋ 新建快捷指令</button>
             </div>
@@ -5646,6 +5666,15 @@ function bindUiEvents() {
         markDirty();
         renderCompact();
         renderManagerSubtitle();
+    });
+
+    $('#stsc_manager_overlay').on('change', '[data-manager-instruction-mode]', function () {
+        const id = $(this).closest('[data-temp-id]').data('temp-id');
+        const previous = instructionActivationMode(id, getUiSettings());
+        if (!setDraftInstructionActivation(id, this.value)) this.value = previous;
+        const mode = instructionActivationMode(id, getUiSettings());
+        $(this).removeClass('stsc-instruction-mode-off stsc-instruction-mode-once stsc-instruction-mode-always')
+            .addClass(`stsc-instruction-mode-${mode}`);
     });
 
     $('#stsc_manager_overlay').on('input change', '[data-temp-field]', function () {

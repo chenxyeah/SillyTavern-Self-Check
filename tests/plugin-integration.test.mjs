@@ -62,6 +62,7 @@ function plugin() {
         dialogAction(action, data = {}) { return events.get('click:[data-dialog-action]').call({ data: { 'dialog-action': action, ...data } }); },
         planAction(action, referenceId) { return events.get('click:[data-plan-action]').call({ data: { 'plan-action': action, 'plan-reference-id': referenceId } }); },
         groupAction(action, id = '') { return events.get('click:[data-reference-group-action]').call({data:{'reference-group-action':action,'group-id':id}}); },
+        managerInstruction(id, value) { const element={value,data:{'temp-id':id}}; events.get('change:[data-manager-instruction-mode]').call(element); return element.value; },
         planField(field, referenceId, checked) { return events.get('change:[data-plan-field]').call({ checked, data: { 'plan-field': field, 'plan-reference-id': referenceId } }); }
     };
 }
@@ -691,6 +692,107 @@ test('single and dual reply processing preserve trailing code fences in message 
     }
 });
 
+function instructionApp() {
+    const app = plugin();
+    app.run(`ctx().extensionSettings[STSC_MODULE]=clone(DEFAULT_SETTINGS);
+        normalizeSettings().temporaryInstructions=[
+            {id:'a',name:'第一条',content:'FIRST_CONTENT'},
+            {id:'b',name:'第二条',content:'SECOND_CONTENT'},
+            {id:'empty',name:'<img onerror=x>',content:'   '}
+        ];beginEditSession();`);
+    return app;
+}
+
+test('manager has directly usable off/once/always selector even when instruction cards are collapsed', () => {
+    const app = instructionApp();
+    app.run('renderTemporaryTab()');
+    const markup=app.html['#stsc_tab_temporary'];
+    assert.equal((markup.match(/data-manager-instruction-mode/g)||[]).length,3);
+    assert.ok(markup.includes('is-collapsed'));
+    for(const mode of ['off','once','always']) assert.ok(markup.includes('value="'+mode+'"'));
+    assert.ok(markup.indexOf('data-manager-instruction-mode')<markup.indexOf('stsc-temp-body'));
+    assert.ok(markup.includes('保存后生效'));
+    assert.ok(markup.includes('无需打开悬浮窗'));
+    assert.ok(markup.includes('&lt;img onerror=x&gt;'));
+    assert.ok(!markup.includes('<img'));
+    assert.equal(app.requestBodies.length,0);
+});
+
+test('manager activation stays in draft, saves/reopens and never enables floating button or overwrites other content', () => {
+    const app = instructionApp();
+    app.run("editDraft.dualApi.model='UNSAVED_MODEL';editDraft.temporaryInstructions[0].content='EDITED_CONTENT'");
+    for(const mode of ['always','once','off','always']) {
+        assert.equal(app.managerInstruction('a',mode),mode);
+        assert.equal(app.run("instructionActivationMode('a',editDraft)"),mode);
+        assert.equal(app.run("instructionActivationMode('a',normalizeSettings())"),'off');
+        assert.equal(app.run('editDraft.temporaryInstructions[0].content'),'EDITED_CONTENT');
+        assert.equal(app.run('editDraft.dualApi.model'),'UNSAVED_MODEL');
+    }
+    assert.equal(app.run('editDirty'),true);
+    assert.equal(app.run('normalizeSettings().appearance.floatingEnabled'),false);
+    app.run('applyTheme=renderAll=refreshPluginUpdateNotice=()=>{};commitEditDraft({notify:false});beginEditSession()');
+    assert.equal(app.run("instructionActivationMode('a',normalizeSettings())"),'always');
+    assert.equal(app.run("instructionActivationMode('a',editDraft)"),'always');
+    app.run('renderFloatingInstructionPage()');
+    assert.ok(app.html['#stsc_floating_content'].includes('data-floating-temp-id="a" data-activation="always"'));
+    assert.equal(app.run('editDirty'),false);
+    assert.equal(app.requestBodies.length,0);
+});
+
+test('discard reverses manager activation and leaves saved floating state unchanged', () => {
+    const app = instructionApp();
+    app.run("applyInstructionActivation(normalizeSettings(),'a','always');beginEditSession();applyTheme=renderAll=()=>{}");
+    app.managerInstruction('a','off');
+    assert.equal(app.run("instructionActivationMode('a',editDraft)"),'off');
+    app.run('discardEditDraft()');
+    assert.equal(app.run("instructionActivationMode('a',editDraft)"),'always');
+    assert.equal(app.run("instructionActivationMode('a',normalizeSettings())"),'always');
+    assert.equal(app.run('editDirty'),false);
+});
+
+test('manager rejects empty, unknown and invalid activation without arming unusable instructions', () => {
+    const app = instructionApp();
+    for(const mode of ['once','always']) assert.equal(app.managerInstruction('empty',mode),'off');
+    assert.equal(app.run('editDirty'),false);
+    assert.equal(app.run("setDraftInstructionActivation('missing','once')"),false);
+    assert.equal(app.run("setDraftInstructionActivation('a','invalid')"),false);
+    assert.equal(app.run('editDraft.pendingInstructionIds.length+editDraft.persistentInstructionIds.length'),0);
+    app.run("editDraft.temporaryInstructions.push({id:'new',name:'新建',content:'NEW_CONTENT'})");
+    app.managerInstruction('new','once');
+    assert.equal(app.run("instructionActivationMode('new',editDraft)"),'once');
+    assert.equal(app.run("getSelectedTemporaryInstructions().length"),0);
+});
+
+test('saved once from manager is consumed once and does not erase unrelated unsaved once or rearm on later save', () => {
+    const app = instructionApp();
+    app.run('applyTheme=renderAll=refreshPluginUpdateNotice=()=>{}');
+    app.managerInstruction('a','once');
+    app.run('commitEditDraft({notify:false})');
+    app.managerInstruction('b','once');
+    assert.equal(app.run('getSelectedTemporaryInstructions({consume:true}).map(x=>x.id).join(",")'),'a');
+    assert.equal(app.run("instructionActivationMode('a',normalizeSettings())"),'off');
+    assert.equal(app.run("instructionActivationMode('a',editDraft)"),'off');
+    assert.equal(app.run("instructionActivationMode('b',editDraft)"),'once');
+    assert.equal(app.run('getSelectedTemporaryInstructions().length'),0);
+    app.run('commitEditDraft({notify:false})');
+    assert.equal(app.run('getSelectedTemporaryInstructions({consume:true}).map(x=>x.id).join(",")'),'b');
+    assert.equal(app.run('getSelectedTemporaryInstructions({consume:true}).length'),0);
+});
+
+test('floating immediate mode updates manager draft without saving unrelated edits or losing dirty state', () => {
+    const app = instructionApp();
+    app.run("editDraft.temporaryInstructions[1].content='UNSAVED_CONTENT';markDirty()");
+    app.managerInstruction('a','once');
+    app.run("setInstructionActivation('a','always')");
+    assert.equal(app.run("instructionActivationMode('a',editDraft)"),'always');
+    assert.equal(app.run("instructionActivationMode('a',normalizeSettings())"),'always');
+    assert.equal(app.run('editDraft.temporaryInstructions[1].content'),'UNSAVED_CONTENT');
+    assert.equal(app.run('normalizeSettings().temporaryInstructions[1].content'),'SECOND_CONTENT');
+    assert.equal(app.run('editDirty'),true);
+    assert.ok(app.html['#stsc_tab_temporary'].includes('stsc-manager-instruction-mode stsc-instruction-mode-always'));
+    assert.equal(app.requestBodies.length,0);
+});
+
 test('floating instruction cards reflect saved activation states, not an unsaved draft', () => {
     const app = plugin();
     app.run(`runtimeForFloating = clone(DEFAULT_SETTINGS);
@@ -742,10 +844,10 @@ test('empty floating instructions stay disabled and instruction names remain esc
     assert.equal(app.run("setInstructionActivation('empty', 'always')"), false);
 });
 
-test('version/identity are formal v0.4.14; release metadata and UI stay in sync', () => {
+test('version/identity are formal v0.4.15; release metadata and UI stay in sync', () => {
     const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url)));
     const release = JSON.parse(readFileSync(new URL('../version.json', import.meta.url)));
-    assert.equal(manifest.version, '0.4.14');
+    assert.equal(manifest.version, '0.4.15');
     assert.equal(release.version, manifest.version);
     assert.equal(manifest.homePage, 'https://github.com/chenxyeah/SillyTavern-Self-Check');
     const app = plugin();
