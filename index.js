@@ -10,7 +10,7 @@ import {
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.15';
+const STSC_VERSION = '0.4.16';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -46,12 +46,12 @@ const STSC_REMOTE_RELEASE_URLS = Object.freeze([
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-11-04',
-    title: '快捷指令管理器直接开关',
+    releasedAt: '2026-11-06',
+    title: '从预设与世界书导入参考资料',
     changes: Object.freeze([
-        '快捷指令库右侧可直接切换关闭、临时一轮或常开，无需打开悬浮窗。',
-        '管理器中的切换点击保存更改后生效；悬浮窗仍支持立即切换并保存。',
-        '保留临时一轮的自动关闭与草稿保护，不改变已经开始的请求，也不增加API调用。',
+        '参考资料库新增导入入口，可以从当前聊天补全预设或指定的一本世界书搜索并勾选条目。',
+        '所选条目分别复制为独立资料，归入默认分组并保持关闭，点击保存更改后保留。',
+        '不改动原预设或世界书，不继承触发规则，不生成自检题，也不调用模型。',
     ]),
 });
 
@@ -204,6 +204,7 @@ let expandedReferenceIds = new Set();
 let collapsedReferenceGroupIds = new Set();
 let referenceGroupFilter = null; // null = all groups; '' = the permanent default group.
 let referencePlanDialogState = null;
+let referenceSourceDialogState = null;
 let errorHelpState = null;
 let expandedQuestionIds = new Set();
 let expandedInstructionIds = new Set();
@@ -4062,6 +4063,7 @@ function renderReferencesTab() {
                 <button class="menu_button stsc-compact-action" type="button" data-action="open-create-reference" title="新建资料库" aria-label="新建资料库"><i class="fa-solid fa-plus"></i><span class="stsc-action-label">新建资料库</span></button>
                 <button class="menu_button stsc-compact-action" type="button" data-action="batch-export-references" title="批量导出资料库" aria-label="批量导出资料库" ${settings.references.length ? '' : 'disabled'}><i class="fa-solid fa-box-archive"></i><span class="stsc-action-label">批量导出</span></button>
                 <button class="menu_button stsc-compact-action" type="button" data-action="import-reference" title="导入资料库或资料库合集" aria-label="导入资料库或资料库合集"><i class="fa-solid fa-file-import"></i><span class="stsc-action-label">导入资料库</span></button>
+                <button class="menu_button" type="button" data-action="import-reference-source">从预设／世界书导入</button>
                 <input id="stsc_reference_import_file" class="stsc-file-input" type="file" accept=".json,.stsc-reference.json,.stsc-references.json,application/json" aria-label="选择要导入的参考资料库文件或合集文件">
             </div>
             <div class="stsc-muted" style="margin-top:8px">支持导入单个资料库或一次导入整个资料库合集。导入内容默认保持关闭，角色绑定不会随文件导入；请展开检查后再手动启用。</div>
@@ -4834,6 +4836,7 @@ function closeManager() {
 function openDialog(title, bodyHtml, footerHtml = '') {
     errorHelpState = null;
     referencePlanDialogState = null;
+    referenceSourceDialogState = null;
     $('#stsc_dialog_title').text(title || '操作');
     $('#stsc_dialog_body').html(bodyHtml || '');
     $('#stsc_dialog_footer').html(footerHtml || '');
@@ -4844,6 +4847,7 @@ function openDialog(title, bodyHtml, footerHtml = '') {
 function closeDialog() {
     errorHelpState = null;
     referencePlanDialogState = null;
+    referenceSourceDialogState = null;
     const hadPendingUnsavedAction = Boolean(pendingUnsavedAction);
     bulkDraft = null;
     pendingUnsavedAction = null;
@@ -5266,6 +5270,138 @@ async function importReferenceFile(file) {
         console.warn('[STSC] 导入参考资料库失败：', error);
         toastr.error(`格式不匹配，文件错误或不是本插件导出的参考资料库。${error?.message ? ` ${error.message}` : ''}`, '墨提斯之镜', { timeOut: 7000 });
     }
+}
+
+function readCurrentPresetReferenceEntries(context) {
+    const settings = context?.chatCompletionSettings;
+    if ((context?.mainApi && context.mainApi !== 'openai') || !Array.isArray(settings?.prompts)) return null;
+    // SillyTavern uses global prompt order (dummy character 100001) for Chat Completion.
+    const order = Array.isArray(settings.prompt_order)
+        ? settings.prompt_order.find(item => String(item?.character_id) === '100001')?.order : null;
+    const orderById = new Map(Array.isArray(order) ? order.filter(item => item?.identifier).map((item, index) => [item.identifier, { index, enabled: item.enabled }]) : []);
+    const entries = settings.prompts
+        .filter(item => !item?.marker && typeof item?.content === 'string' && item.content.trim())
+        .map((item, index) => ({
+            name: typeof item.name === 'string' && item.name.trim() ? item.name.trim() : `预设条目 ${index + 1}`,
+            content: item.content,
+            disabled: item.enabled === false || (Array.isArray(order) && orderById.get(item.identifier)?.enabled !== true),
+            order: orderById.get(item.identifier)?.index ?? Infinity,
+        })).sort((a, b) => a.order - b.order);
+    return { name: typeof settings.preset_settings_openai === 'string' ? settings.preset_settings_openai : '', entries };
+}
+
+function listReferenceSourceWorldBooks(context) {
+    // Older SillyTavern builds expose the same names in the world editor selector.
+    const names = typeof context?.getWorldInfoNames === 'function'
+        ? context.getWorldInfoNames()
+        : Array.from(document.getElementById('world_editor_select')?.options || [])
+            .filter(option => option.value !== '').map(option => option.textContent);
+    return [...new Set(Array.isArray(names) ? names.filter(name => typeof name === 'string' && name.trim()) : [])];
+}
+
+function readWorldReferenceEntries(book) {
+    if (!book?.entries || typeof book.entries !== 'object') return [];
+    return Object.values(book.entries)
+        .filter(item => typeof item?.content === 'string' && item.content.trim())
+        .map((item, index) => ({
+            name: (typeof item.comment === 'string' && item.comment.trim())
+                || (Array.isArray(item.key) && item.key.filter(key => typeof key === 'string' && key.trim()).join('、'))
+                || `世界书条目 ${index + 1}`,
+            content: item.content,
+            disabled: item.disable === true,
+            order: Number.isFinite(item.displayIndex) ? item.displayIndex : Infinity,
+        })).sort((a, b) => a.order - b.order);
+}
+
+function renderReferenceSourceDialog(state) {
+    const items = state.entries.map((entry, index) => {
+        const preview = entry.content.trim();
+        return `<label class="stsc-batch-reference-item" data-reference-source-row="${index}">
+            <input type="checkbox" data-reference-source-entry="${index}" ${state.selected.has(index) ? 'checked' : ''}>
+            <span class="stsc-batch-reference-main"><b>${escapeHtml(entry.name)}</b>
+                ${entry.disabled ? '<span>原条目已关闭或未启用</span>' : ''}
+                <span class="stsc-reference-source-preview">${escapeHtml(preview.slice(0, 300))}${preview.length > 300 ? '…' : ''}</span>
+            </span></label>`;
+    }).join('');
+    openDialog('从预设／世界书导入',
+        `<div class="stsc-field"><label for="stsc_reference_source_kind">导入来源</label>
+            <select id="stsc_reference_source_kind" class="text_pole">
+                <option value="preset" ${state.source === 'preset' ? 'selected' : ''}>当前酒馆预设</option>
+                <option value="world" ${state.source === 'world' ? 'selected' : ''}>世界书</option>
+            </select></div>
+        ${state.source === 'world' ? `<div class="stsc-field"><label for="stsc_reference_source_book">选择世界书</label>
+            <select id="stsc_reference_source_book" class="text_pole">
+                <option value="">请选择一本世界书</option>
+                ${state.books.map((name, index) => `<option value="${index}" ${state.bookIndex === index ? 'selected' : ''}>${escapeHtml(name)}</option>`).join('')}
+            </select></div>` : `<div class="stsc-muted">当前预设：${escapeHtml(state.name || '未命名／不可用')}</div>`}
+        <div class="stsc-muted">只复制名称和正文，导入为独立资料，归入默认分组并保持关闭。不修改原预设或世界书，不继承触发规则，也不生成自检问题。</div>
+        ${items ? `<div class="stsc-batch-reference-tools">
+            <input id="stsc_reference_source_search" class="text_pole" type="search" placeholder="搜索条目名称或正文" aria-label="搜索条目名称或正文">
+            <span id="stsc_reference_source_count" class="stsc-muted" aria-live="polite">已选择 ${state.selected.size} 条</span>
+            </div><div id="stsc_reference_source_items" class="stsc-batch-reference-list">${items}</div>`
+            : `<div class="stsc-empty" role="status">${escapeHtml(state.message)}</div>`}
+        ${state.failed ? '<button class="menu_button" type="button" data-dialog-action="retry-reference-source-book">重试读取</button>' : ''}`,
+        '<button class="menu_button" type="button" data-dialog-action="cancel">取消</button>'
+        + `<button class="menu_button stsc-primary-button" type="button" data-dialog-action="confirm-reference-source" ${state.selected.size ? '' : 'disabled'}>确认导入</button>`);
+    referenceSourceDialogState = state;
+    $('#stsc_dialog_body').scrollTop(0);
+}
+
+function openReferenceSourceDialog(source = 'preset') {
+    const state = { source, books: [], bookIndex: -1, name: '', entries: [], selected: new Set(), message: '' };
+    try {
+        const context = ctx();
+        if (source === 'world') {
+            state.books = listReferenceSourceWorldBooks(context);
+            state.message = state.books.length ? '请先选择一本世界书。切换世界书会清空当前勾选。' : '没有可读取的世界书。';
+        } else {
+            const preset = readCurrentPresetReferenceEntries(context);
+            if (preset) Object.assign(state, preset);
+            state.message = preset ? '当前预设没有可复制的正文条目。' : '未能读取当前聊天补全预设，仍可切换至世界书导入。';
+        }
+    } catch {
+        state.message = '读取来源失败，请关闭窗口后重试。';
+    }
+    renderReferenceSourceDialog(state);
+}
+
+async function selectReferenceSourceBook(value) {
+    const state = referenceSourceDialogState;
+    if (state?.source !== 'world') return;
+    const index = value === '' ? -1 : Number(value);
+    const name = Number.isInteger(index) && index >= 0 ? state.books[index] : null;
+    const request = {};
+    Object.assign(state, { request, bookIndex: name ? index : -1, entries: [], selected: new Set(), failed: false,
+        message: name ? '正在读取世界书条目…' : '请先选择一本世界书。' });
+    renderReferenceSourceDialog(state);
+    if (!name) return;
+    try {
+        const book = await ctx()?.loadWorldInfo?.(name);
+        if (!book) throw new Error('World book unavailable');
+        if (referenceSourceDialogState !== state || state.request !== request) return;
+        state.entries = readWorldReferenceEntries(book);
+        state.message = '这本世界书没有可复制的正文条目。';
+    } catch {
+        if (referenceSourceDialogState !== state || state.request !== request) return;
+        state.failed = true;
+        state.message = '读取世界书失败，请重试或选择其他世界书。';
+    }
+    renderReferenceSourceDialog(state);
+}
+
+function confirmReferenceSourceImport() {
+    const state = referenceSourceDialogState;
+    if (!state?.selected.size || !editDraft) return;
+    const entries = state.entries.filter((_, index) => state.selected.has(index));
+    for (const entry of entries) {
+        editDraft.references.push({ ...createReference(makeUniqueReferenceName(entry.name)), content: entry.content, enabled: false });
+    }
+    if (!entries.length) return;
+    revealReferenceGroup('', editDraft);
+    markDirty();
+    closeDialog();
+    renderReferencesTab();
+    toastr.success(`已导入 ${entries.length} 条资料。请点击顶部“保存更改”。`, '墨提斯之镜');
 }
 
 function openCreatePresetDialog(kind) {
@@ -5978,6 +6114,9 @@ function bindUiEvents() {
         } else if (action === 'open-extension-manager') {
             openVersionDialog();
             return;
+        } else if (action === 'import-reference-source') {
+            openReferenceSourceDialog();
+            return;
         } else if (action === 'import-reference') {
             const input = document.getElementById('stsc_reference_import_file');
             if (input) {
@@ -6182,6 +6321,34 @@ function bindUiEvents() {
         $('#stsc_batch_reference_count').text(`已选择 ${count} 个`);
     });
 
+    $('#stsc_dialog_overlay').on('change', '#stsc_reference_source_kind', function () {
+        if (referenceSourceDialogState) openReferenceSourceDialog(this.value === 'world' ? 'world' : 'preset');
+    });
+
+    $('#stsc_dialog_overlay').on('change', '#stsc_reference_source_book', function () {
+        return selectReferenceSourceBook(this.value);
+    });
+
+    $('#stsc_dialog_overlay').on('change', '[data-reference-source-entry]', function () {
+        const state = referenceSourceDialogState;
+        const index = Number(this.dataset.referenceSourceEntry);
+        if (!state?.entries[index]) return;
+        if (this.checked) state.selected.add(index);
+        else state.selected.delete(index);
+        $('#stsc_reference_source_count').text(`已选择 ${state.selected.size} 条`);
+        $('#stsc_dialog_footer [data-dialog-action="confirm-reference-source"]').prop('disabled', !state.selected.size);
+    });
+
+    $('#stsc_dialog_overlay').on('input', '#stsc_reference_source_search', function () {
+        const state = referenceSourceDialogState;
+        if (!state) return;
+        const query = this.value.trim().toLowerCase();
+        document.getElementById('stsc_reference_source_items')?.querySelectorAll('[data-reference-source-row]').forEach(row => {
+            const entry = state.entries[Number(row.dataset.referenceSourceRow)];
+            row.hidden = Boolean(entry && query && !entry.name.toLowerCase().includes(query) && !entry.content.toLowerCase().includes(query));
+        });
+    });
+
     $('#stsc_dialog_overlay').on('input', '#stsc_bulk_raw', function () {
         if (bulkDraft) bulkDraft.raw = this.value;
     });
@@ -6209,6 +6376,13 @@ function bindUiEvents() {
     $('#stsc_dialog_overlay').on('click', '[data-dialog-action]', function () {
         const action = $(this).data('dialog-action');
         const settings = getUiSettings();
+
+        if (action === 'confirm-reference-source') return confirmReferenceSourceImport();
+        if (action === 'retry-reference-source-book') {
+            const state = referenceSourceDialogState;
+            if (state?.failed) return selectReferenceSourceBook(String(state.bookIndex));
+            return;
+        }
 
         if (action === 'confirm-import-dev-settings' || action === 'confirm-restore-dev-migration') {
             const restore = action === 'confirm-restore-dev-migration';

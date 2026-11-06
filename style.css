@@ -2335,6 +2335,14 @@ body.stsc-modal-open {
   border-color: color-mix(in srgb, var(--stsc-accent) 45%, var(--stsc-border));
 }
 
+[data-reference-source-row][hidden] {
+  display: none;
+}
+
+.stsc-reference-source-preview {
+  white-space: pre-wrap;
+}
+
 .stsc-batch-reference-item input {
   margin-top: 3px;
   flex: 0 0 auto;

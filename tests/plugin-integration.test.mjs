@@ -62,6 +62,7 @@ function plugin() {
         dialogAction(action, data = {}) { return events.get('click:[data-dialog-action]').call({ data: { 'dialog-action': action, ...data } }); },
         planAction(action, referenceId) { return events.get('click:[data-plan-action]').call({ data: { 'plan-action': action, 'plan-reference-id': referenceId } }); },
         groupAction(action, id = '') { return events.get('click:[data-reference-group-action]').call({data:{'reference-group-action':action,'group-id':id}}); },
+        sourceEntry(index, checked) { return events.get('change:[data-reference-source-entry]').call({ dataset: { referenceSourceEntry: String(index) }, checked }); },
         managerInstruction(id, value) { const element={value,data:{'temp-id':id}}; events.get('change:[data-manager-instruction-mode]').call(element); return element.value; },
         planField(field, referenceId, checked) { return events.get('change:[data-plan-field]').call({ checked, data: { 'plan-field': field, 'plan-reference-id': referenceId } }); }
     };
@@ -72,6 +73,160 @@ function groupApp() {
     app.run(`editDraft.references=['a','b','c'].map(id=>({...createReference('资料'+id),id,content:'CONTENT-'+id,addToCheck:true}));`);
     return app;
 }
+
+function referenceSourceApp() {
+    const app = plugin();
+    app.st.mainApi = 'openai';
+    app.st.chatCompletionSettings = {
+        preset_settings_openai: '<我的预设>',
+        prompts: [
+            { identifier: 'a', name: '<描写风格>', content: '  保留原文 {{char}}\n\n第二段  ' },
+            { identifier: 'b', name: '节奏', content: '对话不要堆叠' },
+            { identifier: 'marker', name: '动态占位', marker: true, content: '不是可复制条目' },
+            { identifier: 'blank', content: '  ' },
+            { identifier: 'c', content: '未列入提示顺序' },
+        ],
+        prompt_order: [{ character_id: 100001, order: [{ identifier: 'b', enabled: false }, { identifier: 'a', enabled: true }] }],
+    };
+    return app;
+}
+
+test('reference library entry reads the live chat completion preset and offers disabled text without markers', async () => {
+    const app = referenceSourceApp();
+    app.run('renderReferencesTab(); renderPresetsTab()');
+    assert.match(app.html['#stsc_tab_references'], /data-action="import-reference-source"/);
+    assert.doesNotMatch(app.html['#stsc_tab_presets'], /import-reference-source/);
+    await app.action('import-reference-source');
+    const body = app.html['#stsc_dialog_body'];
+    assert.match(body, /&lt;我的预设&gt;/);
+    assert.match(body, /&lt;描写风格&gt;/);
+    assert.doesNotMatch(body, /动态占位|不是可复制条目/);
+    assert.equal(app.run('JSON.stringify(referenceSourceDialogState.entries.map(item => [item.name, item.disabled]))'),
+        JSON.stringify([['节奏', true], ['<描写风格>', false], ['预设条目 3', true]]));
+    assert.equal(app.run('referenceSourceDialogState.selected.size'), 0);
+    assert.match(app.html['#stsc_dialog_footer'], /confirm-reference-source" disabled/);
+    assert.equal(app.requestBodies.length, 0);
+});
+
+test('selected preset entries are independent disabled draft copies in the default group, without questions or overwrite', async () => {
+    const app = referenceSourceApp();
+    const original = JSON.stringify(app.st.chatCompletionSettings);
+    app.run(`editDraft.references.push({...createReference('节奏'),content:'旧正文'});
+        g=setReferenceGroupName('别的分组');referenceGroupFilter=g.id;collapsedReferenceGroupIds.add('');
+        applyTheme=renderAll=refreshPluginUpdateNotice=()=>{};`);
+    const presetsBefore = app.run('JSON.stringify([editDraft.generalPresets, editDraft.characterPresets])');
+    await app.action('import-reference-source');
+    app.sourceEntry(2, true);
+    app.sourceEntry(2, false);
+    app.sourceEntry(1, true);
+    app.sourceEntry(0, true);
+    app.dialogAction('confirm-reference-source');
+    assert.equal(app.run('JSON.stringify(editDraft.references.map(r=>[r.name,r.content,r.groupId,r.enabled,r.addToCheck]))'), JSON.stringify([
+        ['节奏', '旧正文', '', true, false], ['节奏 2', '对话不要堆叠', '', false, false],
+        ['<描写风格>', '  保留原文 {{char}}\n\n第二段  ', '', false, false],
+    ]));
+    assert.equal(app.run('JSON.stringify([editDraft.generalPresets, editDraft.characterPresets])'), presetsBefore);
+    assert.equal(app.run('referenceGroupFilter'), null);
+    assert.equal(app.run("collapsedReferenceGroupIds.has('')"), false);
+    assert.equal(app.run('normalizeSettings().references.length'), 0);
+    assert.equal(app.run('editDirty'), true);
+    assert.equal(JSON.stringify(app.st.chatCompletionSettings), original);
+    app.run('commitEditDraft({notify:false});beginEditSession()');
+    assert.equal(app.run('editDraft.references.length'), 3);
+    assert.equal(app.run('getActiveReferences().some(r=>r.name==="节奏 2")'), false);
+    assert.equal(app.requestBodies.length, 0);
+});
+
+test('world source lists books, reads only the selected book and imports only selected text', async () => {
+    const app = referenceSourceApp();
+    const reads = [];
+    const book = { entries: {
+        0: { comment: '第二条', content: '不会导入的文本', displayIndex: 2 },
+        1: { comment: ' ', key: ['<词>'], content: '原始正文', disable: true, constant: true, position: 9, displayIndex: 1 },
+        2: { comment: '空正文', content: '  ' },
+    } };
+    const original = JSON.stringify(book);
+    app.st.getWorldInfoNames = () => ['<书甲>', '书乙', '书乙'];
+    app.st.loadWorldInfo = async name => { reads.push(name); return book; };
+    await app.action('import-reference-source');
+    app.event('change', '#stsc_reference_source_kind', 'world');
+    assert.match(app.html['#stsc_dialog_body'], /&lt;书甲&gt;/);
+    assert.deepEqual(reads, []);
+    await app.event('change', '#stsc_reference_source_book', '1');
+    assert.deepEqual(reads, ['书乙']);
+    assert.match(app.html['#stsc_dialog_body'], /&lt;词&gt;/);
+    assert.match(app.html['#stsc_dialog_body'], /原条目已关闭/);
+    assert.doesNotMatch(app.html['#stsc_dialog_body'], /空正文/);
+    app.sourceEntry(0, true);
+    app.dialogAction('confirm-reference-source');
+    assert.equal(app.run('editDraft.references.length'), 1);
+    assert.equal(app.run('JSON.stringify(editDraft.references.map(r=>[r.name,r.content,r.groupId,r.enabled,r.addToCheck,r.type]))'),
+        JSON.stringify([['<词>', '原始正文', '', false, false, 'other']]));
+    assert.equal(app.run("Object.hasOwn(editDraft.references[0],'constant')"), false);
+    assert.equal(JSON.stringify(book), original);
+});
+
+test('older host world selector fallback works when the current backend has no prompt entries', async () => {
+    const app = referenceSourceApp();
+    app.st.mainApi = 'textgenerationwebui';
+    app.nodes.set('world_editor_select', { options: [{ value: '', textContent: '请选择' }, { value: '0', textContent: '旧版世界书' }] });
+    app.st.loadWorldInfo = async () => ({ entries: [] });
+    await app.action('import-reference-source');
+    assert.match(app.html['#stsc_dialog_body'], /未能读取当前聊天补全预设/);
+    app.event('change', '#stsc_reference_source_kind', 'world');
+    assert.match(app.html['#stsc_dialog_body'], /旧版世界书/);
+    await app.event('change', '#stsc_reference_source_book', '0');
+    assert.match(app.html['#stsc_dialog_body'], /没有可复制的正文条目/);
+    assert.equal(app.run('editDraft.references.length'), 0);
+});
+
+test('switching books and closing the dialog discard stale responses and selections', async () => {
+    const app = referenceSourceApp();
+    app.st.getWorldInfoNames = () => ['慢的书', '快的书'];
+    let finish;
+    app.st.loadWorldInfo = name => name === '慢的书' ? new Promise(resolve => { finish = resolve; }) : Promise.resolve({ entries: [{ content: '快的正文' }] });
+    await app.action('import-reference-source');
+    app.event('change', '#stsc_reference_source_kind', 'world');
+    const pending = app.event('change', '#stsc_reference_source_book', '0');
+    await app.event('change', '#stsc_reference_source_book', '1');
+    app.sourceEntry(0, true);
+    finish({ entries: [{ content: '慢的正文' }] });
+    await pending;
+    assert.match(app.html['#stsc_dialog_body'], /快的正文/);
+    assert.doesNotMatch(app.html['#stsc_dialog_body'], /慢的正文/);
+    const pendingAfterClose = app.event('change', '#stsc_reference_source_book', '0');
+    assert.equal(app.run('referenceSourceDialogState.selected.size'), 0);
+    app.dialogAction('cancel');
+    finish({ entries: [{ content: '慢的正文' }] });
+    await pendingAfterClose;
+    assert.equal(app.run('referenceSourceDialogState'), null);
+    assert.equal(app.run('editDraft.references.length'), 0);
+});
+
+test('failed book reads are retryable; search retains checked items and cancel adds nothing', async () => {
+    const app = referenceSourceApp();
+    app.st.getWorldInfoNames = () => ['失败后可重试'];
+    let attempt = 0;
+    app.st.loadWorldInfo = async () => {
+        if (!attempt++) throw new Error('private server error');
+        return { entries: [{ content: '首先' }, { content: '然后' }] };
+    };
+    await app.action('import-reference-source');
+    app.event('change', '#stsc_reference_source_kind', 'world');
+    await app.event('change', '#stsc_reference_source_book', '0');
+    assert.match(app.html['#stsc_dialog_body'], /读取世界书失败/);
+    assert.doesNotMatch(app.html['#stsc_dialog_body'], /private server error/);
+    await app.dialogAction('retry-reference-source-book');
+    const rows = [0, 1].map(index => ({ dataset: { referenceSourceRow: String(index) } }));
+    app.nodes.set('stsc_reference_source_items', { querySelectorAll: () => rows });
+    app.sourceEntry(0, true);
+    app.event('input', '#stsc_reference_source_search', '然后');
+    assert.deepEqual(rows.map(row => row.hidden), [true, false]);
+    assert.equal(app.run('referenceSourceDialogState.selected.has(0)'), true);
+    app.dialogAction('cancel');
+    assert.equal(app.run('editDirty'), false);
+    assert.equal(app.run('editDraft.references.length'), 0);
+});
 
 test('legacy library and malformed groups normalize to safe default membership without losing content', () => {
     const app = groupApp();
@@ -844,10 +999,10 @@ test('empty floating instructions stay disabled and instruction names remain esc
     assert.equal(app.run("setInstructionActivation('empty', 'always')"), false);
 });
 
-test('version/identity are formal v0.4.15; release metadata and UI stay in sync', () => {
+test('version/identity are formal v0.4.16; release metadata and UI stay in sync', () => {
     const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url)));
     const release = JSON.parse(readFileSync(new URL('../version.json', import.meta.url)));
-    assert.equal(manifest.version, '0.4.15');
+    assert.equal(manifest.version, '0.4.16');
     assert.equal(release.version, manifest.version);
     assert.equal(manifest.homePage, 'https://github.com/chenxyeah/SillyTavern-Self-Check');
     const app = plugin();
