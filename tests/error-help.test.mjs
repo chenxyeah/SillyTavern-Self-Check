@@ -39,6 +39,7 @@ test('help IDs only accept known integer guide numbers', () => {
 });
 
 test('structured API errors map precisely without trusting incidental words in the message', () => {
+    assert.deepEqual(getApiErrorHelpIds({code:'background_interrupted',message:'TEST'}),[28]);
     const codes={auth:17,quota:18,rate_limit:19,timeout:23,empty:24,content_blocked:25,output_limit:26,stream_unsupported:27,stream_incomplete:28,stream_format:29};
     for(const [code,id] of Object.entries(codes)) assert.deepEqual(getApiErrorHelpIds({code,message:'请检查密钥和模型'}),[id]);
     assert.deepEqual(getApiErrorHelpIds({code:'stream_format',message:'流式事件过长，已停止接收。'}),[30]);

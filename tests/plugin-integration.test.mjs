@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import * as adapters from '../api-providers.mjs';
 import * as errorHelp from '../error-help.mjs';
+import { createGenerationWatchdog } from '../request-lifecycle.mjs';
 
 const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8').replace(/^import[\s\S]*?;\r?\n/gm, '');
 const tick = () => new Promise(resolve => setImmediate(resolve));
@@ -37,7 +38,7 @@ function plugin() {
     for (const id of ['stsc_dual_model', 'stsc_refresh_models', 'stsc_dual_model_status', 'stsc_dual_model_manual', 'stsc_test_api_connection', 'stsc_api_profile_name']) {
         nodes.set(id, { innerHTML: '', disabled: false, value: '', textContent: '', classList: { toggle() {} } });
     }
-    const scope = { ...adapters, ...errorHelp, $, jQuery() {}, URL, AbortController, structuredClone, Error, TypeError,
+    const scope = { ...adapters, ...errorHelp, createGenerationWatchdog, $, jQuery() {}, URL, AbortController, structuredClone, Error, TypeError,
         setTimeout: (fn, delay) => { const timer = setTimeout(fn, delay); timer.unref(); return timer; }, clearTimeout,
         document: { getElementById: id => nodes.get(id) || null },
         window: { addEventListener() {} },
@@ -999,10 +1000,10 @@ test('empty floating instructions stay disabled and instruction names remain esc
     assert.equal(app.run("setInstructionActivation('empty', 'always')"), false);
 });
 
-test('version/identity are formal v0.4.16; release metadata and UI stay in sync', () => {
+test('version/identity are formal v0.4.17; release metadata and UI stay in sync', () => {
     const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url)));
     const release = JSON.parse(readFileSync(new URL('../version.json', import.meta.url)));
-    assert.equal(manifest.version, '0.4.16');
+    assert.equal(manifest.version, '0.4.17');
     assert.equal(release.version, manifest.version);
     assert.equal(manifest.homePage, 'https://github.com/chenxyeah/SillyTavern-Self-Check');
     const app = plugin();
@@ -1969,7 +1970,12 @@ function timedStreamApp() {
     app.run(`editDraft.dualApi.timeoutSeconds = 60; editDraft.dualApi.retryTransient = false;
         buildDualApiMessages = () => [{role:'user',content:'TEST'}];`);
     let now = 0, next = 0;
+    app.scope.Date = class extends Date { static now() { return now; } };
     const timers = new Map();
+    const pageListeners = new Map();
+    app.scope.document.visibilityState = 'visible';
+    app.scope.document.addEventListener = (type, fn) => { pageListeners.set(type, fn); };
+    app.scope.document.removeEventListener = (type, fn) => { if (pageListeners.get(type) === fn) pageListeners.delete(type); };
     app.scope.setTimeout = (fn, delay) => { const id = ++next; timers.set(id, { at: now + delay, fn }); return id; };
     app.scope.clearTimeout = id => timers.delete(id);
     let controller, cancelled = false;
@@ -1983,11 +1989,79 @@ function timedStreamApp() {
         }
         now = target; await tick();
     };
-    return { app, advance, timers,
+    return { app, advance, timers, pageListeners,
+        visible(value) { app.scope.document.visibilityState = value ? 'visible' : 'hidden'; pageListeners.get('visibilitychange')?.(); },
+        fail: () => controller.error(new TypeError('TEST_NETWORK_FAILURE')),
+        close: () => controller.close(),
         send: data => controller.enqueue(new TextEncoder().encode(data)),
         cancelled: () => cancelled,
     };
 }
+
+test('background stream completes through the same request after old timeout would expire', async () => {
+    const t = timedStreamApp();
+    const pending = t.app.run('callDualApiSelfCheck({settings:getUiSettings()})');
+    await tick(); t.visible(false); await t.advance(240000);
+    assert.equal(t.cancelled(), false);
+    t.send('data: {"choices":[{"delta":{"content":"BACKGROUND_OK"},"finish_reason":"stop"}]}\n\n');
+    assert.equal((await pending).text, 'BACKGROUND_OK');
+    assert.equal(t.timers.size, 0); assert.equal(t.pageListeners.size, 0);
+});
+
+test('background disconnect is classified honestly and never automatically resends secondary request', async () => {
+    const t = timedStreamApp();
+    t.app.run('editDraft.dualApi.retryTransient = true');
+    let calls = 0;
+    const fetch = t.app.scope.fetch;
+    t.app.scope.fetch = (...args) => { calls++; return fetch(...args); };
+    const pending = t.app.run('callDualApiSelfCheck({settings:getUiSettings()})');
+    await tick(); t.visible(false); t.fail();
+    await assert.rejects(pending, error => error.code === 'background_interrupted' && error.transient === false);
+    assert.equal(calls, 1); assert.equal(t.timers.size, 0); assert.equal(t.pageListeners.size, 0);
+    assert.equal(t.app.run(`dualApiFailureMessage({code:'background_interrupted',message:'TEST_BACKGROUND'})`), 'TEST_BACKGROUND');
+});
+
+test('background protection limit produces a non-retryable error and closes the reader', async () => {
+    const t = timedStreamApp();
+    t.app.run('editDraft.dualApi.retryTransient = true');
+    const pending = t.app.run('callDualApiSelfCheck({settings:getUiSettings()})');
+    const check = assert.rejects(pending, error => error.code === 'background_interrupted' && error.message.includes('10分钟'));
+    await tick(); t.visible(false); await t.advance(600001); await check;
+    assert.equal(t.cancelled(), true); assert.equal(t.timers.size, 0); assert.equal(t.pageListeners.size, 0);
+});
+
+test('nonstream JSON body can finish in background without hitting foreground timeout', async () => {
+    const t = timedStreamApp();
+    t.app.run('editDraft.dualApi.stream=false');
+    const pending = t.app.run('callDualApiSelfCheck({settings:getUiSettings()})');
+    await tick(); t.visible(false); await t.advance(240000);
+    t.send(JSON.stringify({choices:[{message:{content:'JSON_BACKGROUND_OK'}}]}));
+    // Nonstreaming reads the complete HTTP body, not an SSE finish marker.
+    t.close();
+    assert.equal((await pending).text, 'JSON_BACKGROUND_OK');
+    assert.equal(t.timers.size, 0); assert.equal(t.pageListeners.size, 0);
+});
+
+test('previous generation delayed end check cannot clear a newer run', () => {
+    const app = plugin();
+    const timers = [];
+    app.scope.setTimeout = fn => { timers.push(fn); return timers.length; };
+    app.run(`clearRuntimePrompts=()=>{}; pendingRun={startedAt:Date.now()-10000}; onGenerationEnded(); nextRun={startedAt:Date.now()-10000}; pendingRun=nextRun;`);
+    timers.shift()();
+    assert.equal(app.run('pendingRun === nextRun'), true);
+    app.run('onGenerationEnded(); dualApiBusy=true');
+    timers.shift()();
+    assert.equal(app.run('pendingRun === nextRun'), true);
+});
+
+test('same ended generation still clears its abandoned result after delay', () => {
+    const app = plugin();
+    const timers = [];
+    app.scope.setTimeout = fn => { timers.push(fn); return timers.length; };
+    app.run(`clearRuntimePrompts=()=>{}; addRuntimeLog=()=>{}; pendingRun={startedAt:Date.now()-10000}; onGenerationEnded();`);
+    timers.shift()();
+    assert.equal(app.run('pendingRun'), null);
+});
 
 test('active streams may exceed the old total timeout and all timers clear on success', async () => {
     const t = timedStreamApp();

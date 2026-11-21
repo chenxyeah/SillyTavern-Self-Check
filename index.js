@@ -6,11 +6,12 @@ import {
 import {
     COMMON_ERROR_HELP, searchErrorHelp, normalizeHelpIds, getApiErrorHelpIds, getResultHelpIds, getLogHelpIds,
 } from './error-help.mjs';
+import { createGenerationWatchdog } from './request-lifecycle.mjs';
 
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.16';
+const STSC_VERSION = '0.4.17';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
@@ -46,12 +47,12 @@ const STSC_REMOTE_RELEASE_URLS = Object.freeze([
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-11-06',
-    title: '从预设与世界书导入参考资料',
+    releasedAt: '2026-11-21',
+    title: '手机后台等待保护',
     changes: Object.freeze([
-        '参考资料库新增导入入口，可以从当前聊天补全预设或指定的一本世界书搜索并勾选条目。',
-        '所选条目分别复制为独立资料，归入默认分组并保持关闭，点击保存更改后保留。',
-        '不改动原预设或世界书，不继承触发规则，不生成自检题，也不调用模型。',
+        '副API生成自动启用后台等待保护，暂停前台超时计时，返回后预留接收缓冲数据的时间。',
+        '后台等待保护最多10分钟；切后台后连接中断不自动重发副API，仍按原设置回退或停止。',
+        '修复旧轮延迟检查误清新一轮状态；系统冻结、关闭网页及主API断连仍无法保证恢复。',
     ]),
 });
 
@@ -2547,14 +2548,10 @@ async function callDualApiSelfCheck(
         const startedAt = Date.now();
         const streaming = dual.stream !== false;
         const totalSeconds = attemptTimeoutSeconds * 3;
-        let timeout, timeoutKind = 'idle';
-        const armIdleTimeout = () => {
-            clearTimeout(timeout);
-            timeout = setTimeout(() => { timeoutKind = 'idle'; controller.abort(); }, attemptTimeoutSeconds * 1000);
-        };
-        armIdleTimeout();
-        // Heartbeats keep an active stream alive, but cannot make a request wait forever.
-        const totalTimeout = streaming ? setTimeout(() => { timeoutKind = 'total'; controller.abort(); }, totalSeconds * 1000) : null;
+        const watchdog = createGenerationWatchdog({
+            controller, timeoutMs: attemptTimeoutSeconds * 1000, streaming,
+            page: globalThis.document, now: () => Date.now(), setTimer: setTimeout, clearTimer: clearTimeout,
+        });
 
         try {
             const headers = {
@@ -2565,14 +2562,23 @@ async function callDualApiSelfCheck(
             const payload = await requestProvider('generate', buildGenerationRequest({ ...dual, stream: streaming }, messages), {
                 headers,
                 signal: controller.signal,
-                onActivity: streaming ? armIdleTimeout : undefined,
+                onActivity: streaming ? watchdog.activity : undefined,
             });
             const text = readGenerationText(payload);
             return { text, attempts: attempt + 1, compact: attemptCompact };
         } catch (caught) {
+            watchdog.dispose();
             let error = caught instanceof Error ? caught : new Error(String(caught || '未知错误'));
-            if (error.name === 'AbortError') {
-                error = new Error(timeoutKind === 'total'
+            if ((error.name === 'AbortError' && watchdog.kind === 'background')
+                || (watchdog.wasBackgrounded && (error.name === 'TypeError' || error.code === 'stream_incomplete' || (!error.code && /网络|连接|network|fetch|socket/i.test(error.message))))) {
+                error = new Error(watchdog.kind === 'background'
+                    ? '自检API在后台等待已达到10分钟保护上限，本轮没有取得完整结果。请回到酒馆前台后手动重试。'
+                    : '本轮切到过后台，随后自检连接中断；可能与系统暂停网页或网络变化有关，不能仅凭此确定原因。请保持酒馆在前台后重试。');
+                error.code = 'background_interrupted';
+                // Do not silently issue another paid request after a suspended tab.
+                error.transient = false;
+            } else if (error.name === 'AbortError') {
+                error = new Error(watchdog.kind === 'total'
                     ? `自检API已达到${totalSeconds}秒流式总等待上限，已超时。`
                     : `自检API${streaming ? '连续未收到数据' : '等待'}超过${attemptTimeoutSeconds}秒，已超时。`);
                 error.code = 'timeout';
@@ -2587,8 +2593,7 @@ async function callDualApiSelfCheck(
             if (attempt + 1 >= maxAttempts || !isTransientDualApiFailure(error)) break;
             await waitForDualApiRetry(error.httpStatus === 429 ? 1500 : 800);
         } finally {
-            clearTimeout(timeout);
-            clearTimeout(totalTimeout);
+            watchdog.dispose();
         }
     }
 
@@ -2691,7 +2696,7 @@ function dualApiFailureMessage(error) {
     const retried = Number(error?.attempts) > 1 || /重试/.test(raw);
     let message = '';
 
-    if (['empty', 'content_blocked', 'output_limit', 'stream_incomplete', 'stream_format', 'stream_unsupported', 'timeout'].includes(error?.code)) {
+    if (['empty', 'content_blocked', 'output_limit', 'stream_incomplete', 'stream_format', 'stream_unsupported', 'timeout', 'background_interrupted'].includes(error?.code)) {
         message = raw;
     } else if (error?.code === 'provider' && status === 200) {
         message = '接口返回了200，但结果中包含错误，未取得自检答案；这不能直接判断为密钥错误。';
@@ -3192,9 +3197,11 @@ function removeLegacyMessageBadges() {
 
 function onGenerationEnded() {
     clearRuntimePrompts();
+    const endedRun = pendingRun;
+    if (!endedRun) return;
     // 极端情况下没有收到最终消息事件，避免运行状态永久残留。
     setTimeout(() => {
-        if (pendingRun && Date.now() - pendingRun.startedAt > 4500) {
+        if (pendingRun === endedRun && !dualApiBusy && Date.now() - pendingRun.startedAt > 4500) {
             const character = runtimeCharacterLabel({ characterName: pendingRun.characterName || '' });
             const mode = pendingRun.mode === 'dual_api' ? '双API' : '单API';
             addRuntimeLog('error', '本轮结果', `${character}：本轮生成已经结束，但插件没有收到可保存的AI正文。`, `本轮原本使用${mode}模式。请重新生成；如果连续发生，请检查主API连接和酒馆控制台。`);
@@ -3207,7 +3214,7 @@ function onGenerationStopped() {
     clearRuntimePrompts();
     if (pendingRun) {
         const character = runtimeCharacterLabel({ characterName: pendingRun.characterName || '' });
-        addRuntimeLog('warning', '本轮结果', `${character}：本轮生成在完成前被停止，没有形成完整结果。`, '如果这是你手动停止的，可以忽略；如果不是，请检查主API连接是否中断。');
+        addRuntimeLog('warning', '本轮结果', `${character}：本轮生成在完成前被停止，没有形成完整结果。`, '手动停止可以忽略；否则请检查主API连接。手机切后台或锁屏也可能暂停网页、断开连接，请保持酒馆在前台后重试。');
     }
     pendingRun = null;
     dualApiBusy = false;
@@ -4312,12 +4319,12 @@ function renderSettingsTab() {
                 <div class="stsc-field">
                     <label>${dual.stream !== false ? '流式无数据超时' : '单次请求超时'}</label>
                     <input id="stsc_dual_timeout_seconds" class="text_pole" type="number" min="60" max="300" step="10" value="${Math.round(dual.timeoutSeconds)}">
-                    <div class="stsc-muted">单位：秒，默认150秒。流式每次收到数据会重新计时，总等待最多为此值的3倍。精简重试的无数据等待最多60秒、流式总等待最多180秒；关闭流式时按单次总时长计时。</div>
+                    <div class="stsc-muted">单位：秒，默认150秒。前台：流式每次收到数据会重新计时，总等待最多为此值的3倍；精简重试最多60秒无数据、180秒总等待。非流式按单次时长计时。副API生成已自动开启后台等待保护：后台时间不计入前台超时，后台累计最多等待10分钟，返回后至少留15秒接收数据。此保护不作用于连接测试，也不能防止系统冻结、关闭网页或主API断连；生成时尽量保持酒馆在前台且不要锁屏。</div>
                 </div>
                 <div class="stsc-field">
                     <label>瞬时错误补救</label>
                     <label class="checkbox_label"><input id="stsc_dual_retry_transient" type="checkbox" ${dual.retryTransient ? 'checked' : ''}> 自动精简重试一次</label>
-                    <div class="stsc-muted">仅用于超时、限流、服务器异常、网络中断及不完整回答；认证失败不会重试。</div>
+                    <div class="stsc-muted">仅用于超时、限流、服务器异常、网络中断及不完整回答；认证失败不会重试。切后台后连接中断不会自动重发副API，以免重复计费；后续仍按失败处理设置回退或停止。</div>
                 </div>
             </div>
 

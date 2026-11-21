@@ -45,8 +45,8 @@ export const COMMON_ERROR_HELP = Object.freeze([
     helpEntry(9, '本轮生成提前停止',
         '单API、双API都可能出现。',
         '本轮可能没有完整结果，不会因此作废以前已完成的聊天。',
-        '可能手动点了停止，也可能连接中断。',
-        '手动停止可以忽略；不是手动停止，就检查网络和主API。'),
+        '可能手动点了停止，也可能连接中断；手机切后台或锁屏后，系统也可能暂停或关闭网页。',
+        '手动停止可以忽略；否则检查网络和主API。手机上尽量保持酒馆在前台、不要锁屏；后台等待保护不能阻止系统回收网页，也不能恢复主API已断开的连接。'),
     helpEntry(10, '没有返回上一轮复盘／复盘重试失败',
         '双API，并开启上一轮复盘。',
         '通常只影响本次复盘。本轮自检完整时仍可继续正文，不等于自检失败。',
@@ -115,8 +115,8 @@ export const COMMON_ERROR_HELP = Object.freeze([
     helpEntry(23, '连接测试超时／无数据超时／总等待超时',
         '副API连接测试和双API调用。',
         '本次测试或自检没在时限内完成；实际自检最终失败后会回退或停止。',
-        '接口慢、长期没数据，或整个流式请求拖得太久。',
-        '减少题目和上下文，确认流式支持情况，必要时适当增加等待。一直没数据时只延长时间未必有用。'),
+        '接口慢、长期没数据，或整个流式请求拖得太久；副API生成后台累计等待超过10分钟也会结束保护。',
+        '减少题目和上下文，确认流式支持情况，必要时适当增加等待。手机切后台后失败，回到酒馆前台再手动重试；保护不能保证系统冻结或断网时仍能生成。'),
     helpEntry(24, '返回空结果／没有最终文本',
         '副API连接测试和双API调用。',
         '没有拿到可用最终答案；接口有响应不等于自检成功。',
@@ -138,10 +138,10 @@ export const COMMON_ERROR_HELP = Object.freeze([
         '接口或当前浏览器不支持这种接收方式。',
         '关闭“独立自检API使用流式请求”，保存后重试。'),
     helpEntry(28, '流式连接中断／模型异常结束',
-        '双API的副API流式请求。',
-        '不会把半截自检作为完整结果提交，后续重试、回退或停止。',
-        '网络中断、接口异常，或没有正常结束标记。',
-        '先重试一次；反复发生就检查线路，也可关闭流式做对照测试。'),
+        '双API的副API请求；流式、后台连接中断都可参考。',
+        '不会把半截自检作为完整结果提交，后续按设置回退或停止。切后台后断连不自动重发副API，以免重复计费。',
+        '网络中断、接口异常或缺少正常结束标记；切后台后也可能被手机系统暂停，不能仅凭切过后台确定原因。',
+        '回到酒馆前台、保持网络后手动重试；反复发生就检查线路，也可关闭流式做对照。不要依赖后台保护来保证锁屏运行。'),
     helpEntry(29, '返回格式异常／不是JSON／无法识别流式响应',
         '副API连接测试和双API调用。',
         '插件读不懂返回内容，所以拿不到可用自检。',
@@ -279,7 +279,7 @@ export function searchErrorHelp(query) {
     return COMMON_ERROR_HELP.filter(item => searchKey(item.title).includes(key));
 }
 
-const apiCodeHelp = Object.freeze({ auth: 17, quota: 18, rate_limit: 19, timeout: 23, empty: 24,
+const apiCodeHelp = Object.freeze({ auth: 17, quota: 18, rate_limit: 19, timeout: 23, background_interrupted: 28, empty: 24,
     content_blocked: 25, output_limit: 26, stream_unsupported: 27, stream_incomplete: 28, stream_format: 29 });
 
 export function getApiErrorHelpIds(error = {}) {
