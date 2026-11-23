@@ -1000,10 +1000,10 @@ test('empty floating instructions stay disabled and instruction names remain esc
     assert.equal(app.run("setInstructionActivation('empty', 'always')"), false);
 });
 
-test('version/identity are formal v0.4.17; release metadata and UI stay in sync', () => {
+test('version/identity are formal v0.4.18; release metadata and UI stay in sync', () => {
     const manifest = JSON.parse(readFileSync(new URL('../manifest.json', import.meta.url)));
     const release = JSON.parse(readFileSync(new URL('../version.json', import.meta.url)));
-    assert.equal(manifest.version, '0.4.17');
+    assert.equal(manifest.version, '0.4.18');
     assert.equal(release.version, manifest.version);
     assert.equal(manifest.homePage, 'https://github.com/chenxyeah/SillyTavern-Self-Check');
     const app = plugin();
@@ -1997,6 +1997,132 @@ function timedStreamApp() {
         cancelled: () => cancelled,
     };
 }
+
+test('secondary timeout normalization preserves old values, accepts slow-model values and bounds invalid input', () => {
+    const app = plugin();
+    for (const [value, expected] of [[60,60],[150,150],[300,300],[600,600],[900,900],['600',600],[600.4,600],[0,60],[9001,900],['',150],[null,150],[undefined,150],['bad',150],[Infinity,150]]) {
+        app.scope.testTimeoutValue = value;
+        assert.equal(app.run('normalizeDualApiTimeout(testTimeoutValue)'), expected);
+        app.run('ctx().extensionSettings[STSC_MODULE] = clone(editDraft); ctx().extensionSettings[STSC_MODULE].dualApi.timeoutSeconds = testTimeoutValue');
+        assert.equal(app.run('normalizeSettings().dualApi.timeoutSeconds'), expected);
+    }
+});
+
+test('wait time UI, save/reopen and per-API profile switching keep values above the old cap', () => {
+    const app = profileApp();
+    app.run('firstId=editDraft.activeApiProfileId');
+    app.event('change', '#stsc_dual_timeout_seconds', '600');
+    app.run('commitEditDraft({notify:false}); beginEditSession(); renderSettingsTab()');
+    assert.equal(app.run('editDraft.dualApi.timeoutSeconds'), 600);
+    assert.ok(app.html['#stsc_tab_settings'].includes('max="900"'));
+    app.run('editDraft.dualApi.timeoutSeconds=900; secondId=createApiProfile("慢模型").id; switchApiProfile(firstId)');
+    assert.equal(app.run('editDraft.dualApi.timeoutSeconds'), 600);
+    app.run('commitEditDraft({notify:false}); beginEditSession(); switchApiProfile(secondId)');
+    assert.equal(app.run('editDraft.dualApi.timeoutSeconds'), 900);
+    app.event('change', '#stsc_dual_timeout_seconds', '7000');
+    assert.equal(app.run('editDraft.dualApi.timeoutSeconds'), 900);
+    app.run('discardEditDraft()');
+    assert.equal(app.run('editDraft.dualApi.timeoutSeconds'), 600);
+    assert.equal(app.requestBodies.length, 0);
+});
+
+test('connection probe uses the saved larger wait while sending only its short test message', async () => {
+    const app = plugin();
+    app.run('editDraft.dualApi.timeoutSeconds=600');
+    const delays = [], cleared = [];
+    app.scope.setTimeout = (_fn, delay) => { delays.push(delay); return delays.length; };
+    app.scope.clearTimeout = id => cleared.push(id);
+    app.scope.fetch = async (_url, options) => {
+        assert.deepEqual(JSON.parse(options.body).messages, [{role:'user',content:'Reply with OK only.'}]);
+        return new Response(JSON.stringify({choices:[{message:{content:'OK'}}]}));
+    };
+    await app.run('testDualApiConnection()');
+    assert.equal(delays[0], 600000); assert.ok(cleared.includes(1));
+    assert.equal(app.run('dualApiConnectionTestResult.ok'), true);
+});
+
+test('streaming first attempt can wait past sixty seconds when configured for longer', async () => {
+    const t = timedStreamApp();
+    t.app.run('editDraft.dualApi.timeoutSeconds=300');
+    const pending = t.app.run('callDualApiSelfCheck({settings:getUiSettings()})');
+    await tick(); await t.advance(65000);
+    assert.equal(t.cancelled(), false);
+    t.send('data: {"choices":[{"delta":{"content":"SLOW_OK"},"finish_reason":"stop"}]}\n\n');
+    assert.equal((await pending).text, 'SLOW_OK'); assert.equal(t.timers.size, 0);
+});
+
+test('transient-error retry uses the same configured wait instead of a hidden sixty second cap', async () => {
+    const t = timedStreamApp();
+    t.app.run('editDraft.dualApi.timeoutSeconds=600; editDraft.dualApi.retryTransient=true; waitForDualApiRetry=async()=>{}');
+    const fetch = t.app.scope.fetch;
+    let calls = 0;
+    t.app.scope.fetch = (...args) => ++calls === 1 ? Promise.resolve(new Response('{}', {status:502})) : fetch(...args);
+    const pending = t.app.run('callDualApiSelfCheck({settings:getUiSettings()})');
+    await tick(); await t.advance(65000);
+    assert.equal(calls, 2); assert.equal(t.cancelled(), false);
+    t.send('data: {"choices":[{"delta":{"content":"SLOW_RETRY_OK"},"finish_reason":"stop"}]}\n\n');
+    const result = await pending;
+    assert.equal(result.text, 'SLOW_RETRY_OK'); assert.equal(result.compact, true);
+    assert.equal(result.attempts, 2); assert.equal(t.timers.size, 0);
+});
+
+test('nonstreaming retry also honors the full configured wait', async () => {
+    const t = timedStreamApp();
+    t.app.run('editDraft.dualApi.stream=false; editDraft.dualApi.timeoutSeconds=300; editDraft.dualApi.retryTransient=true; waitForDualApiRetry=async()=>{}');
+    const fetch = t.app.scope.fetch;
+    let calls = 0;
+    t.app.scope.fetch = (...args) => ++calls === 1 ? Promise.resolve(new Response('{}', {status:502})) : fetch(...args);
+    const pending = t.app.run('callDualApiSelfCheck({settings:getUiSettings()})');
+    await tick(); await t.advance(65000);
+    t.send(JSON.stringify({choices:[{message:{content:'NONSTREAM_RETRY_OK'}}]})); t.close();
+    assert.equal((await pending).text, 'NONSTREAM_RETRY_OK');
+    assert.equal(calls, 2); assert.equal(t.timers.size, 0);
+});
+
+test('format repair through the actual interceptor keeps the saved timeout, not a separate sixty seconds', async () => {
+    const t = timedStreamApp();
+    t.app.run(`editDraft.dualApi.timeoutSeconds=600; editDraft.dualApi.retryTransient=true;
+        testSettings=clone(editDraft); normalizeSettings=()=>testSettings;
+        getActiveQuestions=getDualApiQuestions=()=>[{id:'q1',text:'问题',requireEvidence:false}];
+        getActiveReferences=getSelectedTemporaryInstructions=()=>[];
+        clearRuntimePrompts=applyReferencePrompts=applyTemporaryPrompt=()=>{};
+        injected=false; applyDualApiMainPrompt=()=>{injected=true};`);
+    const fetch = t.app.scope.fetch;
+    let calls = 0;
+    t.app.scope.fetch = (...args) => ++calls === 1
+        ? Promise.resolve(new Response(JSON.stringify({choices:[{message:{content:'<stsc_self_check></stsc_self_check>'}}]}))) : fetch(...args);
+    const pending = t.app.run('sillyTavernSelfCheckInterceptor([],10000,()=>{throw new Error("must not abort")},"normal")');
+    await tick(); await t.advance(65000);
+    assert.equal(calls, 2); assert.equal(t.cancelled(), false); assert.equal(t.app.run('injected'), false);
+    const text = '<stsc_self_check><item id="q1"><answer>结论</answer></item></stsc_self_check>';
+    t.send('data: '+JSON.stringify({choices:[{delta:{content:text},finish_reason:'stop'}]})+'\n\n');
+    await pending;
+    assert.equal(t.app.run('injected'), true); assert.equal(calls, 2); assert.equal(t.timers.size, 0);
+});
+
+test('slow failed requests still time out at the configured value and never retry more than once', async () => {
+    const t = timedStreamApp();
+    t.app.run('editDraft.dualApi.timeoutSeconds=300; editDraft.dualApi.retryTransient=true; waitForDualApiRetry=async()=>{}');
+    const fetch = t.app.scope.fetch;
+    let calls = 0;
+    t.app.scope.fetch = (...args) => { calls++; return fetch(...args); };
+    let finalError;
+    const pending = t.app.run('callDualApiSelfCheck({settings:getUiSettings()})');
+    const check = assert.rejects(pending, error => { finalError=error; return error.code==='timeout' && error.attempts===2 && error.message.includes('300秒'); });
+    await tick(); await t.advance(300001); await t.advance(300001); await check;
+    assert.equal(calls, 2); assert.equal(t.timers.size, 0);
+    t.app.scope.finalError=finalError;
+    const message=t.app.run('dualApiFailureMessage(finalError)');
+    assert.equal((message.match(/重试/g)||[]).length, 1);
+});
+
+test('manual retry advice is not falsely described as an automatic retry, and repeated formatting stays concise', () => {
+    const app = plugin();
+    assert.equal(app.run(`dualApiFailureMessage({code:'background_interrupted',message:'请回到前台后手动重试。',attempts:1})`), '请回到前台后手动重试。');
+    const message=app.run(`dualApiFailureMessage({code:'timeout',message:'已超时。',attempts:2})`);
+    app.scope.alreadyFormatted=message;
+    assert.equal(app.run(`dualApiFailureMessage({code:'timeout',message:alreadyFormatted,attempts:2})`), message);
+});
 
 test('background stream completes through the same request after old timeout would expire', async () => {
     const t = timedStreamApp();

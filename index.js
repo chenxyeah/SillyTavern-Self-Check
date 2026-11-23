@@ -11,10 +11,13 @@ import { createGenerationWatchdog } from './request-lifecycle.mjs';
 const STSC_MODULE = 'sillytavern_self_check';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_latest';
-const STSC_VERSION = '0.4.17';
+const STSC_VERSION = '0.4.18';
 const STSC_DEV_MODULE = 'sillytavern_self_check_dev';
 const STSC_DEV_MIGRATION_BACKUP = 'sillytavern_self_check_before_dev_import';
 const STSC_LOG_LIMIT = 500;
+const STSC_DUAL_TIMEOUT_MIN = 60;
+const STSC_DUAL_TIMEOUT_MAX = 900;
+const STSC_DUAL_TIMEOUT_DEFAULT = 150;
 const STSC_CHECK_TAG = 'stsc_self_check';
 const STSC_RESPONSE_TAG = 'stsc_response';
 const STSC_CHECK_OPEN_RE = /<stsc_self_check\b[^>]*>/i;
@@ -47,12 +50,12 @@ const STSC_REMOTE_RELEASE_URLS = Object.freeze([
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-11-21',
-    title: '手机后台等待保护',
+    releasedAt: '2026-11-23',
+    title: '自定义副API等待时间与重试修复',
     changes: Object.freeze([
-        '副API生成自动启用后台等待保护，暂停前台超时计时，返回后预留接收缓冲数据的时间。',
-        '后台等待保护最多10分钟；切后台后连接中断不自动重发副API，仍按原设置回退或停止。',
-        '修复旧轮延迟检查误清新一轮状态；系统冻结、关闭网页及主API断连仍无法保证恢复。',
+        '副API等待时间可设为60～900秒，保留默认150秒，并随API配置保存。',
+        '首次请求、瞬时错误重试和不完整答案补救统一使用设置值，不再把重试强制缩短到60秒。',
+        '精简重复的重试失败提示，保留最多一次补救、后台保护和原有回退或停止设置。',
     ]),
 });
 
@@ -125,7 +128,7 @@ const DEFAULT_SETTINGS = Object.freeze({
         topP: '',
         reasoningEffort: '',
         preamble: '',
-        timeoutSeconds: 150,
+        timeoutSeconds: STSC_DUAL_TIMEOUT_DEFAULT,
         retryTransient: true,
         stream: true,
         contextMode: 'recent5',
@@ -420,7 +423,7 @@ function normalizeSettings() {
     settings.dualApi.model = String(settings.dualApi.model || '');
     settings.dualApi.maxTokens = normalizeMaxTokens(settings.dualApi.maxTokens);
     settings.dualApi.preamble = String(settings.dualApi.preamble || '');
-    settings.dualApi.timeoutSeconds = clampNumber(settings.dualApi.timeoutSeconds, 60, 300, 150);
+    settings.dualApi.timeoutSeconds = normalizeDualApiTimeout(settings.dualApi.timeoutSeconds);
     settings.dualApi.retryTransient = Boolean(settings.dualApi.retryTransient);
     settings.dualApi.stream = settings.dualApi.stream !== false;
     // beta.3：聊天范围只保留“默认最近5轮 / 自定义 / 全部”。旧界面的跟随、10轮、20轮统一迁移为最近5轮。
@@ -940,6 +943,11 @@ function clampNumber(value, min, max, fallback) {
     return Math.min(max, Math.max(min, number));
 }
 
+function normalizeDualApiTimeout(value) {
+    const input = value == null || String(value).trim() === '' ? NaN : value;
+    return Math.round(clampNumber(input, STSC_DUAL_TIMEOUT_MIN, STSC_DUAL_TIMEOUT_MAX, STSC_DUAL_TIMEOUT_DEFAULT));
+}
+
 function normalizeDualApiBaseUrl(value, provider = getUiSettings()?.dualApi?.provider) {
     return normalizeEndpoint(value, provider);
 }
@@ -1117,7 +1125,7 @@ async function testDualApiConnection() {
     const dual = { ...getUiSettings().dualApi };
     const signature = apiTestSignature(dual);
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), clampNumber(dual.timeoutSeconds, 60, 300, 150) * 1000);
+    const timeout = setTimeout(() => controller.abort(), normalizeDualApiTimeout(dual.timeoutSeconds) * 1000);
     dualApiConnectionTestBusy = true;
     const button = document.getElementById('stsc_test_api_connection');
     if (button) { button.disabled = true; button.textContent = '测试中…'; }
@@ -1219,7 +1227,7 @@ function apiProfileConfig(dual = {}) {
     config.provider = providerId(config.provider);
     for (const field of ['endpoint', 'apiKey', 'model', 'temperature', 'topP', 'reasoningEffort', 'preamble']) config[field] = String(config[field] ?? '');
     config.maxTokens = normalizeMaxTokens(config.maxTokens);
-    config.timeoutSeconds = clampNumber(config.timeoutSeconds, 60, 300, 150);
+    config.timeoutSeconds = normalizeDualApiTimeout(config.timeoutSeconds);
     config.retryTransient = Boolean(config.retryTransient);
     config.stream = config.stream !== false;
     return config;
@@ -2527,7 +2535,7 @@ function waitForDualApiRetry(milliseconds) {
 
 async function callDualApiSelfCheck(
     { chat, questions, references, temporaryInstructions, settings },
-    { compact = false, allowTransientRetry = true, timeoutSecondsOverride = 0 } = {},
+    { compact = false, allowTransientRetry = true } = {},
 ) {
     const dual = settings.dualApi;
     const endpoint = normalizeEndpoint(dual.endpoint, dual.provider);
@@ -2536,14 +2544,14 @@ async function callDualApiSelfCheck(
     if (!model) throw new Error('尚未填写自检模型。请先在设置页手动填写或选择模型，然后保存。');
 
     const context = ctx();
-    const configuredTimeout = clampNumber(timeoutSecondsOverride || dual.timeoutSeconds, 60, 300, 150);
+    const configuredTimeout = normalizeDualApiTimeout(dual.timeoutSeconds);
     const maxAttempts = allowTransientRetry && dual.retryTransient ? 2 : 1;
     let lastError = null;
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
         const retrying = attempt > 0;
         const attemptCompact = compact || retrying;
-        const attemptTimeoutSeconds = retrying ? Math.min(configuredTimeout, 60) : configuredTimeout;
+        const attemptTimeoutSeconds = configuredTimeout;
         const controller = new AbortController();
         const startedAt = Date.now();
         const streaming = dual.stream !== false;
@@ -2597,9 +2605,6 @@ async function callDualApiSelfCheck(
         }
     }
 
-    if (lastError && maxAttempts > 1 && lastError.attempts > 1) {
-        lastError.message = `${lastError.message}（已自动精简重试1次，仍未成功）`;
-    }
     throw lastError || new Error('自检API调用失败。');
 }
 
@@ -2693,7 +2698,7 @@ function dualApiFailureMessage(error) {
     const raw = compactPromptText(error?.message || error || '没有收到具体原因');
     const status = Number(error?.httpStatus) || Number(raw.match(/HTTP\s*(\d{3})/i)?.[1]) || 0;
     const seconds = Number.isFinite(error?.elapsedMs) ? Math.max(1, Math.round(error.elapsedMs / 1000)) : 0;
-    const retried = Number(error?.attempts) > 1 || /重试/.test(raw);
+    const retried = Number(error?.attempts) > 1 || /已自动.*重试|精简重试(?:后|失败)/.test(raw);
     let message = '';
 
     if (['empty', 'content_blocked', 'output_limit', 'stream_incomplete', 'stream_format', 'stream_unsupported', 'timeout', 'background_interrupted'].includes(error?.code)) {
@@ -2720,7 +2725,8 @@ function dualApiFailureMessage(error) {
         message = `自检API没有成功完成请求。接口给出的提示是：${raw}`;
     }
 
-    if (retried) message += ' 插件已经自动精简内容并重试过一次，仍然没有成功。';
+    const retryNote = '插件已经自动精简内容并重试过一次，仍然没有成功。';
+    if (retried && !message.includes(retryNote)) message += ` ${retryNote}`;
     return message;
 }
 
@@ -3298,7 +3304,7 @@ globalThis.sillyTavernSelfCheckInterceptor = async function (_chat, _contextSize
                         references,
                         temporaryInstructions,
                         settings,
-                    }, { compact: true, allowTransientRetry: false, timeoutSecondsOverride: 60 });
+                    }, { compact: true, allowTransientRetry: false });
                     const retryRawCheck = retryResponse.text;
                     const retryParsed = parseModelOutput(retryRawCheck, dualQuestions);
                     const retryReview = parsePreviousReview(retryRawCheck);
@@ -4317,9 +4323,11 @@ function renderSettingsTab() {
 
             <div class="stsc-grid-2" style="margin-top:10px">
                 <div class="stsc-field">
-                    <label>${dual.stream !== false ? '流式无数据超时' : '单次请求超时'}</label>
-                    <input id="stsc_dual_timeout_seconds" class="text_pole" type="number" min="60" max="300" step="10" value="${Math.round(dual.timeoutSeconds)}">
-                    <div class="stsc-muted">单位：秒，默认150秒。前台：流式每次收到数据会重新计时，总等待最多为此值的3倍；精简重试最多60秒无数据、180秒总等待。非流式按单次时长计时。副API生成已自动开启后台等待保护：后台时间不计入前台超时，后台累计最多等待10分钟，返回后至少留15秒接收数据。此保护不作用于连接测试，也不能防止系统冻结、关闭网页或主API断连；生成时尽量保持酒馆在前台且不要锁屏。</div>
+                    <label>${dual.stream !== false ? '流式无数据等待时间（秒）' : '单次请求等待时间（秒）'}</label>
+                    <input id="stsc_dual_timeout_seconds" class="text_pole" type="number" min="${STSC_DUAL_TIMEOUT_MIN}" max="${STSC_DUAL_TIMEOUT_MAX}" step="1" value="${normalizeDualApiTimeout(dual.timeoutSeconds)}">
+                    <div class="stsc-muted">可设60～900秒，默认150秒。思考较慢时可先试300或600秒，修改后点击顶部“保存更改”；此值随API配置保存，首次请求和最多一次精简重试都使用同一等待时间，不再把重试限制为60秒。</div>
+                    <div class="stsc-muted">流式：收到数据就重新计算无数据等待，每次请求的前台总等待上限为设置值的3倍。非流式：每次请求按设置的总时长等待。连接测试只发简短消息，不能保证实际自检也同样快；延长插件等待不能修复接口或中转商提前断连。</div>
+                    <div class="stsc-muted">副API生成已自动开启后台保护：后台时间不计入前台超时，后台累计最多等待10分钟，返回后至少留15秒接收数据。此保护不作用于连接测试，也不能防止系统冻结、关闭网页或主API断连；生成时尽量保持酒馆在前台且不要锁屏。</div>
                 </div>
                 <div class="stsc-field">
                     <label>瞬时错误补救</label>
@@ -5937,7 +5945,7 @@ function bindUiEvents() {
         renderSettingsTab();
     });
     $('#stsc_manager_overlay').on('change', '#stsc_dual_timeout_seconds', function () {
-        getUiSettings().dualApi.timeoutSeconds = clampNumber(this.value, 60, 300, 150);
+        getUiSettings().dualApi.timeoutSeconds = normalizeDualApiTimeout(this.value);
         this.value = Math.round(getUiSettings().dualApi.timeoutSeconds);
         markDirty();
     });
